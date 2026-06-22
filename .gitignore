@@ -1,0 +1,9 @@
+ng_migration.env
+ng_migration.env.bak*
+.deploy_ssh_pass
+__pycache__/
+*.pyc
+reports/*
+!reports/.gitkeep
+*.log
+*.nohup
