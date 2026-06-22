@@ -29,6 +29,8 @@ USER_TABLES = ("user", "user_info", "user_bankcard", "user_product")
 APP_TABLES = ("application", "loan", "id_mapping")
 TARGET_LOOKUP_CHUNK = 500
 TARGET_MAPPING_CHUNK = 200
+FIELD_DIFF_LOOKUP_CHUNK = 50
+APP_VALIDATE_BATCH = 3000
 
 
 _repair_log_file: Optional[Path] = None
@@ -584,6 +586,11 @@ def _build_application_validation_rows_for_ids(
     return src_map, app_keys_by_no, src_mapping_by_app_id
 
 
+def _merge_app_missing(out: Dict[str, List[Any]], part: Dict[str, List[Any]]) -> None:
+    for key in ("application_ids", "loan_app_nos", "id_mapping", "_repair_application_ids"):
+        out[key].extend(part.get(key, []))
+
+
 def validate_application_missing_for_ids(
     cfg: Dict[str, Any],
     src,
@@ -605,7 +612,12 @@ def validate_application_missing_for_ids(
         for x in [*application_ids, *loan_ids, *id_mapping_ids]
         if x is not None
     })
+    repair_log(f"validate application ids start count={len(all_ids)}")
     src_map, app_keys_by_no, src_mapping_by_app_id = _build_application_validation_rows_for_ids(cfg, src, all_ids)
+    repair_log(
+        f"validate application ids src_load done apps={len(src_map)} "
+        f"keys={len(app_keys_by_no)} mapping_keys={len(src_mapping_by_app_id)}"
+    )
     app_id_by_no = {app_no: app_id for app_id, app_no in src_map.items()}
 
     app_id_set = {int(x) for x in application_ids if x is not None}
@@ -617,7 +629,9 @@ def validate_application_missing_for_ids(
             key for app_no, key in app_keys_by_no.items()
             if int(app_id_by_no.get(app_no, 0)) in (app_id_set | loan_id_set | mapping_id_set)
         ]
+        repair_log(f"validate application ids target_lookup start keys={len(needed_app_keys)}")
         tgt, tgt_app_keys = target_application_keys(cfg, tgt, needed_app_keys, lookup_chunk)
+        repair_log(f"validate application ids target_lookup done matched={len(tgt_app_keys)}")
         existing_app_nos = {
             app_no for app_no, key in app_keys_by_no.items()
             if key in tgt_app_keys
@@ -643,7 +657,7 @@ def validate_application_missing_for_ids(
             app_id for app_id, app_no in src_map.items()
             if app_id in loan_id_set and app_no not in existing_app_nos
         ]
-        tgt_loans = target_loan_app_nos(tgt, loan_existing_app_nos, lookup_chunk)
+        tgt_loans = target_loan_app_nos(cfg, tgt, loan_existing_app_nos, lookup_chunk)
         missing_loan_nos = sorted(no for no in loan_existing_app_nos if no not in tgt_loans)
         out["loan_app_nos"].extend(missing_loan_nos)
         out["_repair_application_ids"].extend(sorted(missing_app_for_loan))
@@ -681,14 +695,40 @@ def validate_application_missing_for_window(
         f"application_src={len(app_ids)} loan_src={len(loan_ids)} "
         f"id_mapping_src={len(mapping_ids)}"
     )
-    return validate_application_missing_for_ids(
-        cfg,
-        src,
-        tgt,
-        application_ids=app_ids,
-        loan_ids=loan_ids,
-        id_mapping_ids=mapping_ids,
+    app_id_set = {int(x) for x in app_ids if x is not None}
+    loan_id_set = {int(x) for x in loan_ids if x is not None}
+    mapping_id_set = {int(x) for x in mapping_ids if x is not None}
+    all_ids = sorted(app_id_set | loan_id_set | mapping_id_set)
+    out: Dict[str, List[Any]] = {
+        "application_ids": [],
+        "loan_app_nos": [],
+        "id_mapping": [],
+        "_repair_application_ids": [],
+    }
+    if not all_ids:
+        return out
+    batch_size = max(1, int(cfg.get("app_validate_batch", APP_VALIDATE_BATCH)))
+    total_batches = (len(all_ids) + batch_size - 1) // batch_size
+    for batch_no, i in enumerate(range(0, len(all_ids), batch_size), start=1):
+        batch_ids = set(all_ids[i:i + batch_size])
+        repair_log(f"validate application batch {batch_no}/{total_batches} ids={len(batch_ids)}")
+        part = validate_application_missing_for_ids(
+            cfg,
+            src,
+            tgt,
+            application_ids=sorted(app_id_set & batch_ids),
+            loan_ids=sorted(loan_id_set & batch_ids),
+            id_mapping_ids=sorted(mapping_id_set & batch_ids),
+        )
+        _merge_app_missing(out, part)
+    out["_repair_application_ids"] = sorted({int(x) for x in out["_repair_application_ids"]})
+    repair_log(
+        "validate application window done "
+        f"missing_application={len(out['application_ids'])} "
+        f"missing_loan={len(out['loan_app_nos'])} "
+        f"missing_id_mapping={len(out['id_mapping'])}"
     )
+    return out
 
 
 def source_application_ids_by_nos(src, app_nos: Sequence[str]) -> Dict[str, int]:
@@ -732,22 +772,35 @@ def target_application_nos(tgt, app_nos: Sequence[str], chunk_size: int = TARGET
     return out
 
 
-def target_loan_app_nos(tgt, app_nos: Sequence[str], chunk_size: int = TARGET_LOOKUP_CHUNK) -> set:
+def target_loan_app_nos(
+    cfg: Dict[str, Any],
+    tgt,
+    app_nos: Sequence[str],
+    chunk_size: int = TARGET_LOOKUP_CHUNK,
+) -> set:
     vals = [str(x) for x in app_nos if x]
     if not vals:
         return set()
     out = set()
     chunk_size = max(1, int(chunk_size or TARGET_LOOKUP_CHUNK))
-    for i in range(0, len(vals), chunk_size):
+    total_chunks = (len(vals) + chunk_size - 1) // chunk_size
+    for chunk_idx, i in enumerate(range(0, len(vals), chunk_size), start=1):
         part = vals[i:i + chunk_size]
         ph = ",".join(["%s"] * len(part))
-        rows = q_values(
-            tgt,
-            f"SELECT DISTINCT application_no FROM loan WHERE application_no IN ({ph})",
-            part,
-            "application_no",
-        )
-        out.update(str(x) for x in rows)
+
+        def _query(conn, _ph=ph, _part=part):
+            rows = q_values(
+                conn,
+                f"SELECT DISTINCT application_no FROM loan WHERE application_no IN ({_ph})",
+                _part,
+                "application_no",
+            )
+            return {str(x) for x in rows}
+
+        tgt, part_out = _target_conn_retry(cfg, tgt, _query)
+        out.update(part_out)
+        if chunk_idx == 1 or chunk_idx % 20 == 0 or chunk_idx == total_chunks:
+            repair_log(f"validate loan target lookup chunk={chunk_idx}/{total_chunks} matched={len(out)}")
     return out
 
 
@@ -761,8 +814,9 @@ def target_application_keys(
     if not vals:
         return tgt, set()
     out = set()
-    chunk_size = max(1, min(int(chunk_size or TARGET_LOOKUP_CHUNK), 200))
-    for i in range(0, len(vals), chunk_size):
+    chunk_size = max(1, min(int(chunk_size or TARGET_LOOKUP_CHUNK), 50))
+    total_chunks = (len(vals) + chunk_size - 1) // chunk_size
+    for chunk_idx, i in enumerate(range(0, len(vals), chunk_size), start=1):
         part = vals[i:i + chunk_size]
         wanted = set(part)
         sns = sorted({sn for _, _, sn in part})
@@ -779,6 +833,8 @@ def target_application_keys(
             )
             if key in wanted
         )
+        if chunk_idx == 1 or chunk_idx % 20 == 0 or chunk_idx == total_chunks:
+            repair_log(f"validate app target lookup chunk={chunk_idx}/{total_chunks} matched={len(out)}")
     return tgt, out
 
 
@@ -1091,28 +1147,62 @@ def target_existing_user_product_keys(tgt, keys: Sequence[Tuple[int, str]]) -> s
     return out
 
 
+def _target_rows_by_key_chunk_sql(
+    table: str,
+    key_cols: Sequence[str],
+    columns: Sequence[str],
+    part: Sequence[dict],
+) -> Tuple[str, List[Any]]:
+    cols_sql = ", ".join(_quote_ident(c) for c in columns)
+    if len(key_cols) == 1:
+        col = key_cols[0]
+        keys = [row.get(col) for row in part]
+        ph = ",".join(["%s"] * len(keys))
+        sql = f"SELECT {cols_sql} FROM {_quote_ident(table)} WHERE {_quote_ident(col)} IN ({ph})"
+        return sql, list(keys)
+    cols_expr = ", ".join(_quote_ident(c) for c in key_cols)
+    tuple_ph = []
+    params: List[Any] = []
+    for row in part:
+        tuple_ph.append(f"({','.join(['%s'] * len(key_cols))})")
+        params.extend(row.get(c) for c in key_cols)
+    sql = f"SELECT {cols_sql} FROM {_quote_ident(table)} WHERE ({cols_expr}) IN ({','.join(tuple_ph)})"
+    return sql, params
+
+
 def target_rows_by_key(
     tgt,
     table: str,
     key_cols: Sequence[str],
     rows: Sequence[dict],
     columns: Sequence[str],
-    chunk_size: int = 500,
+    chunk_size: int = FIELD_DIFF_LOOKUP_CHUNK,
+    cfg: Optional[Dict[str, Any]] = None,
+    log_label: str = "",
 ) -> Dict[Tuple[Any, ...], dict]:
     if not rows:
         return {}
     out: Dict[Tuple[Any, ...], dict] = {}
-    cols_sql = ", ".join(_quote_ident(c) for c in columns)
-    key_expr = " AND ".join(f"{_quote_ident(c)}=%s" for c in key_cols)
-    for i in range(0, len(rows), max(1, chunk_size)):
+    chunk_size = max(1, int(chunk_size or FIELD_DIFF_LOOKUP_CHUNK))
+    total_chunks = (len(rows) + chunk_size - 1) // chunk_size
+    for chunk_idx, i in enumerate(range(0, len(rows), chunk_size), start=1):
         part = list(rows[i:i + chunk_size])
-        where = " OR ".join(f"({key_expr})" for _ in part)
-        params: List[Any] = []
-        for row in part:
-            params.extend(row.get(c) for c in key_cols)
-        got = q_rows(tgt, f"SELECT {cols_sql} FROM {_quote_ident(table)} WHERE {where}", params)
+        sql, params = _target_rows_by_key_chunk_sql(table, key_cols, columns, part)
+
+        def _query(conn, _sql=sql, _params=params):
+            return q_rows(conn, _sql, _params)
+
+        if cfg is not None:
+            tgt, got = _target_conn_retry(cfg, tgt, _query)
+        else:
+            got = _query(tgt)
         for row in got:
             out[tuple(row.get(c) for c in key_cols)] = row
+        if log_label and (chunk_idx == 1 or chunk_idx % 20 == 0 or chunk_idx == total_chunks):
+            repair_log(
+                f"field diff fetch {log_label} chunk={chunk_idx}/{total_chunks} "
+                f"rows={len(part)} fetched={len(got)} total={len(out)}"
+            )
     return out
 
 
@@ -1280,20 +1370,26 @@ def collect_field_diffs_for_window(
     tgt,
     window: DateWindow,
     table_sel: set,
+    chunk_size: int = FIELD_DIFF_LOOKUP_CHUNK,
 ) -> List[FieldDiff]:
     diffs: List[FieldDiff] = []
     do_user = "all" in table_sel or "user" in table_sel
     do_app = "all" in table_sel or "application" in table_sel
+    lookup_kw = {"cfg": cfg, "chunk_size": chunk_size}
     if do_user:
+        repair_log(f"field diff user phase start chunk_size={chunk_size}")
         user_ids = sorted(set(source_user_ids_by_created_window(src, window)) | set(source_bankcard_user_ids_by_window(src, window)))
         product_keys = source_user_product_keys_by_apply_date_window(src, window)
         product_user_ids = sorted({user_id for user_id, _ in product_keys})
         rows_user, rows_info, rows_bankcard, _rows_product_for_users = _prepare_expected_user_rows_for_ids(cfg, src, sorted(set(user_ids) | set(product_user_ids)))
         product_rows = mig._build_user_product_rows(_source_user_product_rows_for_keys(src, product_keys))
-        user_actual = target_rows_by_key(tgt, "user", ["user_id"], rows_user, mig.USER_INSERT_COLS)
-        info_actual = target_rows_by_key(tgt, "user_info", ["user_id"], rows_info, mig.USER_INFO_COLS)
-        bank_actual = target_rows_by_key(tgt, "user_bankcard", ["group_user_id"], rows_bankcard, mig.USER_BANKCARD_COLS)
-        product_actual = target_rows_by_key(tgt, "user_product", ["group_user_id", "product_id"], product_rows, mig.USER_PRODUCT_COLS)
+        user_actual = target_rows_by_key(tgt, "user", ["user_id"], rows_user, mig.USER_INSERT_COLS, log_label="user", **lookup_kw)
+        info_actual = target_rows_by_key(tgt, "user_info", ["user_id"], rows_info, mig.USER_INFO_COLS, log_label="user_info", **lookup_kw)
+        bank_actual = target_rows_by_key(tgt, "user_bankcard", ["group_user_id"], rows_bankcard, mig.USER_BANKCARD_COLS, log_label="user_bankcard", **lookup_kw)
+        product_actual = target_rows_by_key(
+            tgt, "user_product", ["group_user_id", "product_id"], product_rows, mig.USER_PRODUCT_COLS,
+            log_label="user_product", **lookup_kw,
+        )
         for row in rows_user:
             key = (row["user_id"],)
             diffs.extend(_diff_rows("user", str(row["user_id"]), row, user_actual.get(key), [c for c in mig.USER_INSERT_COLS if c != "user_id"]))
@@ -1311,14 +1407,19 @@ def collect_field_diffs_for_window(
             key = (row["group_user_id"], row["product_id"])
             cols = [c for c in mig.USER_PRODUCT_COLS if c not in ("group_user_id", "product_id")]
             diffs.extend(_diff_rows("user_product", f"({row['group_user_id']},{row['product_id']})", row, product_actual.get(key), cols))
+        repair_log(f"field diff user phase end diffs={len(diffs)}")
     if do_app:
+        repair_log(f"field diff application phase start chunk_size={chunk_size}")
         app_ids = set(source_application_ids_by_apply_date_window(src, window))
         loan_ids = set(source_application_ids_by_repay_plan_created_window(src, window))
         mapping_ids = set(source_application_ids_by_created_window(src, window))
         app_rows, loan_rows, mapping_rows = _expected_application_related_rows_for_ids(cfg, src, sorted(app_ids | loan_ids | mapping_ids))
-        app_actual = target_rows_by_key(tgt, "application", ["application_no"], app_rows, mig.APPLICATION_INSERT_COLS)
-        loan_actual = target_rows_by_key(tgt, "loan", ["loan_no"], loan_rows, mig.LOAN_INSERT_COLS)
-        mapping_actual = target_rows_by_key(tgt, "id_mapping", ["id", "app_id", "mapping_id", "type"], mapping_rows, mig.ID_MAPPING_COLS)
+        app_actual = target_rows_by_key(tgt, "application", ["application_no"], app_rows, mig.APPLICATION_INSERT_COLS, log_label="application", **lookup_kw)
+        loan_actual = target_rows_by_key(tgt, "loan", ["loan_no"], loan_rows, mig.LOAN_INSERT_COLS, log_label="loan", **lookup_kw)
+        mapping_actual = target_rows_by_key(
+            tgt, "id_mapping", ["id", "app_id", "mapping_id", "type"], mapping_rows, mig.ID_MAPPING_COLS,
+            log_label="id_mapping", **lookup_kw,
+        )
         for row in app_rows:
             key = (row["application_no"],)
             cols = [c for c in mig.APPLICATION_INSERT_COLS if c != "application_no"]
@@ -1330,6 +1431,7 @@ def collect_field_diffs_for_window(
         for row in mapping_rows:
             key = (row["id"], row["app_id"], row["mapping_id"], row["type"])
             diffs.extend(_diff_rows("id_mapping", "|".join(str(x) for x in key), row, mapping_actual.get(key), ["event_time"]))
+        repair_log(f"field diff application phase end diffs={len(diffs)}")
     repair_log(f"field diff window total={len(diffs)}")
     return diffs
 
@@ -1870,8 +1972,10 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--report-base-url", default="")
     p.add_argument("--date-window", choices=["last-month"], default="")
     p.add_argument("--from-validation-csv", default="", help="Skip validation and repair from an existing validate_all_missing CSV")
-    p.add_argument("--repair-lookup-chunk", type=int, default=100)
+    p.add_argument("--repair-lookup-chunk", type=int, default=50)
     p.add_argument("--repair-mapping-chunk", type=int, default=20)
+    p.add_argument("--field-diff-chunk", type=int, default=FIELD_DIFF_LOOKUP_CHUNK)
+    p.add_argument("--app-validate-batch", type=int, default=APP_VALIDATE_BATCH)
     p.add_argument("--start-id", type=int, default=0)
     p.add_argument("--end-id", type=int, default=0)
     return p.parse_args(argv)
@@ -1994,6 +2098,7 @@ def main(argv: Sequence[str] = None) -> int:
             if do_app:
                 cfg["repair_lookup_chunk"] = args.repair_lookup_chunk
                 cfg["repair_mapping_chunk"] = args.repair_mapping_chunk
+                cfg["app_validate_batch"] = args.app_validate_batch
                 if window:
                     app_missing = validate_application_missing_for_window(cfg, src, tgt, window)
                 else:
@@ -2003,7 +2108,13 @@ def main(argv: Sequence[str] = None) -> int:
                         max_app_id = q_int(src, "SELECT MAX(id) AS m FROM ng_loan_market.application")
                     app_missing = validate_application_missing(cfg, src, tgt, max_app_id, args.app_batch)
             if window:
-                field_diffs = collect_field_diffs_for_window(cfg, src, tgt, window, table_sel)
+                repair_log(
+                    f"field diff start chunk_size={args.field_diff_chunk} "
+                    f"app_validate_batch={args.app_validate_batch}"
+                )
+                field_diffs = collect_field_diffs_for_window(
+                    cfg, src, tgt, window, table_sel, chunk_size=args.field_diff_chunk,
+                )
         finally:
             mig._close_mysql_conn(src)
             mig._close_mysql_conn(tgt)

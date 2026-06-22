@@ -251,6 +251,9 @@ def connect_target(cfg: Dict[str, Any]):
         charset="utf8mb4",
         autocommit=False,
         cursorclass=DictCursor,
+        connect_timeout=int(cfg.get("mysql_connect_timeout") or 60),
+        read_timeout=int(cfg.get("mysql_read_timeout") or 3600),
+        write_timeout=int(cfg.get("mysql_write_timeout") or 3600),
     )
 
 
