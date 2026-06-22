@@ -30,7 +30,7 @@ APP_TABLES = ("application", "loan", "id_mapping")
 TARGET_LOOKUP_CHUNK = 500
 TARGET_MAPPING_CHUNK = 200
 FIELD_DIFF_LOOKUP_CHUNK = 50
-APP_VALIDATE_BATCH = 3000
+APP_VALIDATE_BATCH = 10000
 
 
 _repair_log_file: Optional[Path] = None
