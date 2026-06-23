@@ -14,7 +14,6 @@ import csv
 import json
 import sys
 import time
-from dataclasses import dataclass, field
 from decimal import Decimal
 from datetime import datetime
 from pathlib import Path
@@ -73,28 +72,28 @@ class DateWindow(NamedTuple):
         return self.end.strftime("%Y-%m-%d %H:%M:%S")
 
 
-@dataclass
 class WindowSourceCache:
     """One-month window source rows preloaded in batches for reuse across validate/field-diff."""
 
-    window: DateWindow
-    user_ids: List[int] = field(default_factory=list)
-    bankcard_user_ids: List[int] = field(default_factory=list)
-    product_keys: List[Tuple[int, str]] = field(default_factory=list)
-    app_ids_by_apply: List[int] = field(default_factory=list)
-    loan_app_ids: List[int] = field(default_factory=list)
-    mapping_app_ids: List[int] = field(default_factory=list)
-    all_app_ids: List[int] = field(default_factory=list)
-    rows_user: List[dict] = field(default_factory=list)
-    rows_info: List[dict] = field(default_factory=list)
-    rows_bankcard: List[dict] = field(default_factory=list)
-    product_rows: List[dict] = field(default_factory=list)
-    src_map: Dict[int, str] = field(default_factory=dict)
-    app_keys_by_no: Dict[str, Tuple[str, int, str]] = field(default_factory=dict)
-    src_mapping_by_app_id: Dict[Tuple[str, int, str, str], set] = field(default_factory=dict)
-    app_rows: List[dict] = field(default_factory=list)
-    loan_rows: List[dict] = field(default_factory=list)
-    mapping_rows: List[dict] = field(default_factory=list)
+    def __init__(self, window: "DateWindow") -> None:
+        self.window = window
+        self.user_ids: List[int] = []
+        self.bankcard_user_ids: List[int] = []
+        self.product_keys: List[Tuple[int, str]] = []
+        self.app_ids_by_apply: List[int] = []
+        self.loan_app_ids: List[int] = []
+        self.mapping_app_ids: List[int] = []
+        self.all_app_ids: List[int] = []
+        self.rows_user: List[dict] = []
+        self.rows_info: List[dict] = []
+        self.rows_bankcard: List[dict] = []
+        self.product_rows: List[dict] = []
+        self.src_map: Dict[int, str] = {}
+        self.app_keys_by_no: Dict[str, Tuple[str, int, str]] = {}
+        self.src_mapping_by_app_id: Dict[Tuple[str, int, str, str], set] = {}
+        self.app_rows: List[dict] = []
+        self.loan_rows: List[dict] = []
+        self.mapping_rows: List[dict] = []
 
 
 def set_repair_log(path: str) -> None:
