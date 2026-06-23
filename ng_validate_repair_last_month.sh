@@ -96,7 +96,7 @@ python3 validate_and_repair.py \
   --date-window last-month \
   --repair-lookup-chunk 50 \
   --app-validate-batch 10000 \
-  --field-diff-chunk 50 \
+  --field-diff-chunk 200 \
   --reports-dir "$REPORTS_DIR" \
   --repair-log "$REPAIR_LOG" \
   --feishu-webhook "${FEISHU_WEBHOOK:-}" \
