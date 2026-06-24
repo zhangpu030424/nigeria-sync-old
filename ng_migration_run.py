@@ -2290,6 +2290,7 @@ def _build_loan_row(rp: dict, application_no: str) -> dict:
     repay_last = int(rp.get("repay_last_time") or 0)
     settle_time = int(rp.get("settle_time") or 0)
     paid_amount = repaid if st in (2, 4) else 0
+    paid_time_ms = _to_epoch_ms(repay_last) if repay_last > 0 else 0
     return {
         "loan_no": f"NG-{rp['plan_sn']}",
         "application_no": application_no,
@@ -2307,7 +2308,7 @@ def _build_loan_row(rp: dict, application_no: str) -> dict:
         "reduction_amount": 0,
         "total_amount": int(rp.get("amt") or 0),
         "paid_amount": paid_amount,
-        "paid_time": repay_last if repay_last > 0 else None,
+        "paid_time": paid_time_ms if paid_time_ms > 0 else None,
         "paid_off_date": _unix_to_date_str(settle_time) if settle_time > 0 else None,
         "created_time": _to_epoch_ms(rp.get("created_at")),
         "status": _map_loan_status(st, repaid),
