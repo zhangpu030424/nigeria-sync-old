@@ -404,11 +404,12 @@ def validate_user_missing(src, tgt, max_user_id: int, batch_size: int) -> Dict[s
 
 
 def validate_user_missing_for_window(
+    cfg: Dict[str, Any],
     src,
     tgt,
     window: DateWindow,
     cache: Optional[WindowSourceCache] = None,
-) -> Dict[str, List[Any]]:
+) -> Tuple[Dict[str, List[Any]], Any]:
     if cache is not None:
         user_ids = cache.user_ids
         bankcard_user_ids = cache.bankcard_user_ids
@@ -418,10 +419,31 @@ def validate_user_missing_for_window(
         bankcard_user_ids = source_bankcard_user_ids_by_window(src, window)
         product_keys = source_user_product_keys_by_apply_date_window(src, window)
 
-    tgt_user = target_existing_user_ids(tgt, user_ids)
-    tgt_info = target_existing_user_info_ids(tgt, user_ids)
-    tgt_bank = target_existing_bankcard_user_ids(tgt, bankcard_user_ids)
-    tgt_products = target_existing_user_product_keys(tgt, product_keys)
+    repair_log(
+        f"validate user window target_lookup start "
+        f"users={len(user_ids)} bankcard={len(bankcard_user_ids)} product_keys={len(product_keys)}"
+    )
+    t0 = time.time()
+    repair_log(f"validate user window target_lookup user start count={len(user_ids)}")
+    tgt, tgt_user = target_existing_user_ids(cfg, tgt, user_ids, log_label="validate user")
+    repair_log(f"validate user window target_lookup user done matched={len(tgt_user)} elapsed={time.time() - t0:.1f}s")
+    t1 = time.time()
+    repair_log(f"validate user window target_lookup user_info start count={len(user_ids)}")
+    tgt, tgt_info = target_existing_user_info_ids(cfg, tgt, user_ids, log_label="validate user_info")
+    repair_log(f"validate user window target_lookup user_info done matched={len(tgt_info)} elapsed={time.time() - t1:.1f}s")
+    t2 = time.time()
+    repair_log(f"validate user window target_lookup bankcard start count={len(bankcard_user_ids)}")
+    tgt, tgt_bank = target_existing_bankcard_user_ids(cfg, tgt, bankcard_user_ids, log_label="validate user_bankcard")
+    repair_log(f"validate user window target_lookup bankcard done matched={len(tgt_bank)} elapsed={time.time() - t2:.1f}s")
+    t3 = time.time()
+    repair_log(f"validate user window target_lookup user_product start count={len(product_keys)}")
+    tgt, tgt_products = target_existing_user_product_keys(
+        cfg, tgt, product_keys, log_label="validate user_product",
+    )
+    repair_log(
+        f"validate user window target_lookup user_product done matched={len(tgt_products)} "
+        f"elapsed={time.time() - t3:.1f}s total_elapsed={time.time() - t0:.1f}s"
+    )
 
     out: Dict[str, List[Any]] = {
         "user": sorted(set(user_ids) - tgt_user),
@@ -439,7 +461,7 @@ def validate_user_missing_for_window(
         f"missing_info={len(out['user_info'])} missing_bankcard={len(out['user_bankcard'])} "
         f"missing_product={len(out['user_product'])}"
     )
-    return out
+    return out, tgt
 
 
 def source_bankcard_user_ids(src, lo: int, hi: int) -> List[int]:
@@ -1145,59 +1167,98 @@ def target_exists_user_info(tgt, user_id: int) -> bool:
     return bool(q_int(tgt, "SELECT COUNT(*) AS c FROM user_info WHERE user_id=%s", (user_id,)))
 
 
-def target_existing_user_ids(tgt, user_ids: Sequence[int]) -> set:
+def target_existing_user_ids(
+    cfg: Dict[str, Any],
+    tgt,
+    user_ids: Sequence[int],
+    log_label: str = "",
+) -> Tuple[Any, set]:
     vals = sorted({int(x) for x in user_ids if x is not None})
     out = set()
-    for i in range(0, len(vals), 5000):
+    total_chunks = max(1, (len(vals) + 4999) // 5000) if vals else 0
+    chunk_t0 = time.time()
+    for chunk_idx, i in enumerate(range(0, len(vals), 5000), start=1):
         part = vals[i:i + 5000]
         if not part:
             continue
         ph = ",".join(["%s"] * len(part))
-        out.update(int(x) for x in q_values(
-            tgt,
-            f"SELECT user_id FROM `user` WHERE user_id IN ({ph})",
-            part,
-            "user_id",
-        ))
-    return out
+        sql = f"SELECT user_id FROM `user` WHERE user_id IN ({ph})"
+
+        def _query(conn, _sql=sql, _part=part):
+            return q_values(conn, _sql, _part, "user_id")
+
+        tgt, got = _target_conn_retry(cfg, tgt, _query)
+        out.update(int(x) for x in got)
+        if log_label and (chunk_idx == 1 or chunk_idx % 5 == 0 or chunk_idx == total_chunks):
+            repair_log(
+                f"{log_label} chunk={chunk_idx}/{total_chunks} matched={len(out)} "
+                f"elapsed={time.time() - chunk_t0:.1f}s"
+            )
+    return tgt, out
 
 
-def target_existing_user_info_ids(tgt, user_ids: Sequence[int]) -> set:
+def target_existing_user_info_ids(
+    cfg: Dict[str, Any],
+    tgt,
+    user_ids: Sequence[int],
+    log_label: str = "",
+) -> Tuple[Any, set]:
     vals = sorted({int(x) for x in user_ids if x is not None})
     out = set()
-    for i in range(0, len(vals), 5000):
+    total_chunks = max(1, (len(vals) + 4999) // 5000) if vals else 0
+    chunk_t0 = time.time()
+    for chunk_idx, i in enumerate(range(0, len(vals), 5000), start=1):
         part = vals[i:i + 5000]
         if not part:
             continue
         ph = ",".join(["%s"] * len(part))
-        out.update(int(x) for x in q_values(
-            tgt,
-            f"SELECT user_id FROM user_info WHERE user_id IN ({ph})",
-            part,
-            "user_id",
-        ))
-    return out
+        sql = f"SELECT user_id FROM user_info WHERE user_id IN ({ph})"
+
+        def _query(conn, _sql=sql, _part=part):
+            return q_values(conn, _sql, _part, "user_id")
+
+        tgt, got = _target_conn_retry(cfg, tgt, _query)
+        out.update(int(x) for x in got)
+        if log_label and (chunk_idx == 1 or chunk_idx % 5 == 0 or chunk_idx == total_chunks):
+            repair_log(
+                f"{log_label} chunk={chunk_idx}/{total_chunks} matched={len(out)} "
+                f"elapsed={time.time() - chunk_t0:.1f}s"
+            )
+    return tgt, out
 
 
 def target_exists_user_bankcard(tgt, user_id: int) -> bool:
     return bool(q_int(tgt, "SELECT COUNT(*) AS c FROM user_bankcard WHERE group_user_id=%s", (user_id,)))
 
 
-def target_existing_bankcard_user_ids(tgt, user_ids: Sequence[int]) -> set:
+def target_existing_bankcard_user_ids(
+    cfg: Dict[str, Any],
+    tgt,
+    user_ids: Sequence[int],
+    log_label: str = "",
+) -> Tuple[Any, set]:
     vals = sorted({int(x) for x in user_ids if x is not None})
     out = set()
-    for i in range(0, len(vals), 5000):
+    total_chunks = max(1, (len(vals) + 4999) // 5000) if vals else 0
+    chunk_t0 = time.time()
+    for chunk_idx, i in enumerate(range(0, len(vals), 5000), start=1):
         part = vals[i:i + 5000]
         if not part:
             continue
         ph = ",".join(["%s"] * len(part))
-        out.update(int(x) for x in q_values(
-            tgt,
-            f"SELECT DISTINCT group_user_id FROM user_bankcard WHERE group_user_id IN ({ph})",
-            part,
-            "group_user_id",
-        ))
-    return out
+        sql = f"SELECT DISTINCT group_user_id FROM user_bankcard WHERE group_user_id IN ({ph})"
+
+        def _query(conn, _sql=sql, _part=part):
+            return q_values(conn, _sql, _part, "group_user_id")
+
+        tgt, got = _target_conn_retry(cfg, tgt, _query)
+        out.update(int(x) for x in got)
+        if log_label and (chunk_idx == 1 or chunk_idx % 5 == 0 or chunk_idx == total_chunks):
+            repair_log(
+                f"{log_label} chunk={chunk_idx}/{total_chunks} matched={len(out)} "
+                f"elapsed={time.time() - chunk_t0:.1f}s"
+            )
+    return tgt, out
 
 
 def target_exists_user_product(tgt, user_id: int, product_id: str) -> bool:
@@ -1208,10 +1269,17 @@ def target_exists_user_product(tgt, user_id: int, product_id: str) -> bool:
     ))
 
 
-def target_existing_user_product_keys(tgt, keys: Sequence[Tuple[int, str]]) -> set:
+def target_existing_user_product_keys(
+    cfg: Dict[str, Any],
+    tgt,
+    keys: Sequence[Tuple[int, str]],
+    log_label: str = "",
+) -> Tuple[Any, set]:
     vals = sorted({(int(user_id), str(product_id)) for user_id, product_id in keys})
     out = set()
-    for i in range(0, len(vals), 1000):
+    total_chunks = max(1, (len(vals) + 999) // 1000) if vals else 0
+    chunk_t0 = time.time()
+    for chunk_idx, i in enumerate(range(0, len(vals), 1000), start=1):
         part = vals[i:i + 1000]
         if not part:
             continue
@@ -1219,14 +1287,22 @@ def target_existing_user_product_keys(tgt, keys: Sequence[Tuple[int, str]]) -> s
         params: List[Any] = []
         for user_id, product_id in part:
             params.extend([user_id, product_id])
-        rows = q_rows(
-            tgt,
+        sql = (
             "SELECT group_user_id, product_id FROM user_product "
-            f"WHERE (group_user_id, product_id) IN ({tuple_ph})",
-            params,
+            f"WHERE (group_user_id, product_id) IN ({tuple_ph})"
         )
+
+        def _query(conn, _sql=sql, _params=params):
+            return q_rows(conn, _sql, _params)
+
+        tgt, rows = _target_conn_retry(cfg, tgt, _query)
         out.update((int(r["group_user_id"]), str(r["product_id"])) for r in rows)
-    return out
+        if log_label and (chunk_idx == 1 or chunk_idx % 10 == 0 or chunk_idx == total_chunks):
+            repair_log(
+                f"{log_label} chunk={chunk_idx}/{total_chunks} "
+                f"matched={len(out)} elapsed={time.time() - chunk_t0:.1f}s"
+            )
+    return tgt, out
 
 
 def _target_rows_by_key_chunk_sql(
@@ -2081,8 +2157,8 @@ def repair_user_rows(cfg: Dict[str, Any], user_ids: Sequence[int], writer) -> No
         else:
             inserted = 0
         repair_log(f"user direct inserted={inserted} candidates={len(rows_ok)} source_rows={len(rows_user)}")
-        existing_users = target_existing_user_ids(tgt, ids)
-        existing_infos = target_existing_user_info_ids(tgt, ids)
+        existing_users = target_existing_user_ids(cfg, tgt, ids)[1]
+        existing_infos = target_existing_user_info_ids(cfg, tgt, ids)[1]
         for user_id in ids:
             ok_user = user_id in existing_users
             ok_info = user_id in existing_infos
@@ -2148,7 +2224,7 @@ def repair_bankcard_rows(cfg: Dict[str, Any], user_ids: Sequence[int], writer) -
         repair_log(f"user_bankcard vt prefetch rows={len(ud_rows)} elapsed={time.perf_counter() - t0:.2f}s {vt.summary()}")
         rows = mig._build_bankcard_rows(lookups, vt, cfg=cfg)
         rows_by_user = {int(row["group_user_id"]): row for row in rows}
-        existing_before = target_existing_bankcard_user_ids(tgt, ids)
+        existing_before = target_existing_bankcard_user_ids(cfg, tgt, ids)[1]
         insert_rows = [
             row for row in rows
             if int(row["group_user_id"]) not in existing_before
@@ -2163,7 +2239,7 @@ def repair_bankcard_rows(cfg: Dict[str, Any], user_ids: Sequence[int], writer) -
         else:
             inserted = 0
         repair_log(f"user_bankcard inserted={inserted} candidates={len(rows)}")
-        existing_after = target_existing_bankcard_user_ids(tgt, ids)
+        existing_after = target_existing_bankcard_user_ids(cfg, tgt, ids)[1]
         for user_id in ids:
             ok = user_id in existing_after
             has_source = user_id in rows_by_user
@@ -2215,7 +2291,7 @@ def repair_user_product_rows(cfg: Dict[str, Any], product_keys: Sequence[Tuple[i
             (int(row["group_user_id"]), str(row["product_id"])): row
             for row in rows
         }
-        existing_before = target_existing_user_product_keys(tgt, keys)
+        existing_before = target_existing_user_product_keys(cfg, tgt, keys)[1]
         insert_rows = [
             row for row in rows
             if (int(row["group_user_id"]), str(row["product_id"])) not in existing_before
@@ -2230,7 +2306,7 @@ def repair_user_product_rows(cfg: Dict[str, Any], product_keys: Sequence[Tuple[i
         else:
             inserted = 0
         repair_log(f"user_product inserted={inserted} candidates={len(rows)}")
-        existing_after = target_existing_user_product_keys(tgt, keys)
+        existing_after = target_existing_user_product_keys(cfg, tgt, keys)[1]
         for user_id, product_id in keys:
             ok = (user_id, product_id) in existing_after
             has_source = (user_id, product_id) in rows_by_key
@@ -2561,7 +2637,9 @@ def main(argv: Sequence[str] = None) -> int:
                 window_cache = load_window_source_cache(cfg, src, window)
             if do_user:
                 if window:
-                    user_missing = validate_user_missing_for_window(src, tgt, window, cache=window_cache)
+                    user_missing, tgt = validate_user_missing_for_window(
+                        cfg, src, tgt, window, cache=window_cache,
+                    )
                 else:
                     max_user_id = int(cfg.get("max_user_id") or 0)
                     user_missing = validate_user_missing(src, tgt, max_user_id, args.user_batch)
