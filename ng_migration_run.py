@@ -368,26 +368,43 @@ def preload_vt_token_store(cfg: Dict[str, Any]) -> int:
               AND token IS NOT NULL AND token <> ''
         """
         t0 = time.perf_counter()
+        mig_log(f"== VT preload start db={vt_db} ==")
+        progress_fn = cfg.get("progress_log_fn")
+        if progress_fn:
+            progress_fn("vt preload start (full vt_token_cache, may take a while)...")
         src = connect_source(cfg)
         store: Dict[Tuple[str, str], str] = {}
         try:
             with src.cursor() as cur:
                 cur.execute(sql)
+                chunk_no = 0
                 while True:
                     chunk = cur.fetchmany(50000)
                     if not chunk:
                         break
+                    chunk_no += 1
                     for row in chunk:
                         store[(row["vt_type"], row["raw_value"])] = row["token"]
+                    if chunk_no == 1 or chunk_no % 10 == 0:
+                        el = time.perf_counter() - t0
+                        msg = (
+                            f"vt preload progress chunks={chunk_no} rows={len(store)} "
+                            f"elapsed={el:.1f}s"
+                        )
+                        mig_log(f"== {msg} ==")
+                        if progress_fn:
+                            progress_fn(msg)
         finally:
             _close_mysql_conn(src)
         _vt_global_store = store
         el = time.perf_counter() - t0
         rate = (len(store) / el) if el > 0 else 0.0
-        mig_log(
-            f"== VT preload done rows={len(store)} elapsed={el:.1f}s "
-            f"({rate:.0f} rows/s) =="
+        done_msg = (
+            f"vt preload done rows={len(store)} elapsed={el:.1f}s ({rate:.0f} rows/s)"
         )
+        mig_log(f"== {done_msg} ==")
+        if progress_fn:
+            progress_fn(done_msg)
         return len(store)
 
 

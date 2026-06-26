@@ -197,8 +197,16 @@ def load_window_upsert_cfg(env_path: str, args: argparse.Namespace) -> Dict[str,
     cfg["user_insert_batch"] = args.user_insert_batch
     cfg["app_insert_batch"] = args.app_insert_batch
     cfg["id_mapping_insert_batch"] = args.id_mapping_insert_batch
-    cfg["vt_preload"] = True
+    cfg["vt_preload"] = not args.no_vt_preload
     return cfg
+
+
+def _bind_cfg_log(cfg: Dict[str, Any], log_file: str) -> None:
+    """Route mig_log / VT preload progress to the same file as repair_log."""
+    cfg["log_file"] = log_file
+    p = Path(log_file)
+    cfg["skip_log_file"] = str(p.with_name(p.stem + ".skip.log"))
+    mig.init_log(cfg)
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -214,6 +222,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--user-insert-batch", type=int, default=5000)
     p.add_argument("--app-insert-batch", type=int, default=5000)
     p.add_argument("--id-mapping-insert-batch", type=int, default=10000)
+    p.add_argument(
+        "--no-vt-preload",
+        action="store_true",
+        help="Skip full vt_token_cache preload (default: preload with progress logs)",
+    )
     p.add_argument("--feishu-webhook", default="")
     p.add_argument("--report-base-url", default="")
     return p.parse_args(argv)
@@ -251,6 +264,8 @@ def main(argv: Sequence[str] = None) -> int:
     log_file = args.log_file or str(reports_dir / f"window_upsert_{ts}.log")
     vr.set_repair_log(log_file)
     cfg = load_window_upsert_cfg(args.env, args)
+    cfg["progress_log_fn"] = vr.repair_log
+    _bind_cfg_log(cfg, log_file)
     table_sel = {x.strip() for x in args.tables.split(",") if x.strip()}
     window = vr.compute_date_window(args.date_window)
     t0 = time.time()
@@ -258,7 +273,10 @@ def main(argv: Sequence[str] = None) -> int:
         f"======== WINDOW UPSERT START dry_run={int(dry_run)} "
         f"window=[{window.start_sql},{window.end_sql}) log={log_file} ========"
     )
-    mig.preload_vt_token_store(cfg)
+    if cfg.get("vt_preload"):
+        mig.preload_vt_token_store(cfg)
+    else:
+        vr.repair_log("vt preload disabled via --no-vt-preload")
     src = mig.connect_source(cfg)
     tgt = mig.connect_target(cfg)
     mig._session_opts(tgt)

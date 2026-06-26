@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Daily one-month window UPSERT sync (source read-only → target merge).
-# Keeps validate_and_repair (ng_validate_repair_last_month.sh) as fallback.
+# Default: nohup background (safe to exit SSH). Keeps validate_and_repair as fallback.
 set -eo pipefail
 
 cd "$(dirname "$0")"
@@ -15,6 +15,8 @@ set +a
 ts="$(date '+%Y%m%d_%H%M%S')"
 export LOG_FILE="${LOG_FILE:-/tmp/ng_window_upsert_last_month_${ts}.log}"
 export REPORTS_DIR="${REPORTS_DIR:-$(pwd)/reports}"
+export NOHUP_LOG="${NOHUP_LOG:-/tmp/ng_window_upsert_last_month_${ts}.nohup.log}"
+BACKGROUND="${BACKGROUND:-1}"
 job_status="starting"
 t0=0
 
@@ -68,6 +70,7 @@ status=${job_status}
 exit_code=${exit_code}
 elapsed=${elapsed}s
 log=${LOG_FILE}
+nohup=${NOHUP_LOG}
 reports_dir=${REPORTS_DIR}"
   exit "$exit_code"
 }
@@ -80,25 +83,53 @@ if [[ "$DRY_RUN" == "0" ]]; then
   APPLY_FLAG="--apply"
 fi
 
-phase_log "======== WINDOW UPSERT START host=$(hostname) dry_run=${DRY_RUN} ========"
-phase_log "CONFIG LOG_FILE=$LOG_FILE REPORTS_DIR=$REPORTS_DIR"
+phase_log "======== WINDOW UPSERT START host=$(hostname) dry_run=${DRY_RUN} background=${BACKGROUND} ========"
+phase_log "CONFIG LOG_FILE=$LOG_FILE NOHUP_LOG=$NOHUP_LOG REPORTS_DIR=$REPORTS_DIR"
 phase_log "FALLBACK: ng_validate_repair_last_month.sh (validate+repair) unchanged"
+phase_log "TAIL: tail -f $LOG_FILE"
+
+run_python() {
+  python3 window_upsert.py \
+    --date-window last-month \
+    $APPLY_FLAG \
+    --tables all \
+    --app-validate-batch "${APP_VALIDATE_BATCH:-20000}" \
+    --user-insert-batch "${USER_INSERT_BATCH:-5000}" \
+    --app-insert-batch "${APP_INSERT_BATCH:-5000}" \
+    --id-mapping-insert-batch "${ID_MAPPING_INSERT_BATCH:-10000}" \
+    --log-file "$LOG_FILE" \
+    --reports-dir "$REPORTS_DIR" \
+    --feishu-webhook "${FEISHU_WEBHOOK:-}" \
+    --report-base-url "${REPORT_BASE_URL:-}"
+}
 
 t0=$(date +%s)
-job_status="running window_upsert.py"
-python3 window_upsert.py \
-  --date-window last-month \
-  $APPLY_FLAG \
-  --tables all \
-  --app-validate-batch "${APP_VALIDATE_BATCH:-20000}" \
-  --user-insert-batch "${USER_INSERT_BATCH:-5000}" \
-  --app-insert-batch "${APP_INSERT_BATCH:-5000}" \
-  --id-mapping-insert-batch "${ID_MAPPING_INSERT_BATCH:-10000}" \
-  --log-file "$LOG_FILE" \
-  --reports-dir "$REPORTS_DIR" \
-  --feishu-webhook "${FEISHU_WEBHOOK:-}" \
-  --report-base-url "${REPORT_BASE_URL:-}" \
-  2>&1 | tee -a "$LOG_FILE"
+
+if [[ "$BACKGROUND" == "1" ]]; then
+  job_status="starting background window_upsert.py"
+  : > "$NOHUP_LOG"
+  nohup python3 window_upsert.py \
+    --date-window last-month \
+    $APPLY_FLAG \
+    --tables all \
+    --app-validate-batch "${APP_VALIDATE_BATCH:-20000}" \
+    --user-insert-batch "${USER_INSERT_BATCH:-5000}" \
+    --app-insert-batch "${APP_INSERT_BATCH:-5000}" \
+    --id-mapping-insert-batch "${ID_MAPPING_INSERT_BATCH:-10000}" \
+    --log-file "$LOG_FILE" \
+    --reports-dir "$REPORTS_DIR" \
+    --feishu-webhook "${FEISHU_WEBHOOK:-}" \
+    --report-base-url "${REPORT_BASE_URL:-}" \
+    >> "$NOHUP_LOG" 2>&1 &
+  pid=$!
+  phase_log "background started pid=${pid} log=${LOG_FILE} nohup=${NOHUP_LOG}"
+  phase_log "check: ps -p ${pid} -o pid,cmd"
+  phase_log "======== WINDOW UPSERT LAUNCHED (detach ok) ========"
+  exit 0
+fi
+
+job_status="running window_upsert.py foreground"
+run_python 2>&1 | tee -a "$LOG_FILE"
 job_status="completed"
 t1=$(date +%s)
 
