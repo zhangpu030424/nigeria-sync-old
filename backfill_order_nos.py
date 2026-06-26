@@ -15,8 +15,6 @@ Usage:
   python3 backfill_order_nos.py --env ./ng_migration.env --dry-run
   python3 backfill_order_nos.py --env ./ng_migration.env --apply --batch-size 5000
 """
-from __future__ import annotations
-
 import argparse
 import os
 import re

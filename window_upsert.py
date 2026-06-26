@@ -10,8 +10,6 @@ Usage:
   python3 window_upsert.py --date-window last-month --apply
   python3 window_upsert.py --date-window last-month --apply --tables application,loan
 """
-from __future__ import annotations
-
 import argparse
 import sys
 import time
