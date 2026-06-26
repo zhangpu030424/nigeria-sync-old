@@ -57,26 +57,14 @@ except ImportError:
 HERE = Path(__file__).resolve().parent
 ENV_FILE = HERE / "ng_migration.env"
 
-USER_PRODUCT_SCHEMES_JSON = _json_dumps({
-    "repayment_method": 1,
-    "interest_start": "next_day",
-    "term": 7,
-    "periods": 1,
-    "periods_days": [7],
-    "param_tpl": {
-        "interest_rate": 0,
-        "penalty_rate": 0.05,
-        "post_paid_rate": 0,
-        "reduction_rate": 0,
-        "roll_allowed": 0,
-        "roll_due_method": 1,
-        "rollover_rate": 0,
-        "service_fee_rate": 0,
-        "tax_fee_rate": 0,
-        "upfront_rate": 0.35,
-        "value_date": 0,
-    },
-})
+def _user_product_schemes_json(credit_amount: int) -> str:
+    return _json_dumps([
+        {
+            "schemeId": "PROD-001-D7",
+            "amountRange": [int(credit_amount)],
+        },
+    ])
+
 
 APPLICATION_SCHEME_PARAM_JSON = _json_dumps({
     "penalty_rate": 0.05,
@@ -1915,14 +1903,13 @@ def _fetch_user_batch_lookups(
 
 
 def _build_user_product_rows(prod_rows: List[dict]) -> List[dict]:
-    schemes = USER_PRODUCT_SCHEMES_JSON
     out: List[dict] = []
     for row in prod_rows:
         amount = int(row.get("amount") or 0)
         out.append({
             "group_user_id": int(row["userId"]),
             "product_id": str(row["productId"]),
-            "schemes": schemes,
+            "schemes": _user_product_schemes_json(amount),
             "is_open": 1,
             "credit_amount": amount,
             "unpaid_amount": amount,
