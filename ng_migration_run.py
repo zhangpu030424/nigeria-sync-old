@@ -1962,6 +1962,59 @@ LOAN_INSERT_COLS = [
 
 ID_MAPPING_COLS = ["id", "app_id", "mapping_id", "type", "event_time"]
 
+# Target order no format: {country}{appId(4)}-{sn} / {country}-{sn}-{period}{roll}
+COUNTRY_CODE = "ng"
+
+
+def format_application_no(app_id: Any, sn: Any) -> str:
+    core_sn = str(sn or "").strip()
+    if not core_sn:
+        return ""
+    try:
+        app_id_int = int(app_id or 0)
+    except (TypeError, ValueError):
+        app_id_int = 0
+    return f"{COUNTRY_CODE}{app_id_int:04d}-{core_sn}"
+
+
+def format_loan_no(sn: Any, period: int = 1, roll_sequence: int = 0) -> str:
+    core_sn = str(sn or "").strip()
+    if not core_sn:
+        return ""
+    return f"{COUNTRY_CODE}-{core_sn}-{int(period):02d}{int(roll_sequence):03d}"
+
+
+def formatted_application_no_from_row(row: dict) -> str:
+    return format_application_no(row.get("app_id"), row.get("core_sn"))
+
+
+def source_app_ids_to_target_application_nos(src, ids: Sequence[int]) -> Dict[int, str]:
+    vals = sorted({int(x) for x in ids if x is not None})
+    out: Dict[int, str] = {}
+    if not vals:
+        return out
+    m, c = "ng_loan_market", "ng_loan_core"
+    for i in range(0, len(vals), 5000):
+        part = vals[i:i + 5000]
+        ph = ",".join(["%s"] * len(part))
+        with src.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT a.id, a.`appId` AS app_id, ca.sn AS core_sn
+                FROM {m}.application a
+                LEFT JOIN {c}.application ca ON ca.ext_sn = a.applicationNo
+                WHERE a.id IN ({ph})
+                  AND a.applicationNo IS NOT NULL AND a.applicationNo <> ''
+                """,
+                part,
+            )
+            rows = list(cur.fetchall())
+        for row in rows:
+            app_no = format_application_no(row.get("app_id"), row.get("core_sn"))
+            if app_no:
+                out[int(row["id"])] = app_no
+    return out
+
 # 每条 application 按此顺序展开 mapping 行（与源 id 升序遍历配合）
 _ID_MAPPING_TYPE_SPECS: List[Tuple[str, str, Optional[str]]] = [
     ("mobile", "mobile", VtTokenResolver.VT_MOBILE),
@@ -2171,7 +2224,13 @@ def _build_application_rows(
     out: List[dict] = []
     for row in raw_rows:
         user_id = int(row["user_id"])
-        sn = row.get("sn") or ""
+        market_sn = row.get("sn") or ""
+        core_sn = str(row.get("core_sn") or "").strip()
+        if not core_sn:
+            continue
+        application_no = format_application_no(row.get("app_id"), core_sn)
+        if not application_no:
+            continue
         apply_date = row.get("apply_date") or 0
         due_date = row.get("due_date") or 0
         amount = int(row.get("amount") or 0)
@@ -2179,7 +2238,7 @@ def _build_application_rows(
         bank_raw = row.get("bank_account_number") or ""
         bvn_raw = bvn_map.get(user_id, "") or ""
         gaid_raw = row.get("gaid_idfa")
-        app_ctx = f"application_no={row['application_no']} user_id={user_id}"
+        app_ctx = f"application_no={application_no} market_no={row['application_no']} user_id={user_id}"
         if vt:
             mobile_val = vt.resolve_token(
                 VtTokenResolver.VT_MOBILE, mobile_raw,
@@ -2221,7 +2280,7 @@ def _build_application_rows(
             id_number_val = bvn_raw
             gaid_val = gaid_raw if gaid_raw not in (None, "") else None
         out.append({
-            "application_no": row["application_no"],
+            "application_no": application_no,
             "mobile": mobile_val,
             "coupon_code": "",
             "bid": row.get("bid") or "ng01",
@@ -2229,7 +2288,8 @@ def _build_application_rows(
             "app_version": row["app_version"],
             "user_id": user_id,
             "group_user_id": user_id,
-            "sn": sn,
+            "sn": core_sn,
+            "core_sn": core_sn,
             "is_test": 0,
             "is_first_apply": int(row.get("is_first_apply") or 0),
             "is_auto_apply": 0,
@@ -2257,7 +2317,7 @@ def _build_application_rows(
             "submited_time": int(row.get("core_apply_time") or 0) * 1000,
             "reviewed_time": int(row.get("core_audit_time") or 0) * 1000,
             "disbursed_time": int(row.get("disburse_time") or 0) * 1000,
-            "last_paid_time": repay_map.get(sn, 0) * 1000,
+            "last_paid_time": repay_map.get(market_sn, 0) * 1000,
             "paid_off_time": int(row.get("paid_time") or 0) * 1000,
             "lock_expire_time": (int(apply_date) + 7 * 86400) * 1000 if apply_date else 0,
             "status": _map_application_status(row.get("src_status")),
@@ -2291,11 +2351,14 @@ def _build_loan_row(rp: dict, application_no: str) -> dict:
     settle_time = int(rp.get("settle_time") or 0)
     paid_amount = repaid if st in (2, 4) else 0
     paid_time_ms = _to_epoch_ms(repay_last) if repay_last > 0 else 0
+    period = 1
+    roll_sequence = 0
+    loan_sn = str(rp.get("sn") or "").strip()
     return {
-        "loan_no": f"NG-{rp['plan_sn']}",
+        "loan_no": format_loan_no(loan_sn, period, roll_sequence),
         "application_no": application_no,
-        "period": 1,
-        "roll_sequence": 0,
+        "period": period,
+        "roll_sequence": roll_sequence,
         "start_date": _unix_to_date_str(rp.get("start_date")),
         "due_date": _unix_to_date_str(rp.get("due_date")),
         "due_date_final": _unix_to_date_str(rp.get("due_date")),
@@ -3081,7 +3144,7 @@ def _migrate_app_batch_once(
         included_app_nos = {r["application_no"] for r in rows}
         sn_to_app_no = {
             str(r["core_sn"]): r["application_no"]
-            for r in raw_rows
+            for r in rows
             if r.get("core_sn") and r["application_no"] in included_app_nos
         }
         app_skip = len(raw_rows) - len(rows)
@@ -3124,7 +3187,10 @@ def _migrate_app_batch_once(
     map_ins = 0
     if raw_rows and vt is not None:
         included_app_nos = {r["application_no"] for r in rows} if rows else set()
-        map_src = [r for r in raw_rows if r["application_no"] in included_app_nos]
+        map_src = [
+            r for r in raw_rows
+            if formatted_application_no_from_row(r) in included_app_nos
+        ]
         rows_map = _build_id_mapping_rows(map_src, bvn_map, vt)
         if rows_map:
             _ping_mysql_conn(tgt, cfg, "target")

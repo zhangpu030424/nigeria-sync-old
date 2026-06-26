@@ -958,22 +958,21 @@ def build_application_validation_rows(cfg: Dict[str, Any], src, lo: int, hi: int
     vt.prefetch()
     app_rows = mig._build_application_rows(raw_rows, bvn_map, {}, vt)
     source_map = {
-        int(r["source_app_id"]): str(r["application_no"])
+        int(r["source_app_id"]): mig.formatted_application_no_from_row(r)
         for r in raw_rows
-        if r.get("source_app_id") is not None
+        if r.get("source_app_id") is not None and mig.formatted_application_no_from_row(r)
     }
     app_keys_by_no = {
         str(r["application_no"]): (str(r["mobile"]), int(r["group_user_id"]), str(r["sn"]))
         for r in app_rows
     }
     mapping_by_app_id: Dict[Tuple[str, int, str, str], set] = {}
-    app_no_to_id = {app_no: app_id for app_id, app_no in source_map.items()}
     included_nos = set(app_keys_by_no)
     for raw_row in raw_rows:
-        app_no = str(raw_row.get("application_no") or "")
+        app_no = mig.formatted_application_no_from_row(raw_row)
         if app_no not in included_nos:
             continue
-        source_app_id = app_no_to_id.get(app_no)
+        source_app_id = raw_row.get("source_app_id")
         if source_app_id is None:
             continue
         for row in mig._build_id_mapping_rows([raw_row], bvn_map, vt):
@@ -1516,11 +1515,11 @@ def _expected_application_related_rows_for_ids(
     included = {row["application_no"] for row in app_rows}
     sn_to_app_no = {
         str(r["core_sn"]): r["application_no"]
-        for r in raw_rows
-        if r.get("core_sn") and r["application_no"] in included
+        for r in app_rows
+        if r.get("core_sn")
     }
     loan_rows = mig._fetch_loan_rows_from_source(src, sn_to_app_no)
-    map_src = [r for r in raw_rows if r["application_no"] in included]
+    map_src = [r for r in raw_rows if mig.formatted_application_no_from_row(r) in included]
     mapping_rows = mig._build_id_mapping_rows(map_src, bvn_map, vt)
     return app_rows, loan_rows, mapping_rows
 
@@ -1562,22 +1561,21 @@ def _load_application_batch_source(
     vt.prefetch()
     app_rows = mig._build_application_rows(raw_rows, bvn_map, repay_map, vt)
     source_map = {
-        int(r["source_app_id"]): str(r["application_no"])
+        int(r["source_app_id"]): mig.formatted_application_no_from_row(r)
         for r in raw_rows
-        if r.get("source_app_id") is not None
+        if r.get("source_app_id") is not None and mig.formatted_application_no_from_row(r)
     }
     app_keys_by_no = {
         str(r["application_no"]): (str(r["mobile"]), int(r["group_user_id"]), str(r["sn"]))
         for r in app_rows
     }
     mapping_by_app_id: Dict[Tuple[str, int, str, str], set] = {}
-    app_no_to_source_id = {app_no: app_id for app_id, app_no in source_map.items()}
     included_nos = set(app_keys_by_no)
     for raw_row in raw_rows:
-        app_no = str(raw_row.get("application_no") or "")
+        app_no = mig.formatted_application_no_from_row(raw_row)
         if app_no not in included_nos:
             continue
-        source_app_id = app_no_to_source_id.get(app_no)
+        source_app_id = raw_row.get("source_app_id")
         if source_app_id is None:
             continue
         for row in mig._build_id_mapping_rows([raw_row], bvn_map, vt):
@@ -1586,11 +1584,11 @@ def _load_application_batch_source(
     included = {row["application_no"] for row in app_rows}
     sn_to_app_no = {
         str(r["core_sn"]): r["application_no"]
-        for r in raw_rows
-        if r.get("core_sn") and r["application_no"] in included
+        for r in app_rows
+        if r.get("core_sn")
     }
     loan_rows = mig._fetch_loan_rows_from_source(src, sn_to_app_no)
-    map_src = [r for r in raw_rows if r["application_no"] in included]
+    map_src = [r for r in raw_rows if mig.formatted_application_no_from_row(r) in included]
     mapping_rows = mig._build_id_mapping_rows(map_src, bvn_map, vt)
     return source_map, app_keys_by_no, mapping_by_app_id, app_rows, loan_rows, mapping_rows
 
@@ -1735,7 +1733,9 @@ def _build_field_diff_skip_context(
         if cache is not None:
             ctx["app_nos"] = {str(cache.src_map[aid]) for aid in missing_app_ids if aid in cache.src_map}
         else:
-            ctx["app_nos"] = {str(v) for v in source_app_ids_to_nos(src, missing_app_ids).values() if v}
+            ctx["app_nos"] = {
+                str(v) for v in mig.source_app_ids_to_target_application_nos(src, missing_app_ids).values() if v
+            }
     return ctx
 
 
@@ -1914,7 +1914,7 @@ def collect_field_diffs_for_window(
                 batch_nos = {str(v) for v in part_src_map.values()}
                 part_mapping_keys = set(part_mapping.keys())
                 app_rows = [r for r in cache.app_rows if str(r["application_no"]) in batch_nos]
-                loan_rows = [r for r in cache.loan_rows if str(r["loan_no"]) in batch_nos]
+                loan_rows = [r for r in cache.loan_rows if str(r["application_no"]) in batch_nos]
                 mapping_rows = [
                     r for r in cache.mapping_rows
                     if (str(r["id"]), int(r["app_id"]), str(r["mapping_id"]), str(r["type"])) in part_mapping_keys
@@ -1934,7 +1934,7 @@ def collect_field_diffs_for_window(
                     f"elapsed={time.time() - src_t0:.1f}s"
                 )
             app_rows_fetch = [r for r in app_rows if str(r["application_no"]) not in skip["app_nos"]]
-            loan_rows_fetch = [r for r in loan_rows if str(r["loan_no"]) not in skip["loan_nos"]]
+            loan_rows_fetch = [r for r in loan_rows if str(r["application_no"]) not in skip["loan_nos"]]
             mapping_rows_fetch = [
                 r for r in mapping_rows
                 if (r["id"], r["app_id"], r["mapping_id"], r["type"]) not in skip["mapping_keys"]
@@ -2369,7 +2369,7 @@ def repair_application_ranges(cfg: Dict[str, Any], app_ids: Sequence[int], write
     cfg["id_mapping_insert_batch"] = min(int(cfg.get("id_mapping_insert_batch", 10000)), 2000)
     src_lookup = mig.connect_source(cfg)
     try:
-        id_to_no = source_app_ids_to_nos(src_lookup, app_ids)
+        id_to_no = mig.source_app_ids_to_target_application_nos(src_lookup, app_ids)
     finally:
         mig._close_mysql_conn(src_lookup)
     for lo, hi in compact_ids_to_ranges(app_ids):
