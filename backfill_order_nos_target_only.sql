@@ -6,9 +6,10 @@
 -- 执行前：停 window_upsert / validate；建议在 screen 里跑
 --
 -- ⚠ 101.47.15.219:8001 前面常有 ~60s 代理超时，多行 UPDATE/JOIN 易 2013。
---   推荐改用逐行脚本（每行单独 commit，单条 SQL < 几秒）：
+--   推荐改用逐行脚本（默认 insert-delete：查一行 -> INSERT 新行 -> DELETE 旧行）：
 --     python3 backfill_order_nos_target_only.py --env ./ng_migration.env --apply --tables loan
 --     python3 backfill_order_nos_target_only.py --env ./ng_migration.env --apply --tables application
+--   也可用 --strategy update 原地 UPDATE 主键（较慢，易触发代理超时）。
 --   条件用 application_no NOT LIKE 'ng%' ，不要用 REGEXP。
 -- =============================================================================
 
