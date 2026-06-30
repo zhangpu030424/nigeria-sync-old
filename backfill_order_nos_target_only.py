@@ -2,7 +2,11 @@
 # -*- coding: utf-8 -*-
 """Target-only backfill for application_no / loan_no (no source DB).
 
-New format (suffix = old numeric application_no):
+Loan 逻辑（单遍）:
+  1. SELECT loan WHERE application_no REGEXP '^[0-9]+$'  （纯数字 = 待改）
+  2. 每条用 application_no LIKE '%旧号%' 查 application，有则改，无则 skip（孤儿）
+
+New format:
   application_no = ng{app_id:04d}-{old_application_no}
   loan_no        = ng-{old_application_no}-01000
 
@@ -65,8 +69,13 @@ def new_loan_no(old_app_no: str) -> str:
     return "ng-%s-01000" % old_app_no
 
 
+def is_numeric_application_no(app_no: str) -> bool:
+    s = str(app_no or "")
+    return bool(s) and s.isdigit()
+
+
 def needs_backfill_app_no(app_no: str) -> bool:
-    return bool(app_no) and not str(app_no).startswith("ng")
+    return is_numeric_application_no(app_no)
 
 
 def cols_sql(cols: List[str]) -> str:
@@ -141,53 +150,13 @@ def exec_with_retry(tgt, fn, what: str):
     return None
 
 
-def scan_loan_rows(tgt, after_loan_no: str, scan_limit: int) -> List[dict]:
-    """loan + application 都是旧 application_no（按旧号 JOIN）。"""
-    sql = """
-        SELECT l.loan_no, l.application_no, a.app_id
-        FROM loan l
-        INNER JOIN application a ON l.application_no = a.application_no
-        WHERE l.loan_no > %s
-          AND l.application_no NOT LIKE 'ng%%'
-          AND a.application_no NOT LIKE 'ng%%'
-          AND a.app_id IS NOT NULL
-        ORDER BY l.loan_no ASC
-        LIMIT %s
-    """
-    with tgt.cursor() as cur:
-        cur.execute(sql, (after_loan_no or "", scan_limit))
-        return list(cur.fetchall())
-
-
-def lookup_application_new_for_old(tgt, old_app_no: str) -> Optional[dict]:
-    """按旧 application_no 查是否已有 ng{app_id:04d}-{旧号}（单条，走 application_no 索引）。"""
-    pattern = "ng____-%s" % old_app_no
-    with tgt.cursor() as cur:
-        cur.execute(
-            """
-            SELECT application_no, app_id
-            FROM application
-            WHERE application_no LIKE %s
-            LIMIT 5
-            """,
-            (pattern,),
-        )
-        rows = list(cur.fetchall())
-    for row in rows:
-        if new_application_no(row["app_id"], old_app_no) == str(row["application_no"]):
-            return {
-                "new_application_no": str(row["application_no"]),
-                "app_id": row["app_id"],
-            }
-    return None
-
-
-def scan_loan_old_batch(tgt, after_loan_no: str, scan_limit: int) -> List[dict]:
+def scan_loan_numeric_batch(tgt, after_loan_no: str, scan_limit: int) -> List[dict]:
+    """loan.application_no 纯数字 = 待改（等价 SELECT ... REGEXP '^[0-9]+$'）。"""
     sql = """
         SELECT loan_no, application_no
         FROM loan
         WHERE loan_no > %s
-          AND application_no NOT LIKE 'ng%%'
+          AND application_no REGEXP '^[0-9]+$'
         ORDER BY loan_no ASC
         LIMIT %s
     """
@@ -196,11 +165,54 @@ def scan_loan_old_batch(tgt, after_loan_no: str, scan_limit: int) -> List[dict]:
         return list(cur.fetchall())
 
 
-def enrich_loan_phase2_candidates(tgt, loans: List[dict]) -> List[dict]:
+def lookup_application_for_old_loan(tgt, old_app_no: str) -> Optional[dict]:
+    """application_no LIKE '%旧号%'，有则返回目标新号，没有则 None。"""
+    pattern = "%%%s%%" % old_app_no
+    with tgt.cursor() as cur:
+        cur.execute(
+            """
+            SELECT application_no, app_id
+            FROM application
+            WHERE application_no LIKE %s
+            LIMIT 20
+            """,
+            (pattern,),
+        )
+        rows = list(cur.fetchall())
+    if not rows:
+        return None
+
+    for row in rows:
+        app_no = str(row["application_no"])
+        if app_no.startswith("ng") and row["app_id"] is not None:
+            if new_application_no(row["app_id"], old_app_no) == app_no:
+                return {
+                    "new_application_no": app_no,
+                    "app_id": row["app_id"],
+                }
+
+    for row in rows:
+        app_no = str(row["application_no"])
+        if app_no.startswith("ng") and old_app_no in app_no and row["app_id"] is not None:
+            return {
+                "new_application_no": app_no,
+                "app_id": row["app_id"],
+            }
+
+    for row in rows:
+        if str(row["application_no"]) == old_app_no and row["app_id"] is not None:
+            return {
+                "new_application_no": new_application_no(row["app_id"], old_app_no),
+                "app_id": row["app_id"],
+            }
+    return None
+
+
+def enrich_loan_candidates(tgt, loans: List[dict]) -> List[dict]:
     out = []
     for row in loans:
         old_app = str(row["application_no"])
-        match = lookup_application_new_for_old(tgt, old_app)
+        match = lookup_application_for_old_loan(tgt, old_app)
         if not match:
             continue
         out.append(
@@ -212,12 +224,6 @@ def enrich_loan_phase2_candidates(tgt, loans: List[dict]) -> List[dict]:
             }
         )
     return out
-
-
-def scan_loan_rows_app_already_new(tgt, after_loan_no: str, scan_limit: int) -> List[dict]:
-    """兼容 count 接口：返回本批匹配 phase2 的 loan（分页仍按 loan_no）。"""
-    loans = scan_loan_old_batch(tgt, after_loan_no, scan_limit)
-    return enrich_loan_phase2_candidates(tgt, loans)
 
 
 def scan_application_rows(tgt, after_app_no: str, scan_limit: int) -> List[dict]:
@@ -268,6 +274,15 @@ def insert_row(tgt, table: str, cols: List[str], row: dict) -> None:
         cur.execute(sql, [row[c] for c in cols])
 
 
+def fetch_loan_application_no(tgt, loan_no: str) -> Optional[str]:
+    with tgt.cursor() as cur:
+        cur.execute(
+            "SELECT application_no FROM loan WHERE loan_no=%s LIMIT 1", (loan_no,)
+        )
+        row = cur.fetchone()
+        return str(row["application_no"]) if row else None
+
+
 def update_one_loan(
     tgt, row: dict, dry_run: bool, strategy: str, audit: Optional[DeleteAuditLog]
 ) -> str:
@@ -280,9 +295,75 @@ def update_one_loan(
     new_loan = new_loan_no(old_app_no)
     if new_app == old_app_no and new_loan == old_loan_no:
         return "skip"
+
+    # loan_no 已是新格式，仅 application_no 仍为旧号（phase2 常见）
+    if new_loan == old_loan_no and new_app != old_app_no:
+        if dry_run:
+            if audit:
+                audit.record(
+                    "would_update",
+                    "loan",
+                    old_app_no,
+                    new_app,
+                    row["app_id"],
+                    old_loan_no,
+                    new_loan,
+                )
+            return "ok"
+        with tgt.cursor() as cur:
+            cur.execute(
+                "UPDATE loan SET application_no=%s WHERE loan_no=%s",
+                (new_app, old_loan_no),
+            )
+            if not cur.rowcount:
+                return "missing"
+        if audit:
+            audit.record(
+                "update",
+                "loan",
+                old_app_no,
+                new_app,
+                row["app_id"],
+                old_loan_no,
+                new_loan,
+            )
+        tgt.commit()
+        return "ok"
+
     if loan_exists(tgt, new_loan):
         if not loan_exists(tgt, old_loan_no):
-            return "skip"
+            return "skip_done"
+        if new_loan != old_loan_no:
+            existing_app = fetch_loan_application_no(tgt, new_loan)
+            if existing_app == new_app:
+                if dry_run:
+                    if audit:
+                        audit.record(
+                            "would_delete",
+                            "loan",
+                            old_app_no,
+                            new_app,
+                            row["app_id"],
+                            old_loan_no,
+                            new_loan,
+                        )
+                    return "ok"
+                with tgt.cursor() as cur:
+                    cur.execute("DELETE FROM loan WHERE loan_no=%s", (old_loan_no,))
+                    if not cur.rowcount:
+                        return "missing"
+                if audit:
+                    audit.record(
+                        "delete",
+                        "loan",
+                        old_app_no,
+                        new_app,
+                        row["app_id"],
+                        old_loan_no,
+                        new_loan,
+                    )
+                tgt.commit()
+                return "ok"
         return "conflict_loan_no"
     audit_action = "would_delete" if dry_run else "delete"
     if dry_run:
@@ -401,16 +482,14 @@ def update_one_application(
 
 def _run_loan_pass(
     tgt,
-    scan_fn,
-    phase: str,
     dry_run: bool,
     strategy: str,
     scan_size: int,
     work_limit: int,
     log_every: int,
     audit: Optional[DeleteAuditLog],
-    ok_so_far: int,
-) -> Tuple[int, int, int]:
+) -> Tuple[int, int]:
+    """纯数字 application_no 的 loan → LIKE 查 application → 有则改，无则 skip。"""
     ok = skip = scanned = 0
     after = ""
     batch_no = 0
@@ -418,98 +497,57 @@ def _run_loan_pass(
         batch_no += 1
         rows = exec_with_retry(
             tgt,
-            lambda: scan_fn(tgt, after, scan_size),
-            "%s scan after=%s" % (phase, after),
+            lambda: scan_loan_numeric_batch(tgt, after, scan_size),
+            "loan scan after=%s" % after,
         )
         if not rows:
             break
         after = str(rows[-1]["loan_no"])
         scanned += len(rows)
-        todo = [r for r in rows if needs_backfill_app_no(r["application_no"])]
+        todo = enrich_loan_candidates(tgt, rows)
+        orphan_batch = len(rows) - len(todo)
+        status_counts = {}  # type: Dict[str, int]
         for row in todo:
             loan_no = str(row["loan_no"])
             status = exec_with_retry(
                 tgt,
                 lambda r=row: update_one_loan(tgt, r, dry_run, strategy, audit),
-                "%s %s loan_no=%s" % (phase, strategy, loan_no),
+                "loan %s loan_no=%s" % (strategy, loan_no),
             )
+            status_counts[status] = status_counts.get(status, 0) + 1
             if status == "ok":
                 ok += 1
             else:
                 skip += 1
-            if work_limit and (ok_so_far + ok) >= work_limit:
-                print("%s stop work_limit=%s" % (phase, work_limit), flush=True)
-                return ok, skip, ok_so_far + ok
+            if work_limit and ok >= work_limit:
+                print("loan stop work_limit=%s" % work_limit, flush=True)
+                return ok, skip
             if (ok + skip) and (ok + skip) % log_every == 0:
                 print(
-                    "%s progress ok=%s skip=%s scanned=%s last_loan_no=%s"
-                    % (phase, ok, skip, scanned, loan_no),
+                    "loan progress ok=%s skip=%s scanned=%s last_loan_no=%s"
+                    % (ok, skip, scanned, loan_no),
                     flush=True,
                 )
+        reasons = " ".join(
+            "%s=%s" % (k, v) for k, v in sorted(status_counts.items())
+        )
         print(
-            "%s scan_batch=%s scanned=%s todo=%s ok=%s skip=%s after=%s"
-            % (phase, batch_no, len(rows), len(todo), ok, skip, after),
+            "loan scan_batch=%s numeric=%s matched=%s orphan=%s ok=%s skip=%s reasons=[%s] after=%s"
+            % (
+                batch_no,
+                len(rows),
+                len(todo),
+                orphan_batch,
+                ok,
+                skip,
+                reasons or "-",
+                after,
+            ),
             flush=True,
         )
         if len(rows) < scan_size:
             break
-    return ok, skip, ok_so_far + ok
-
-
-def _run_loan_phase2_pass(
-    tgt,
-    dry_run: bool,
-    strategy: str,
-    scan_size: int,
-    work_limit: int,
-    log_every: int,
-    audit: Optional[DeleteAuditLog],
-    ok_so_far: int,
-) -> Tuple[int, int, int]:
-    """按 loan_no 分页扫描旧 loan，逐条查 application 是否已有新号。"""
-    ok = skip = scanned = 0
-    after = ""
-    batch_no = 0
-    while True:
-        batch_no += 1
-        loans = exec_with_retry(
-            tgt,
-            lambda: scan_loan_old_batch(tgt, after, scan_size),
-            "loan_phase2 loan_scan after=%s" % after,
-        )
-        if not loans:
-            break
-        after = str(loans[-1]["loan_no"])
-        scanned += len(loans)
-        todo = enrich_loan_phase2_candidates(tgt, loans)
-        for row in todo:
-            loan_no = str(row["loan_no"])
-            status = exec_with_retry(
-                tgt,
-                lambda r=row: update_one_loan(tgt, r, dry_run, strategy, audit),
-                "loan_phase2 %s loan_no=%s" % (strategy, loan_no),
-            )
-            if status == "ok":
-                ok += 1
-            else:
-                skip += 1
-            if work_limit and (ok_so_far + ok) >= work_limit:
-                print("loan_phase2 stop work_limit=%s" % work_limit, flush=True)
-                return ok, skip, ok_so_far + ok
-            if (ok + skip) and (ok + skip) % log_every == 0:
-                print(
-                    "loan_phase2 progress ok=%s skip=%s loan_scanned=%s last_loan_no=%s"
-                    % (ok, skip, scanned, loan_no),
-                    flush=True,
-                )
-        print(
-            "loan_phase2 scan_batch=%s loan_batch=%s matched=%s ok=%s skip=%s after=%s"
-            % (batch_no, len(loans), len(todo), ok, skip, after),
-            flush=True,
-        )
-        if len(loans) < scan_size:
-            break
-    return ok, skip, ok_so_far + ok
+    return ok, skip
 
 
 def run_loans(
@@ -517,99 +555,53 @@ def run_loans(
     dry_run: bool,
     strategy: str,
     scan_size: int,
-    phase2_scan_size: int,
     work_limit: int,
     log_every: int,
     audit: Optional[DeleteAuditLog],
 ) -> Tuple[int, int]:
-    total_ok = total_skip = 0
-    ok_limit = 0
-
-    print("loan phase1: loan+application 均为旧 application_no", flush=True)
-    ok, skip, ok_limit = _run_loan_pass(
-        tgt,
-        scan_loan_rows,
-        "loan_phase1",
-        dry_run,
-        strategy,
-        scan_size,
-        work_limit,
-        log_every,
-        audit,
-        ok_limit,
+    print(
+        "loan: REGEXP '^[0-9]+$' 扫待改行，application LIKE '%%旧号%%' 有则改无则 skip",
+        flush=True,
     )
-    total_ok += ok
-    total_skip += skip
-    if work_limit and ok_limit >= work_limit:
-        return total_ok, total_skip
-
-    print("loan phase2: application 已是新号，loan 仍旧号（按 loan_no 扫 + 单条查 application）", flush=True)
-    ok, skip, ok_limit = _run_loan_phase2_pass(
-        tgt,
-        dry_run,
-        strategy,
-        phase2_scan_size,
-        work_limit,
-        log_every,
-        audit,
-        ok_limit,
+    return _run_loan_pass(
+        tgt, dry_run, strategy, scan_size, work_limit, log_every, audit
     )
-    total_ok += ok
-    total_skip += skip
-    return total_ok, total_skip
 
 
-def count_loan_phase2_pass(tgt, scan_size: int) -> int:
-    total = 0
-    after = ""
-    batch_no = 0
-    while True:
-        batch_no += 1
-        loans = exec_with_retry(
-            tgt,
-            lambda: scan_loan_old_batch(tgt, after, scan_size),
-            "loan_phase2 count after=%s" % after,
-        )
-        if not loans:
-            break
-        after = str(loans[-1]["loan_no"])
-        matched = enrich_loan_phase2_candidates(tgt, loans)
-        total += len(matched)
-        print(
-            "loan_phase2 count_batch=%s loan_batch=%s matched=%s total=%s after=%s"
-            % (batch_no, len(loans), len(matched), total, after),
-            flush=True,
-        )
-        if len(loans) < scan_size:
-            break
-    return total
-
-
-def count_scan_pass(tgt, scan_fn, phase: str, scan_size: int) -> int:
-    """Paginated count (no writes); avoids full-table COUNT + CONCAT join."""
-    total = 0
+def count_loan_pass(tgt, scan_size: int) -> Tuple[int, int]:
+    """Returns (numeric_total, matched_with_application)."""
+    total = matched = 0
     after = ""
     batch_no = 0
     while True:
         batch_no += 1
         rows = exec_with_retry(
             tgt,
-            lambda: scan_fn(tgt, after, scan_size),
-            "%s count after=%s" % (phase, after),
+            lambda: scan_loan_numeric_batch(tgt, after, scan_size),
+            "loan count after=%s" % after,
         )
         if not rows:
             break
         after = str(rows[-1]["loan_no"])
-        todo = [r for r in rows if needs_backfill_app_no(r["application_no"])]
-        total += len(todo)
+        total += len(rows)
+        batch_matched = enrich_loan_candidates(tgt, rows)
+        matched += len(batch_matched)
         print(
-            "%s count_batch=%s batch=%s total=%s after=%s"
-            % (phase, batch_no, len(todo), total, after),
+            "loan count_batch=%s numeric=%s matched=%s orphan=%s total_numeric=%s total_matched=%s after=%s"
+            % (
+                batch_no,
+                len(rows),
+                len(batch_matched),
+                len(rows) - len(batch_matched),
+                total,
+                matched,
+                after,
+            ),
             flush=True,
         )
         if len(rows) < scan_size:
             break
-    return total
+    return total, matched
 
 
 def count_application_pass(tgt, scan_size: int) -> int:
@@ -638,17 +630,16 @@ def count_application_pass(tgt, scan_size: int) -> int:
     return total
 
 
-def run_loan_stats(tgt, scan_size: int, phase2_scan_size: int, orphan_loan_hint: int) -> int:
+def run_loan_stats(tgt, scan_size: int, orphan_loan_hint: int) -> int:
     print("=== loan stats (paginated, no full-table COUNT) ===", flush=True)
-    p1 = count_scan_pass(tgt, scan_loan_rows, "loan_phase1", scan_size)
-    p2 = count_loan_phase2_pass(tgt, phase2_scan_size)
-    est_true_orphan = max(0, orphan_loan_hint - p2) if orphan_loan_hint else None
+    numeric, matched = count_loan_pass(tgt, scan_size)
+    orphan = numeric - matched
     print(
-        "loan_phase1(双旧)=%s loan_phase2(app已新)=%s orphan_loan_hint=%s est_true_orphan=%s"
-        % (p1, p2, orphan_loan_hint or "?", est_true_orphan if est_true_orphan is not None else "?"),
+        "loan_numeric=%s matched=%s orphan=%s orphan_loan_hint=%s"
+        % (numeric, matched, orphan, orphan_loan_hint or "?"),
         flush=True,
     )
-    return p1 + p2
+    return matched
 
 
 def run_applications(
@@ -722,13 +713,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         default="all",
         help="loan must run before application when using all",
     )
-    p.add_argument("--scan-size", type=int, default=500)
-    p.add_argument(
-        "--phase2-scan-size",
-        type=int,
-        default=100,
-        help="phase2 每批扫描的旧 loan 数（含单条 application 查询，默认 100）",
-    )
+    p.add_argument("--scan-size", type=int, default=100, help="每批扫描 loan 数（含 LIKE 查 application）")
     p.add_argument("--work-limit", type=int, default=0)
     p.add_argument("--log-every", type=int, default=100)
     p.add_argument(
@@ -750,7 +735,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--orphan-loan-hint",
         type=int,
         default=0,
-        help="optional orphan_loan COUNT from SQL for est_true_orphan=hint-phase2",
+        help="optional orphan_loan COUNT from SQL for cross-check",
     )
     args = p.parse_args(argv)
     if args.apply and args.dry_run:
@@ -771,15 +756,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     tgt = connect_target(cfg)
     try:
         if args.count_only:
-            print(
-                "count_only scan_size=%s phase2_scan_size=%s"
-                % (args.scan_size, args.phase2_scan_size),
-                flush=True,
-            )
+            print("count_only scan_size=%s" % args.scan_size, flush=True)
             if args.tables in ("loan", "all"):
-                run_loan_stats(
-                    tgt, args.scan_size, args.phase2_scan_size, args.orphan_loan_hint
-                )
+                run_loan_stats(tgt, args.scan_size, args.orphan_loan_hint)
             if args.tables in ("application", "all"):
                 app_n = count_application_pass(tgt, args.scan_size)
                 print("application_old_format=%s" % app_n, flush=True)
@@ -787,13 +766,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 0
 
         print(
-            "start dry_run=%s strategy=%s tables=%s scan_size=%s phase2_scan_size=%s work_limit=%s delete_log=%s"
+            "start dry_run=%s strategy=%s tables=%s scan_size=%s work_limit=%s delete_log=%s"
             % (
                 dry_run,
                 args.strategy,
                 args.tables,
                 args.scan_size,
-                args.phase2_scan_size,
                 args.work_limit,
                 delete_log_path if not args.no_delete_log else "(disabled)",
             ),
@@ -805,7 +783,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                 dry_run,
                 args.strategy,
                 args.scan_size,
-                args.phase2_scan_size,
                 args.work_limit,
                 args.log_every,
                 audit,
