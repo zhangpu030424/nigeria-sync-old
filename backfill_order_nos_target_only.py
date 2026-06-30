@@ -259,7 +259,8 @@ def run_applications(
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description="Target-only order no backfill (row by row)")
     p.add_argument("--env", default=str(HERE / "ng_migration.env"))
-    p.add_argument("--apply", action="store_true")
+    p.add_argument("--apply", action="store_true", help="write changes (default: dry-run)")
+    p.add_argument("--dry-run", action="store_true", help="preview only (default)")
     p.add_argument(
         "--tables",
         choices=["loan", "application", "all"],
@@ -269,6 +270,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--fetch-size", type=int, default=200)
     p.add_argument("--log-every", type=int, default=100)
     args = p.parse_args(argv)
+    if args.apply and args.dry_run:
+        p.error("use either --apply or --dry-run, not both")
     dry_run = not args.apply
 
     cfg = load_env(Path(args.env))
