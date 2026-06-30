@@ -3,7 +3,13 @@
 -- 规则：后缀用旧 application_no（纯数字市场号）
 --   application_no = ng + LPAD(app_id,4,'0') + '-' + 旧application_no
 --   loan_no        = ng- + 旧application_no + -01000
--- 执行前：停 validate/repair；建议在服务器 mysql 命令行 + screen 里跑
+-- 执行前：停 window_upsert / validate；建议在 screen 里跑
+--
+-- ⚠ 101.47.15.219:8001 前面常有 ~60s 代理超时，多行 UPDATE/JOIN 易 2013。
+--   推荐改用逐行脚本（每行单独 commit，单条 SQL < 几秒）：
+--     python3 backfill_order_nos_target_only.py --env ./ng_migration.env --apply --tables loan
+--     python3 backfill_order_nos_target_only.py --env ./ng_migration.env --apply --tables application
+--   条件用 application_no NOT LIKE 'ng%' ，不要用 REGEXP。
 -- =============================================================================
 
 SET SESSION wait_timeout = 28800;
