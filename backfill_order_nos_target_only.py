@@ -461,6 +461,72 @@ def run_loans(
     return total_ok, total_skip
 
 
+def count_scan_pass(tgt, scan_fn, phase: str, scan_size: int) -> int:
+    """Paginated count (no writes); avoids full-table COUNT + CONCAT join."""
+    total = 0
+    after = ""
+    batch_no = 0
+    while True:
+        batch_no += 1
+        rows = exec_with_retry(
+            tgt,
+            lambda: scan_fn(tgt, after, scan_size),
+            "%s count after=%s" % (phase, after),
+        )
+        if not rows:
+            break
+        after = str(rows[-1]["loan_no"])
+        todo = [r for r in rows if needs_backfill_app_no(r["application_no"])]
+        total += len(todo)
+        print(
+            "%s count_batch=%s batch=%s total=%s after=%s"
+            % (phase, batch_no, len(todo), total, after),
+            flush=True,
+        )
+        if len(rows) < scan_size:
+            break
+    return total
+
+
+def count_application_pass(tgt, scan_size: int) -> int:
+    total = 0
+    after = ""
+    batch_no = 0
+    while True:
+        batch_no += 1
+        rows = exec_with_retry(
+            tgt,
+            lambda: scan_application_rows(tgt, after, scan_size),
+            "application count after=%s" % after,
+        )
+        if not rows:
+            break
+        after = str(rows[-1]["application_no"])
+        todo = [r for r in rows if needs_backfill_app_no(r["application_no"])]
+        total += len(todo)
+        print(
+            "application count_batch=%s batch=%s total=%s after=%s"
+            % (batch_no, len(todo), total, after),
+            flush=True,
+        )
+        if len(rows) < scan_size:
+            break
+    return total
+
+
+def run_loan_stats(tgt, scan_size: int, orphan_loan_hint: int) -> int:
+    print("=== loan stats (paginated, no full-table COUNT) ===", flush=True)
+    p1 = count_scan_pass(tgt, scan_loan_rows, "loan_phase1", scan_size)
+    p2 = count_scan_pass(tgt, scan_loan_rows_app_already_new, "loan_phase2", scan_size)
+    est_true_orphan = max(0, orphan_loan_hint - p2) if orphan_loan_hint else None
+    print(
+        "loan_phase1(双旧)=%s loan_phase2(app已新)=%s orphan_loan_hint=%s est_true_orphan=%s"
+        % (p1, p2, orphan_loan_hint or "?", est_true_orphan if est_true_orphan is not None else "?"),
+        flush=True,
+    )
+    return p1 + p2
+
+
 def run_applications(
     tgt,
     dry_run: bool,
@@ -545,21 +611,45 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="do not print/write delete audit lines",
     )
+    p.add_argument(
+        "--count-only",
+        action="store_true",
+        help="paginated stats only (no writes); use with --orphan-loan-hint 13753",
+    )
+    p.add_argument(
+        "--orphan-loan-hint",
+        type=int,
+        default=0,
+        help="optional orphan_loan COUNT from SQL for est_true_orphan=hint-phase2",
+    )
     args = p.parse_args(argv)
     if args.apply and args.dry_run:
         p.error("use either --apply or --dry-run, not both")
     dry_run = not args.apply
 
     delete_log_path = args.delete_log
-    if not args.no_delete_log and not delete_log_path:
-        delete_log_path = "/tmp/backfill_delete_audit_%s.csv" % datetime.now().strftime(
-            "%Y%m%d_%H%M%S"
-        )
-    audit = DeleteAuditLog(delete_log_path or None, enabled=not args.no_delete_log)
+    if args.count_only:
+        audit = DeleteAuditLog(None, enabled=False)
+    else:
+        if not args.no_delete_log and not delete_log_path:
+            delete_log_path = "/tmp/backfill_delete_audit_%s.csv" % datetime.now().strftime(
+                "%Y%m%d_%H%M%S"
+            )
+        audit = DeleteAuditLog(delete_log_path or None, enabled=not args.no_delete_log)
 
     cfg = load_env(Path(args.env))
     tgt = connect_target(cfg)
     try:
+        if args.count_only:
+            print("count_only scan_size=%s" % args.scan_size, flush=True)
+            if args.tables in ("loan", "all"):
+                run_loan_stats(tgt, args.scan_size, args.orphan_loan_hint)
+            if args.tables in ("application", "all"):
+                app_n = count_application_pass(tgt, args.scan_size)
+                print("application_old_format=%s" % app_n, flush=True)
+            print("count_only finished", flush=True)
+            return 0
+
         print(
             "start dry_run=%s strategy=%s tables=%s scan_size=%s work_limit=%s delete_log=%s"
             % (
