@@ -4,22 +4,17 @@
 
 Loan 逻辑（单遍）:
   1. SELECT loan WHERE application_no REGEXP '^[0-9]+$'  （纯数字 = 待改）
-  2. 每条用 application_no LIKE '%旧号%' 查 application，有则改，无则 skip（孤儿）
+  2. 先 =旧号，再 LIKE 'ng____-旧号' 查 application，有则改，无则 skip
 
 New format:
   application_no = ng{app_id:04d}-{old_application_no}
   loan_no        = ng-{old_application_no}-01000
 
-Strategies:
-  insert-delete (default): SELECT row -> INSERT new PK -> DELETE old row (faster/safer for PK change)
-  update:                  UPDATE loan_no / application_no in place
-
-Usage:
-  python3 backfill_order_nos_target_only.py --env ./ng_migration.env --dry-run --tables loan
-  python3 backfill_order_nos_target_only.py --env ./ng_migration.env --apply --tables loan
-  python3 backfill_order_nos_target_only.py --env ./ng_migration.env --apply --tables application
+Performance:
+  --scan-size 150  --commit-every 20  --workers 4  (按 loan_no 分段并行)
 """
 import argparse
+import multiprocessing
 import time
 from datetime import datetime
 from pathlib import Path
@@ -150,59 +145,89 @@ def exec_with_retry(tgt, fn, what: str):
     return None
 
 
-def scan_loan_numeric_batch(tgt, after_loan_no: str, scan_limit: int) -> List[dict]:
+class CommitTracker(object):
+    """Batch commit to reduce round-trips through proxy."""
+
+    def __init__(self, conn, every: int, dry_run: bool):
+        self.conn = conn
+        self.every = max(0, int(every))
+        self.dry_run = dry_run
+        self.pending = 0
+
+    def note_write(self):
+        if self.dry_run or self.every <= 0:
+            return
+        self.pending += 1
+        if self.pending >= self.every:
+            self.flush()
+
+    def flush(self):
+        if self.dry_run or self.pending <= 0:
+            return
+        self.conn.commit()
+        self.pending = 0
+
+
+def scan_loan_numeric_batch(
+    tgt,
+    after_loan_no: str,
+    scan_limit: int,
+    loan_no_max: Optional[str] = None,
+) -> List[dict]:
     """loan.application_no 纯数字 = 待改（等价 SELECT ... REGEXP '^[0-9]+$'）。"""
     sql = """
         SELECT loan_no, application_no
         FROM loan
         WHERE loan_no > %s
           AND application_no REGEXP '^[0-9]+$'
-        ORDER BY loan_no ASC
-        LIMIT %s
     """
+    params = [after_loan_no or ""]
+    if loan_no_max:
+        sql += " AND loan_no <= %s"
+        params.append(loan_no_max)
+    sql += " ORDER BY loan_no ASC LIMIT %s"
+    params.append(scan_limit)
     with tgt.cursor() as cur:
-        cur.execute(sql, (after_loan_no or "", scan_limit))
+        cur.execute(sql, params)
         return list(cur.fetchall())
 
 
 def lookup_application_for_old_loan(tgt, old_app_no: str) -> Optional[dict]:
-    """application_no LIKE '%旧号%'，有则返回目标新号，没有则 None。"""
-    pattern = "%%%s%%" % old_app_no
+    """先精确查旧号，再 LIKE 'ng____-旧号'（app_id 用 _ 占位，从结果行读取）。"""
+    with tgt.cursor() as cur:
+        cur.execute(
+            """
+            SELECT application_no, app_id
+            FROM application
+            WHERE application_no = %s
+            LIMIT 1
+            """,
+            (old_app_no,),
+        )
+        row = cur.fetchone()
+    if row and row["app_id"] is not None:
+        return {
+            "new_application_no": new_application_no(row["app_id"], old_app_no),
+            "app_id": row["app_id"],
+        }
+
+    pattern = "ng____-%s" % old_app_no
     with tgt.cursor() as cur:
         cur.execute(
             """
             SELECT application_no, app_id
             FROM application
             WHERE application_no LIKE %s
-            LIMIT 20
+            LIMIT 5
             """,
             (pattern,),
         )
         rows = list(cur.fetchall())
-    if not rows:
-        return None
-
     for row in rows:
         app_no = str(row["application_no"])
-        if app_no.startswith("ng") and row["app_id"] is not None:
-            if new_application_no(row["app_id"], old_app_no) == app_no:
-                return {
-                    "new_application_no": app_no,
-                    "app_id": row["app_id"],
-                }
-
-    for row in rows:
-        app_no = str(row["application_no"])
-        if app_no.startswith("ng") and old_app_no in app_no and row["app_id"] is not None:
+        if row["app_id"] is not None and new_application_no(row["app_id"], old_app_no) == app_no:
             return {
                 "new_application_no": app_no,
-                "app_id": row["app_id"],
-            }
-
-    for row in rows:
-        if str(row["application_no"]) == old_app_no and row["app_id"] is not None:
-            return {
-                "new_application_no": new_application_no(row["app_id"], old_app_no),
                 "app_id": row["app_id"],
             }
     return None
@@ -284,7 +309,12 @@ def fetch_loan_application_no(tgt, loan_no: str) -> Optional[str]:
 
 
 def update_one_loan(
-    tgt, row: dict, dry_run: bool, strategy: str, audit: Optional[DeleteAuditLog]
+    tgt,
+    row: dict,
+    dry_run: bool,
+    strategy: str,
+    audit: Optional[DeleteAuditLog],
+    commit_tracker: Optional[CommitTracker] = None,
 ) -> str:
     old_loan_no = str(row["loan_no"])
     old_app_no = str(row["application_no"])
@@ -327,7 +357,10 @@ def update_one_loan(
                 old_loan_no,
                 new_loan,
             )
-        tgt.commit()
+        if commit_tracker:
+            commit_tracker.note_write()
+        else:
+            tgt.commit()
         return "ok"
 
     if loan_exists(tgt, new_loan):
@@ -362,7 +395,10 @@ def update_one_loan(
                         old_loan_no,
                         new_loan,
                     )
-                tgt.commit()
+                if commit_tracker:
+                    commit_tracker.note_write()
+                else:
+                    tgt.commit()
                 return "ok"
         return "conflict_loan_no"
     audit_action = "would_delete" if dry_run else "delete"
@@ -417,12 +453,20 @@ def update_one_loan(
                 old_loan_no,
                 new_loan,
             )
-    tgt.commit()
+    if commit_tracker:
+        commit_tracker.note_write()
+    else:
+        tgt.commit()
     return "ok"
 
 
 def update_one_application(
-    tgt, row: dict, dry_run: bool, strategy: str, audit: Optional[DeleteAuditLog]
+    tgt,
+    row: dict,
+    dry_run: bool,
+    strategy: str,
+    audit: Optional[DeleteAuditLog],
+    commit_tracker: Optional[CommitTracker] = None,
 ) -> str:
     old_no = str(row["application_no"])
     new_no = new_application_no(row["app_id"], old_no)
@@ -476,8 +520,57 @@ def update_one_application(
                 new_no,
                 row["app_id"],
             )
-    tgt.commit()
+    if commit_tracker:
+        commit_tracker.note_write()
+    else:
+        tgt.commit()
     return "ok"
+
+
+def _log(prefix: str, msg: str):
+    if prefix:
+        print("[%s] %s" % (prefix, msg), flush=True)
+    else:
+        print(msg, flush=True)
+
+
+def list_numeric_loan_nos(tgt, scan_size: int) -> List[str]:
+    nos = []
+    after = ""
+    while True:
+        rows = exec_with_retry(
+            tgt,
+            lambda: scan_loan_numeric_batch(tgt, after, scan_size),
+            "list_numeric_loan_nos after=%s" % after,
+        )
+        if not rows:
+            break
+        nos.extend(str(r["loan_no"]) for r in rows)
+        after = str(rows[-1]["loan_no"])
+        if len(rows) < scan_size:
+            break
+    return nos
+
+
+def compute_worker_ranges(
+    tgt, workers: int, scan_size: int
+) -> List[Optional[Tuple[str, str]]]:
+    """Return per-worker (loan_no_min_exclusive, loan_no_max_inclusive); None = no rows."""
+    nos = list_numeric_loan_nos(tgt, scan_size)
+    if not nos:
+        return [None] * workers
+    n = len(nos)
+    ranges = []  # type: List[Optional[Tuple[str, str]]]
+    for i in range(workers):
+        start = i * n // workers
+        end = (i + 1) * n // workers - 1
+        if start >= n:
+            ranges.append(None)
+            continue
+        lo = nos[start - 1] if start > 0 else ""
+        hi = nos[end]
+        ranges.append((lo, hi))
+    return ranges
 
 
 def _run_loan_pass(
@@ -488,17 +581,21 @@ def _run_loan_pass(
     work_limit: int,
     log_every: int,
     audit: Optional[DeleteAuditLog],
+    commit_tracker: Optional[CommitTracker],
+    loan_no_min: str = "",
+    loan_no_max: Optional[str] = None,
+    worker_label: str = "",
 ) -> Tuple[int, int]:
-    """纯数字 application_no 的 loan → LIKE 查 application → 有则改，无则 skip。"""
+    """纯数字 application_no 的 loan → 查 application → 有则改，无则 skip。"""
     ok = skip = scanned = 0
-    after = ""
+    after = loan_no_min
     batch_no = 0
     while True:
         batch_no += 1
         rows = exec_with_retry(
             tgt,
-            lambda: scan_loan_numeric_batch(tgt, after, scan_size),
-            "loan scan after=%s" % after,
+            lambda: scan_loan_numeric_batch(tgt, after, scan_size, loan_no_max),
+            "loan scan after=%s max=%s" % (after, loan_no_max or "*"),
         )
         if not rows:
             break
@@ -511,7 +608,9 @@ def _run_loan_pass(
             loan_no = str(row["loan_no"])
             status = exec_with_retry(
                 tgt,
-                lambda r=row: update_one_loan(tgt, r, dry_run, strategy, audit),
+                lambda r=row: update_one_loan(
+                    tgt, r, dry_run, strategy, audit, commit_tracker
+                ),
                 "loan %s loan_no=%s" % (strategy, loan_no),
             )
             status_counts[status] = status_counts.get(status, 0) + 1
@@ -520,18 +619,21 @@ def _run_loan_pass(
             else:
                 skip += 1
             if work_limit and ok >= work_limit:
-                print("loan stop work_limit=%s" % work_limit, flush=True)
+                if commit_tracker:
+                    commit_tracker.flush()
+                _log(worker_label, "loan stop work_limit=%s" % work_limit)
                 return ok, skip
             if (ok + skip) and (ok + skip) % log_every == 0:
-                print(
+                _log(
+                    worker_label,
                     "loan progress ok=%s skip=%s scanned=%s last_loan_no=%s"
                     % (ok, skip, scanned, loan_no),
-                    flush=True,
                 )
         reasons = " ".join(
             "%s=%s" % (k, v) for k, v in sorted(status_counts.items())
         )
-        print(
+        _log(
+            worker_label,
             "loan scan_batch=%s numeric=%s matched=%s orphan=%s ok=%s skip=%s reasons=[%s] after=%s"
             % (
                 batch_no,
@@ -543,10 +645,11 @@ def _run_loan_pass(
                 reasons or "-",
                 after,
             ),
-            flush=True,
         )
         if len(rows) < scan_size:
             break
+    if commit_tracker:
+        commit_tracker.flush()
     return ok, skip
 
 
@@ -558,13 +661,33 @@ def run_loans(
     work_limit: int,
     log_every: int,
     audit: Optional[DeleteAuditLog],
+    commit_every: int,
+    loan_no_min: str = "",
+    loan_no_max: Optional[str] = None,
+    worker_label: str = "",
 ) -> Tuple[int, int]:
-    print(
-        "loan: REGEXP '^[0-9]+$' 扫待改行，application LIKE '%%旧号%%' 有则改无则 skip",
-        flush=True,
+    _log(
+        worker_label,
+        "loan: REGEXP '^[0-9]+$' 扫待改行，=旧号 / ng____-旧号 查 application",
     )
+    if loan_no_max or loan_no_min:
+        _log(
+            worker_label,
+            "loan segment (%s, %s]" % (loan_no_min or "(start)", loan_no_max or "(end)"),
+        )
+    tracker = CommitTracker(tgt, commit_every, dry_run)
     return _run_loan_pass(
-        tgt, dry_run, strategy, scan_size, work_limit, log_every, audit
+        tgt,
+        dry_run,
+        strategy,
+        scan_size,
+        work_limit,
+        log_every,
+        audit,
+        tracker,
+        loan_no_min,
+        loan_no_max,
+        worker_label,
     )
 
 
@@ -650,10 +773,12 @@ def run_applications(
     work_limit: int,
     log_every: int,
     audit: Optional[DeleteAuditLog],
+    commit_every: int,
 ) -> Tuple[int, int]:
     ok = skip = scanned = 0
     after = ""
     batch_no = 0
+    tracker = CommitTracker(tgt, commit_every, dry_run)
     while True:
         batch_no += 1
         rows = exec_with_retry(
@@ -670,7 +795,9 @@ def run_applications(
             app_no = str(row["application_no"])
             status = exec_with_retry(
                 tgt,
-                lambda r=row: update_one_application(tgt, r, dry_run, strategy, audit),
+                lambda r=row: update_one_application(
+                    tgt, r, dry_run, strategy, audit, tracker
+                ),
                 "application %s app_no=%s" % (strategy, app_no),
             )
             if status == "ok":
@@ -678,6 +805,7 @@ def run_applications(
             else:
                 skip += 1
             if work_limit and ok >= work_limit:
+                tracker.flush()
                 print("application stop work_limit=%s" % work_limit, flush=True)
                 return ok, skip
             if (ok + skip) and (ok + skip) % log_every == 0:
@@ -693,7 +821,117 @@ def run_applications(
         )
         if len(rows) < scan_size:
             break
+    tracker.flush()
     return ok, skip
+
+
+def _worker_delete_log_path(base: str, worker_id: int) -> str:
+    if not base:
+        return ""
+    p = Path(base)
+    return str(p.with_name("%s.w%s%s" % (p.stem, worker_id, p.suffix or ".csv")))
+
+
+def loan_worker_run(spec: dict) -> Tuple[int, int]:
+    worker_id = spec["worker_id"]
+    workers = spec["workers"]
+    label = "w%s/%s" % (worker_id, workers)
+    seg = spec.get("segment")
+    if seg is None:
+        _log(label, "empty segment, skip")
+        return 0, 0
+    lo, hi = seg
+
+    cfg = load_env(Path(spec["env"]))
+    tgt = connect_target(cfg)
+    if spec.get("no_delete_log"):
+        audit = DeleteAuditLog(None, enabled=False)
+        delete_log = ""
+    else:
+        delete_log = spec.get("delete_log") or ""
+        audit = DeleteAuditLog(delete_log or None, enabled=bool(delete_log))
+
+    try:
+        _log(label, "start segment (%s, %s]" % (lo or "(start)", hi))
+        ok, skip = run_loans(
+            tgt,
+            spec["dry_run"],
+            spec["strategy"],
+            spec["scan_size"],
+            spec["work_limit"],
+            spec["log_every"],
+            audit,
+            spec["commit_every"],
+            lo,
+            hi,
+            label,
+        )
+        _log(label, "done ok=%s skip=%s delete_log=%s" % (ok, skip, delete_log or ""))
+        return ok, skip
+    finally:
+        audit.close()
+        tgt.close()
+
+
+def run_loans_parallel(args, cfg_path: str, delete_log_path: str) -> Tuple[int, int]:
+    tgt = connect_target(load_env(Path(cfg_path)))
+    try:
+        print(
+            "computing loan_no ranges workers=%s scan_size=%s ..."
+            % (args.workers, args.scan_size),
+            flush=True,
+        )
+        ranges = compute_worker_ranges(tgt, args.workers, args.scan_size)
+        for i, seg in enumerate(ranges):
+            if seg is None:
+                print("  worker %s/%s: (empty)" % (i, args.workers), flush=True)
+            else:
+                lo, hi = seg
+                print(
+                    "  worker %s/%s: (%s, %s]"
+                    % (i, args.workers, lo or "(start)", hi),
+                    flush=True,
+                )
+    finally:
+        tgt.close()
+
+    specs = []
+    for i, seg in enumerate(ranges):
+        if seg is None:
+            continue
+        wlog = _worker_delete_log_path(delete_log_path, i) if delete_log_path else ""
+        specs.append(
+            {
+                "worker_id": i,
+                "workers": args.workers,
+                "env": cfg_path,
+                "dry_run": not args.apply,
+                "strategy": args.strategy,
+                "scan_size": args.scan_size,
+                "work_limit": args.work_limit,
+                "log_every": args.log_every,
+                "commit_every": args.commit_every,
+                "segment": seg,
+                "delete_log": wlog,
+                "no_delete_log": args.no_delete_log,
+            }
+        )
+
+    if not specs:
+        print("no loan rows to process", flush=True)
+        return 0, 0
+
+    ctx = multiprocessing.get_context("spawn")
+    with ctx.Pool(processes=len(specs)) as pool:
+        results = pool.map(loan_worker_run, specs)
+
+    total_ok = sum(r[0] for r in results)
+    total_skip = sum(r[1] for r in results)
+    print(
+        "loan parallel done workers=%s ok=%s skip=%s" % (len(specs), total_ok, total_skip),
+        flush=True,
+    )
+    return total_ok, total_skip
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -713,7 +951,35 @@ def main(argv: Optional[List[str]] = None) -> int:
         default="all",
         help="loan must run before application when using all",
     )
-    p.add_argument("--scan-size", type=int, default=100, help="每批扫描 loan 数（含 LIKE 查 application）")
+    p.add_argument("--scan-size", type=int, default=150, help="每批扫描 loan 数")
+    p.add_argument(
+        "--commit-every",
+        type=int,
+        default=20,
+        help="每 N 条成功写入 commit 一次（默认 20）",
+    )
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="loan 并行 worker 数，按 loan_no 分段（仅 --tables loan）",
+    )
+    p.add_argument(
+        "--worker-id",
+        type=int,
+        default=-1,
+        help="手动指定 worker 编号 0..workers-1（配合 --loan-no-max 或由主进程分段）",
+    )
+    p.add_argument(
+        "--loan-no-min",
+        default="",
+        help="手动 segment 下界（exclusive，默认空=从头）",
+    )
+    p.add_argument(
+        "--loan-no-max",
+        default="",
+        help="手动 segment 上界（inclusive）；并行时由主进程自动计算",
+    )
     p.add_argument("--work-limit", type=int, default=0)
     p.add_argument("--log-every", type=int, default=100)
     p.add_argument(
@@ -766,29 +1032,45 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 0
 
         print(
-            "start dry_run=%s strategy=%s tables=%s scan_size=%s work_limit=%s delete_log=%s"
+            "start dry_run=%s strategy=%s tables=%s scan_size=%s commit_every=%s "
+            "workers=%s work_limit=%s delete_log=%s"
             % (
                 dry_run,
                 args.strategy,
                 args.tables,
                 args.scan_size,
+                args.commit_every,
+                args.workers,
                 args.work_limit,
                 delete_log_path if not args.no_delete_log else "(disabled)",
             ),
             flush=True,
         )
         if args.tables in ("loan", "all"):
-            ok, skip = run_loans(
-                tgt,
-                dry_run,
-                args.strategy,
-                args.scan_size,
-                args.work_limit,
-                args.log_every,
-                audit,
-            )
+            if args.workers > 1 and args.worker_id < 0:
+                ok, skip = run_loans_parallel(args, args.env, delete_log_path)
+            else:
+                seg_max = args.loan_no_max or None
+                label = ""
+                if args.worker_id >= 0:
+                    label = "w%s/%s" % (args.worker_id, max(args.workers, 1))
+                ok, skip = run_loans(
+                    tgt,
+                    dry_run,
+                    args.strategy,
+                    args.scan_size,
+                    args.work_limit,
+                    args.log_every,
+                    audit,
+                    args.commit_every,
+                    args.loan_no_min,
+                    seg_max,
+                    label,
+                )
             print("loan done ok=%s skip=%s" % (ok, skip), flush=True)
         if args.tables in ("application", "all"):
+            if args.workers > 1:
+                print("warning: --workers ignored for application table", flush=True)
             ok, skip = run_applications(
                 tgt,
                 dry_run,
@@ -797,6 +1079,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 args.work_limit,
                 args.log_every,
                 audit,
+                args.commit_every,
             )
             print("application done ok=%s skip=%s" % (ok, skip), flush=True)
         print("finished delete_log=%s" % (delete_log_path or ""), flush=True)
