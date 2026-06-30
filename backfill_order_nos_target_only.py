@@ -142,11 +142,33 @@ def exec_with_retry(tgt, fn, what: str):
 
 
 def scan_loan_rows(tgt, after_loan_no: str, scan_limit: int) -> List[dict]:
+    """loan + application 都是旧 application_no（按旧号 JOIN）。"""
     sql = """
         SELECT l.loan_no, l.application_no, a.app_id
         FROM loan l
         INNER JOIN application a ON l.application_no = a.application_no
-        WHERE l.loan_no > %s AND a.app_id IS NOT NULL
+        WHERE l.loan_no > %s
+          AND l.application_no NOT LIKE 'ng%%'
+          AND a.application_no NOT LIKE 'ng%%'
+          AND a.app_id IS NOT NULL
+        ORDER BY l.loan_no ASC
+        LIMIT %s
+    """
+    with tgt.cursor() as cur:
+        cur.execute(sql, (after_loan_no or "", scan_limit))
+        return list(cur.fetchall())
+
+
+def scan_loan_rows_app_already_new(tgt, after_loan_no: str, scan_limit: int) -> List[dict]:
+    """loan 仍旧号，application 已是 ng{app_id:04d}-{旧号}。"""
+    sql = """
+        SELECT l.loan_no, l.application_no, a.app_id,
+               a.application_no AS new_application_no
+        FROM loan l
+        INNER JOIN application a ON a.application_no = CONCAT('ng', LPAD(a.app_id, 4, '0'), '-', l.application_no)
+        WHERE l.loan_no > %s
+          AND l.application_no NOT LIKE 'ng%%'
+          AND a.app_id IS NOT NULL
         ORDER BY l.loan_no ASC
         LIMIT %s
     """
@@ -208,7 +230,10 @@ def update_one_loan(
 ) -> str:
     old_loan_no = str(row["loan_no"])
     old_app_no = str(row["application_no"])
-    new_app = new_application_no(row["app_id"], old_app_no)
+    if row.get("new_application_no"):
+        new_app = str(row["new_application_no"])
+    else:
+        new_app = new_application_no(row["app_id"], old_app_no)
     new_loan = new_loan_no(old_app_no)
     if new_app == old_app_no and new_loan == old_loan_no:
         return "skip"
@@ -331,15 +356,18 @@ def update_one_application(
     return "ok"
 
 
-def run_loans(
+def _run_loan_pass(
     tgt,
+    scan_fn,
+    phase: str,
     dry_run: bool,
     strategy: str,
     scan_size: int,
     work_limit: int,
     log_every: int,
     audit: Optional[DeleteAuditLog],
-) -> Tuple[int, int]:
+    ok_so_far: int,
+) -> Tuple[int, int, int]:
     ok = skip = scanned = 0
     after = ""
     batch_no = 0
@@ -347,8 +375,8 @@ def run_loans(
         batch_no += 1
         rows = exec_with_retry(
             tgt,
-            lambda: scan_loan_rows(tgt, after, scan_size),
-            "loan scan after=%s" % after,
+            lambda: scan_fn(tgt, after, scan_size),
+            "%s scan after=%s" % (phase, after),
         )
         if not rows:
             break
@@ -360,29 +388,77 @@ def run_loans(
             status = exec_with_retry(
                 tgt,
                 lambda r=row: update_one_loan(tgt, r, dry_run, strategy, audit),
-                "loan %s loan_no=%s" % (strategy, loan_no),
+                "%s %s loan_no=%s" % (phase, strategy, loan_no),
             )
             if status == "ok":
                 ok += 1
             else:
                 skip += 1
-            if work_limit and ok >= work_limit:
-                print("loan stop work_limit=%s" % work_limit, flush=True)
-                return ok, skip
+            if work_limit and (ok_so_far + ok) >= work_limit:
+                print("%s stop work_limit=%s" % (phase, work_limit), flush=True)
+                return ok, skip, ok_so_far + ok
             if (ok + skip) and (ok + skip) % log_every == 0:
                 print(
-                    "loan progress ok=%s skip=%s scanned=%s last_loan_no=%s"
-                    % (ok, skip, scanned, loan_no),
+                    "%s progress ok=%s skip=%s scanned=%s last_loan_no=%s"
+                    % (phase, ok, skip, scanned, loan_no),
                     flush=True,
                 )
         print(
-            "loan scan_batch=%s scanned=%s todo=%s ok=%s skip=%s after=%s"
-            % (batch_no, len(rows), len(todo), ok, skip, after),
+            "%s scan_batch=%s scanned=%s todo=%s ok=%s skip=%s after=%s"
+            % (phase, batch_no, len(rows), len(todo), ok, skip, after),
             flush=True,
         )
         if len(rows) < scan_size:
             break
-    return ok, skip
+    return ok, skip, ok_so_far + ok
+
+
+def run_loans(
+    tgt,
+    dry_run: bool,
+    strategy: str,
+    scan_size: int,
+    work_limit: int,
+    log_every: int,
+    audit: Optional[DeleteAuditLog],
+) -> Tuple[int, int]:
+    total_ok = total_skip = 0
+    ok_limit = 0
+
+    print("loan phase1: loan+application 均为旧 application_no", flush=True)
+    ok, skip, ok_limit = _run_loan_pass(
+        tgt,
+        scan_loan_rows,
+        "loan_phase1",
+        dry_run,
+        strategy,
+        scan_size,
+        work_limit,
+        log_every,
+        audit,
+        ok_limit,
+    )
+    total_ok += ok
+    total_skip += skip
+    if work_limit and ok_limit >= work_limit:
+        return total_ok, total_skip
+
+    print("loan phase2: application 已是新号，loan 仍旧号", flush=True)
+    ok, skip, ok_limit = _run_loan_pass(
+        tgt,
+        scan_loan_rows_app_already_new,
+        "loan_phase2",
+        dry_run,
+        strategy,
+        scan_size,
+        work_limit,
+        log_every,
+        audit,
+        ok_limit,
+    )
+    total_ok += ok
+    total_skip += skip
+    return total_ok, total_skip
 
 
 def run_applications(
