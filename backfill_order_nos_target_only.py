@@ -7,10 +7,10 @@ New format (suffix = old numeric application_no):
   loan_no        = ng-{old_application_no}-01000
 
 Use this when SQL batch UPDATE hits proxy timeout (~60s on :8001).
-Each row is one short UPDATE + commit.
+Each row is one short UPDATE + commit. Paginate by primary key (no full-table COUNT).
 
 Usage:
-  python3 backfill_order_nos_target_only.py --env ./ng_migration.env --dry-run
+  python3 backfill_order_nos_target_only.py --env ./ng_migration.env --dry-run --tables loan
   python3 backfill_order_nos_target_only.py --env ./ng_migration.env --apply --tables loan
   python3 backfill_order_nos_target_only.py --env ./ng_migration.env --apply --tables application
 """
@@ -60,59 +60,52 @@ def new_loan_no(old_app_no: str) -> str:
     return "ng-%s-01000" % old_app_no
 
 
-def count_old_loans(tgt) -> int:
-    with tgt.cursor() as cur:
-        cur.execute(
-            "SELECT COUNT(*) AS c FROM loan WHERE application_no NOT LIKE 'ng%%'"
-        )
-        return int(cur.fetchone()["c"])
+def needs_backfill_app_no(app_no: str) -> bool:
+    return bool(app_no) and not str(app_no).startswith("ng")
 
 
-def count_old_applications(tgt) -> int:
-    with tgt.cursor() as cur:
-        cur.execute(
-            """
-            SELECT COUNT(*) AS c FROM application
-            WHERE application_no NOT LIKE 'ng%%' AND app_id IS NOT NULL
-            """
-        )
-        return int(cur.fetchone()["c"])
+def exec_with_retry(tgt, fn, what: str):
+    for attempt in range(5):
+        try:
+            return fn()
+        except pymysql.Error as exc:
+            try:
+                tgt.rollback()
+            except Exception:
+                pass
+            if attempt >= 4:
+                raise
+            print("%s retry err=%s" % (what, exc), flush=True)
+            tgt.ping(reconnect=True)
+            time.sleep(2)
+    return None
 
 
-def fetch_loan_rows(tgt, limit: int, after_loan_no: str = "") -> List[dict]:
+def scan_loan_rows(tgt, after_loan_no: str, scan_limit: int) -> List[dict]:
+    """Scan loan by PK; filter old-format rows in Python (uses loan_no index)."""
     sql = """
         SELECT l.loan_no, l.application_no, a.app_id
         FROM loan l
         INNER JOIN application a ON l.application_no = a.application_no
-        WHERE l.application_no NOT LIKE 'ng%%'
-          AND a.app_id IS NOT NULL
+        WHERE l.loan_no > %s AND a.app_id IS NOT NULL
+        ORDER BY l.loan_no ASC
+        LIMIT %s
     """
-    params: List = []
-    if after_loan_no:
-        sql += " AND l.loan_no > %s"
-        params.append(after_loan_no)
-    sql += " ORDER BY l.loan_no ASC LIMIT %s"
-    params.append(limit)
     with tgt.cursor() as cur:
-        cur.execute(sql, params)
+        cur.execute(sql, (after_loan_no or "", scan_limit))
         return list(cur.fetchall())
 
 
-def fetch_application_rows(tgt, limit: int, after_app_no: str = "") -> List[dict]:
+def scan_application_rows(tgt, after_app_no: str, scan_limit: int) -> List[dict]:
     sql = """
         SELECT application_no, app_id
         FROM application
-        WHERE application_no NOT LIKE 'ng%%'
-          AND app_id IS NOT NULL
+        WHERE application_no > %s AND app_id IS NOT NULL
+        ORDER BY application_no ASC
+        LIMIT %s
     """
-    params: List = []
-    if after_app_no:
-        sql += " AND application_no > %s"
-        params.append(after_app_no)
-    sql += " ORDER BY application_no ASC LIMIT %s"
-    params.append(limit)
     with tgt.cursor() as cur:
-        cur.execute(sql, params)
+        cur.execute(sql, (after_app_no or "", scan_limit))
         return list(cur.fetchall())
 
 
@@ -172,87 +165,99 @@ def update_one_application(tgt, row: dict, dry_run: bool) -> str:
     return "ok"
 
 
-def run_loans(tgt, dry_run: bool, fetch_size: int, log_every: int) -> Tuple[int, int]:
-    ok = skip = 0
+def run_loans(
+    tgt, dry_run: bool, scan_size: int, work_limit: int, log_every: int
+) -> Tuple[int, int]:
+    ok = skip = scanned = 0
     after = ""
     batch_no = 0
     while True:
         batch_no += 1
-        rows = fetch_loan_rows(tgt, fetch_size, after)
+        rows = exec_with_retry(
+            tgt,
+            lambda: scan_loan_rows(tgt, after, scan_size),
+            "loan scan after=%s" % after,
+        )
         if not rows:
             break
-        for row in rows:
-            after = str(row["loan_no"])
-            for attempt in range(5):
-                try:
-                    status = update_one_loan(tgt, row, dry_run)
-                    break
-                except pymysql.Error as exc:
-                    tgt.rollback()
-                    if attempt >= 4:
-                        raise
-                    print("loan retry loan_no=%s err=%s" % (after, exc), flush=True)
-                    tgt.ping(reconnect=True)
-                    time.sleep(2)
+        after = str(rows[-1]["loan_no"])
+        scanned += len(rows)
+        todo = [r for r in rows if needs_backfill_app_no(r["application_no"])]
+        for row in todo:
+            loan_no = str(row["loan_no"])
+            status = exec_with_retry(
+                tgt,
+                lambda r=row: update_one_loan(tgt, r, dry_run),
+                "loan update loan_no=%s" % loan_no,
+            )
             if status == "ok":
                 ok += 1
             else:
                 skip += 1
-            if (ok + skip) % log_every == 0:
+            if work_limit and ok >= work_limit:
+                print("loan stop work_limit=%s" % work_limit, flush=True)
+                return ok, skip
+            if (ok + skip) and (ok + skip) % log_every == 0:
                 print(
-                    "loan progress ok=%s skip=%s last=%s remaining~=%s"
-                    % (ok, skip, after, count_old_loans(tgt)),
+                    "loan progress ok=%s skip=%s scanned=%s last_loan_no=%s"
+                    % (ok, skip, scanned, loan_no),
                     flush=True,
                 )
         print(
-            "loan batch=%s fetched=%s ok=%s skip=%s after=%s"
-            % (batch_no, len(rows), ok, skip, after),
+            "loan scan_batch=%s scanned=%s todo=%s ok=%s skip=%s after=%s"
+            % (batch_no, len(rows), len(todo), ok, skip, after),
             flush=True,
         )
+        if len(rows) < scan_size:
+            break
     return ok, skip
 
 
 def run_applications(
-    tgt, dry_run: bool, fetch_size: int, log_every: int
+    tgt, dry_run: bool, scan_size: int, work_limit: int, log_every: int
 ) -> Tuple[int, int]:
-    ok = skip = 0
+    ok = skip = scanned = 0
     after = ""
     batch_no = 0
     while True:
         batch_no += 1
-        rows = fetch_application_rows(tgt, fetch_size, after)
+        rows = exec_with_retry(
+            tgt,
+            lambda: scan_application_rows(tgt, after, scan_size),
+            "application scan after=%s" % after,
+        )
         if not rows:
             break
-        for row in rows:
-            after = str(row["application_no"])
-            for attempt in range(5):
-                try:
-                    status = update_one_application(tgt, row, dry_run)
-                    break
-                except pymysql.Error as exc:
-                    tgt.rollback()
-                    if attempt >= 4:
-                        raise
-                    print(
-                        "application retry app_no=%s err=%s" % (after, exc), flush=True
-                    )
-                    tgt.ping(reconnect=True)
-                    time.sleep(2)
+        after = str(rows[-1]["application_no"])
+        scanned += len(rows)
+        todo = [r for r in rows if needs_backfill_app_no(r["application_no"])]
+        for row in todo:
+            app_no = str(row["application_no"])
+            status = exec_with_retry(
+                tgt,
+                lambda r=row: update_one_application(tgt, r, dry_run),
+                "application update app_no=%s" % app_no,
+            )
             if status == "ok":
                 ok += 1
             else:
                 skip += 1
-            if (ok + skip) % log_every == 0:
+            if work_limit and ok >= work_limit:
+                print("application stop work_limit=%s" % work_limit, flush=True)
+                return ok, skip
+            if (ok + skip) and (ok + skip) % log_every == 0:
                 print(
-                    "application progress ok=%s skip=%s last=%s remaining~=%s"
-                    % (ok, skip, after, count_old_applications(tgt)),
+                    "application progress ok=%s skip=%s scanned=%s last_app_no=%s"
+                    % (ok, skip, scanned, app_no),
                     flush=True,
                 )
         print(
-            "application batch=%s fetched=%s ok=%s skip=%s after=%s"
-            % (batch_no, len(rows), ok, skip, after),
+            "application scan_batch=%s scanned=%s todo=%s ok=%s skip=%s after=%s"
+            % (batch_no, len(rows), len(todo), ok, skip, after),
             flush=True,
         )
+        if len(rows) < scan_size:
+            break
     return ok, skip
 
 
@@ -267,7 +272,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         default="all",
         help="loan must run before application when using all",
     )
-    p.add_argument("--fetch-size", type=int, default=200)
+    p.add_argument(
+        "--scan-size",
+        type=int,
+        default=500,
+        help="rows scanned per batch via PK pagination (default 500)",
+    )
+    p.add_argument(
+        "--work-limit",
+        type=int,
+        default=0,
+        help="stop after N successful updates (0 = no limit; dry-run test)",
+    )
     p.add_argument("--log-every", type=int, default=100)
     args = p.parse_args(argv)
     if args.apply and args.dry_run:
@@ -278,28 +294,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     tgt = connect_target(cfg)
     try:
         print(
-            "start dry_run=%s tables=%s old_loan=%s old_app=%s"
-            % (
-                dry_run,
-                args.tables,
-                count_old_loans(tgt),
-                count_old_applications(tgt),
-            ),
+            "start dry_run=%s tables=%s scan_size=%s work_limit=%s (no full-table COUNT)"
+            % (dry_run, args.tables, args.scan_size, args.work_limit),
             flush=True,
         )
         if args.tables in ("loan", "all"):
-            ok, skip = run_loans(tgt, dry_run, args.fetch_size, args.log_every)
-            print("loan done ok=%s skip=%s remaining=%s" % (ok, skip, count_old_loans(tgt)))
-        if args.tables in ("application", "all"):
-            ok, skip = run_applications(tgt, dry_run, args.fetch_size, args.log_every)
-            print(
-                "application done ok=%s skip=%s remaining=%s"
-                % (ok, skip, count_old_applications(tgt))
+            ok, skip = run_loans(
+                tgt, dry_run, args.scan_size, args.work_limit, args.log_every
             )
-        print(
-            "finished old_loan=%s old_app=%s"
-            % (count_old_loans(tgt), count_old_applications(tgt))
-        )
+            print("loan done ok=%s skip=%s" % (ok, skip), flush=True)
+        if args.tables in ("application", "all"):
+            ok, skip = run_applications(
+                tgt, dry_run, args.scan_size, args.work_limit, args.log_every
+            )
+            print("application done ok=%s skip=%s" % (ok, skip), flush=True)
+        print("finished", flush=True)
         return 0
     finally:
         tgt.close()
