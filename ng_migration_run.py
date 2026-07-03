@@ -863,7 +863,8 @@ def _get_worker_stats(cfg: Dict[str, Any], worker_id: int) -> CumulativeStats:
 
 
 USER_INSERT_COLS = [
-    "user_id", "app_id", "group_user_id", "info_user_id", "mobile", "closed_time",
+    "user_id", "app_id", "group_user_id", "info_user_id", "mobile", "password",
+    "closed_time",
     "reg_device_uuid", "reg_time", "test_flag",
     "utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term",
     "campaign_id", "ad_group_id", "advertiser_id",
@@ -915,12 +916,15 @@ def _prepare_user_insert_rows(
     lookups: Optional[Dict[str, Any]] = None,
 ) -> None:
     dac_by_device = (lookups or {}).get("dac_by_device", {})
+    lup_by_key = (lookups or {}).get("lup_by_key", {})
     for row in rows:
         row["group_user_id"] = row["user_id"]
         row["info_user_id"] = row["user_id"]
         device_id = _user_reg_device_id(row)
         dac = dac_by_device.get(device_id) if device_id else None
         row.update(_utm_fields_from_dac(dac))
+        lup = _lookup_lup(lup_by_key, row) if lup_by_key else None
+        row["password"] = (lup.get("password") if lup else None) or ""
 
 
 _UD_VARCHAR_LIMITS = {
