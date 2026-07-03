@@ -425,7 +425,9 @@ def preload_lup_store(cfg: Dict[str, Any]) -> int:
                     if not chunk:
                         break
                     for row in chunk:
-                        store[(row["appId"], row["mobile"])] = row["password"] or ""
+                        password = row["password"] or ""
+                        for key in _lup_keys_for_pair(row["appId"], row["mobile"]):
+                            store[key] = password
         finally:
             _close_mysql_conn(src)
         _lup_global_store = store
@@ -1545,15 +1547,48 @@ def _format_emergency_contacts(
     return out if out else _empty_emergency_contacts()
 
 
+def _mobile_format_variants(mobile: Any) -> List[str]:
+    """log_user_password.mobile 与 user.mobile 格式可能不一致，生成多种候选。"""
+    if mobile in (None, ""):
+        return []
+    s = str(mobile).strip()
+    if not s:
+        return []
+    variants = {s}
+    if s.startswith("+234") and len(s) > 4:
+        rest = s[4:]
+        variants.add(rest)
+        variants.add("0" + rest)
+        variants.add("234" + rest)
+    elif s.startswith("234") and len(s) > 3:
+        rest = s[3:]
+        variants.add("+" + s)
+        variants.add("+234" + rest)
+        variants.add("0" + rest)
+    elif s.startswith("0") and len(s) > 1:
+        rest = s[1:]
+        variants.add("+234" + rest)
+        variants.add("234" + rest)
+    return list(variants)
+
+
+def _lup_keys_for_pair(app_id: Any, mobile: Any) -> List[Tuple[Any, str]]:
+    return [(app_id, variant) for variant in _mobile_format_variants(mobile)]
+
+
 def _lookup_lup(lup_by_key: Dict[Any, dict], user_row: dict) -> Optional[dict]:
-    """log_user_password 与 user 表按原始 (appId, mobile) 对齐。"""
+    """log_user_password 与 user 按 (appId, mobile) 对齐（VT token 不参与匹配）。"""
     app_id = user_row.get("app_id")
-    for mobile in (user_row.get("mobile_raw"), user_row.get("mobile")):
-        if mobile in (None, ""):
-            continue
-        lup = lup_by_key.get((app_id, mobile))
-        if lup:
-            return lup
+    seen: set = set()
+    for mobile in (user_row.get("mobile_raw"), user_row.get("mobile_lookup")):
+        for variant in _mobile_format_variants(mobile):
+            key = (app_id, variant)
+            if key in seen:
+                continue
+            seen.add(key)
+            lup = lup_by_key.get(key)
+            if lup:
+                return lup
     return None
 
 
@@ -1754,6 +1789,14 @@ def _build_bankcard_rows(
 
 
 
+def _index_lup_rows(lup_rows: List[dict]) -> Dict[Tuple[Any, str], dict]:
+    out: Dict[Tuple[Any, str], dict] = {}
+    for row in lup_rows:
+        for key in _lup_keys_for_pair(row["appId"], row["mobile"]):
+            out[key] = row
+    return out
+
+
 def _make_user_lookups(
     ud_rows: List[dict],
     lup_rows: List[dict],
@@ -1768,7 +1811,7 @@ def _make_user_lookups(
     }
     return {
         "ud_by_user": {int(r["userId"]): r for r in ud_rows},
-        "lup_by_key": {(r["appId"], r["mobile"]): r for r in lup_rows},
+        "lup_by_key": _index_lup_rows(lup_rows),
         "uri_by_user": {int(r["userId"]): r for r in uri_rows},
         "dac_by_device": dac_by_device,
         "channel_by_device": {
@@ -1791,10 +1834,11 @@ def _extract_user_batch_keys(rows_user: List[dict]) -> Dict[str, Any]:
         for mobile in (row.get("mobile_raw"), row.get("mobile")):
             if app_id is None or mobile in (None, ""):
                 continue
-            key = (app_id, str(mobile))
-            if key not in seen_pairs:
-                seen_pairs.add(key)
-                app_mobile_pairs.append(key)
+            for variant in _mobile_format_variants(mobile):
+                key = (app_id, variant)
+                if key not in seen_pairs:
+                    seen_pairs.add(key)
+                    app_mobile_pairs.append(key)
         device_id = _user_reg_device_id(row)
         if device_id and device_id not in seen_devices:
             seen_devices.add(device_id)
@@ -2494,16 +2538,23 @@ def _fetch_lup_by_app_mobile(
         out: List[dict] = []
         seen: set = set()
         for app_id, mobile in pairs:
-            key = (app_id, mobile)
-            if key in seen:
+            pair_key = (app_id, mobile)
+            if pair_key in seen:
                 continue
-            seen.add(key)
-            password = _lup_global_store.get(key)
+            seen.add(pair_key)
+            password = None
+            matched_mobile = mobile
+            for variant in _mobile_format_variants(mobile):
+                pw = _lup_global_store.get((app_id, variant))
+                if pw is not None:
+                    password = pw
+                    matched_mobile = variant
+                    break
             if password is None:
                 continue
             out.append({
                 "appId": app_id,
-                "mobile": mobile,
+                "mobile": matched_mobile,
                 "password": password,
                 "src_id": 0,
             })
@@ -2658,6 +2709,7 @@ def _migrate_user_batch_once(
             if not mobile_token:
                 vt_skip_user += 1
                 continue
+            row["mobile_lookup"] = row.get("mobile")
             row["mobile"] = mobile_token
             rows_user_ok.append(row)
         rows_user = rows_user_ok
@@ -2792,6 +2844,7 @@ def _migrate_user_info_batch_once(
             if not mobile_token:
                 vt_skip_user += 1
                 continue
+            row["mobile_lookup"] = row.get("mobile")
             row["mobile"] = mobile_token
             rows_user_ok.append(row)
         rows_user = rows_user_ok

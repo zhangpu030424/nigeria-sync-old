@@ -1412,6 +1412,7 @@ def _prepare_expected_user_rows_for_ids(cfg: Dict[str, Any], src, user_ids: Sequ
         if not token:
             continue
         row = dict(row)
+        row["mobile_lookup"] = row.get("mobile")
         row["mobile"] = token
         rows_user_ok.append(row)
     mig._prepare_user_insert_rows(rows_user_ok, lookups)
@@ -2143,6 +2144,7 @@ def repair_user_rows(cfg: Dict[str, Any], user_ids: Sequence[int], writer) -> No
             )
             if not token:
                 continue
+            row["mobile_lookup"] = row.get("mobile")
             row["mobile"] = token
             rows_ok.append(row)
             token_ok_ids.add(user_id)
