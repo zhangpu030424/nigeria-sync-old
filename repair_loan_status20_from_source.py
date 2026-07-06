@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""修复目标库 due_date/status 条件下 loan_no 中间段为 market 长号的行。
+"""修复目标库 due_date/status 条件下 loan 行（与手工 SQL 一致）。
 
-查询链路（与手工 SQL 一致）:
-  1. 目标: SELECT * FROM loan WHERE due_date < ? AND status = ?
-  2. 默认处理全部符合条件的 loan（长号改 loan_no + 同步；短号仅同步 status 等）
-  3. ext_sn = application_no 后缀（如 166487616812019719）
-  4. 源库: SELECT sn FROM ng_loan_core.application WHERE ext_sn = ?
-  5. 源库: SELECT * FROM ng_loan_core.repay_plan WHERE sn = ?（取 max plan_sn）
-  6. 正确 loan_no = ng-{core_sn}-01000，并同步 repay_plan 状态字段
+长号 loan_no（中间段为 market 长号）:
+  1. ext_sn = loan_no 中间段 或 application_no 后缀
+  2. 源库: SELECT sn FROM ng_loan_core.application WHERE ext_sn = ?
+  3. 源库: SELECT * FROM ng_loan_core.repay_plan WHERE sn = ?（max plan_sn）
+  4. 原地 UPDATE loan_no = ng-{core_sn}-01000 + 同步字段；correct 已存在或 1062 则 skip
+
+短号 loan_no（中间段为 core sn）:
+  1. core_sn = loan_no 中间段
+  2. 源库: SELECT * FROM ng_loan_core.repay_plan WHERE sn = ?
+  3. 仅 UPDATE status/金额/日期等，不改 loan_no；失败则 skip
 
 Usage:
   python3 repair_loan_status20_from_source.py --env ./ng_migration.env --dry-run --plan-only
-  python3 repair_loan_status20_from_source.py --env ./ng_migration.env --apply --workers 8 --commit-every 100
+  python3 repair_loan_status20_from_source.py --env ./ng_migration.env --apply --workers 1
 """
 import argparse
 import hashlib
@@ -33,15 +36,14 @@ from repair_loan_no_from_audit import (
     RowChangeAuditLog,
     cols_sql,
     exec_with_retry,
-    fetch_loan_row,
     loan_exists,
 )
 
 HERE = Path(__file__).resolve().parent
 LOAN_COLS = mig.LOAN_INSERT_COLS
 SYNC_COLS = [c for c in LOAN_COLS if c != "loan_no"]
-# sync_status 不改 application_no/period/roll_sequence，避免与残留长号行 PK 冲突
-STATUS_SYNC_COLS = [
+# 更新时不改 application_no/period/roll_sequence，避免主键冲突
+UPDATE_COLS = [
     c for c in SYNC_COLS if c not in ("application_no", "period", "roll_sequence")
 ]
 LOAN_NO_RE = re.compile(r"^[Nn][Gg]-(\d+)-(\d{5})$")
@@ -109,8 +111,16 @@ def is_long_loan_no(loan_no: str, min_sn_len: int) -> bool:
     return bool(parsed and parsed[1] >= min_sn_len)
 
 
+def is_plausible_core_sn(sn: str, market_no: str = "", min_sn_len: int = 15) -> bool:
+    s = str(sn or "").strip()
+    if not s or not s.isdigit():
+        return False
+    if market_no and s == str(market_no).strip():
+        return False
+    return len(s) < min_sn_len
+
+
 def load_all_target_loans(tgt, due_before: str, status: str) -> List[dict]:
-    """一次拉取目标库符合条件的全部 loan。"""
     sql = """
         SELECT %s
         FROM loan
@@ -123,15 +133,13 @@ def load_all_target_loans(tgt, due_before: str, status: str) -> List[dict]:
 
 
 def filter_long_candidates(rows: List[dict], min_sn_len: int) -> List[dict]:
-    out = []
-    for row in rows:
-        if is_long_loan_no(str(row.get("loan_no") or ""), min_sn_len):
-            out.append(row)
-    return out
+    return [
+        r for r in rows
+        if is_long_loan_no(str(r.get("loan_no") or ""), min_sn_len)
+    ]
 
 
 def fetch_repay_plan_by_sns(src, core_sns: List[str]) -> Dict[str, dict]:
-    """core sn -> repay_plan 行（取最大 plan_sn，与 ng_migration_run 一致）。"""
     if not core_sns:
         return {}
     uniq = sorted({str(x).strip() for x in core_sns if x})
@@ -163,10 +171,7 @@ def fetch_repay_plan_by_sns(src, core_sns: List[str]) -> Dict[str, dict]:
     return out
 
 
-def fetch_core_application_by_ext_sn(
-    src, ext_sns: List[str]
-) -> Dict[str, str]:
-    """ext_sn(market applicationNo) -> core sn。"""
+def fetch_core_application_by_ext_sn(src, ext_sns: List[str]) -> Dict[str, str]:
     uniq = sorted({str(x).strip() for x in ext_sns if x})
     out: Dict[str, str] = {}
     if not uniq:
@@ -193,28 +198,17 @@ def fetch_core_application_by_ext_sn(
     return out
 
 
-def is_plausible_core_sn(
-    sn: str, market_no: str = "", min_sn_len: int = 15
-) -> bool:
-    """core sn 约 12 位；market 号 15~18 位，不能当 core sn 用。"""
-    s = str(sn or "").strip()
-    if not s or not s.isdigit():
-        return False
-    if market_no and s == str(market_no).strip():
-        return False
-    return len(s) < min_sn_len
-
-
-def build_meta_from_ext_sn(
+def fetch_source_for_long(
     src,
     ext_sns: List[str],
     target_app_by_ext: Dict[str, str],
     min_sn_len: int,
-) -> Dict[str, Tuple[str, str]]:
-    """ext_sn -> (core_sn, target application_no)。仅查 ng_loan_core.application。"""
+) -> Dict[str, dict]:
+    """ext_sn -> 目标形态 loan 行（application + repay_plan）。"""
     uniq = sorted({str(x).strip() for x in ext_sns if x})
     core_by_ext = fetch_core_application_by_ext_sn(src, uniq)
-    meta: Dict[str, Tuple[str, str]] = {}
+    core_sns = []
+    ext_to_pair: Dict[str, Tuple[str, str]] = {}
     for ext_sn in uniq:
         core_sn = core_by_ext.get(ext_sn, "")
         app_no = target_app_by_ext.get(ext_sn, "")
@@ -222,141 +216,119 @@ def build_meta_from_ext_sn(
             continue
         if not app_no:
             continue
-        meta[ext_sn] = (core_sn, app_no)
-    return meta
-
-
-def fetch_source_loans_bulk(
-    src,
-    ext_sns: List[str],
-    target_app_by_ext: Dict[str, str],
-    min_sn_len: int = 15,
-) -> Tuple[Dict[str, dict], Dict[str, str], Dict[str, Tuple[str, str]]]:
-    """ext_sn -> 目标形态 loan 行；miss_reason；meta。"""
-    if not ext_sns:
-        return {}, {}, {}
-    uniq = sorted({str(x).strip() for x in ext_sns if x})
-    meta = build_meta_from_ext_sn(src, uniq, target_app_by_ext, min_sn_len)
-    repay_plans = fetch_repay_plan_by_sns(src, [v[0] for v in meta.values()])
-    by_ext: Dict[str, dict] = {}
-    miss_reason: Dict[str, str] = {}
-    for ext_sn in uniq:
-        pair = meta.get(ext_sn)
-        if not pair:
-            miss_reason[ext_sn] = "no_core_application"
-            continue
-        core_sn, app_no = pair
+        ext_to_pair[ext_sn] = (core_sn, app_no)
+        core_sns.append(core_sn)
+    repay_plans = fetch_repay_plan_by_sns(src, core_sns)
+    out: Dict[str, dict] = {}
+    for ext_sn, (core_sn, app_no) in ext_to_pair.items():
         rp = repay_plans.get(core_sn)
-        if not rp:
-            miss_reason[ext_sn] = "no_repay_plan"
-            continue
-        by_ext[ext_sn] = mig._build_loan_row(rp, app_no)
-    return by_ext, miss_reason, meta
+        if rp:
+            out[ext_sn] = mig._build_loan_row(rp, app_no)
+    return out
 
 
-def build_rekey_row_from_before(
-    before: dict,
-    application_no: str,
-    core_sn: str,
-    market_no: str = "",
-    min_sn_len: int = 15,
-) -> Optional[dict]:
-    if not is_plausible_core_sn(core_sn, market_no, min_sn_len):
-        return None
-    correct = mig.format_loan_no(core_sn, 1, 0)
-    if not before or not correct:
-        return None
-    if correct == str(before.get("loan_no") or ""):
-        return None
-    row = dict(before)
-    row["loan_no"] = correct
-    if application_no:
-        row["application_no"] = application_no
-    return row
-
-
-def row_needs_sync(target: dict, source: dict) -> bool:
-    """目标行与源库组装行是否有业务字段差异。"""
-    for col in SYNC_COLS:
-        tv = target.get(col)
+def diff_update_cols(before: dict, source: dict) -> List[str]:
+    """返回 before 与 source 不一致、需要写入的列（不含 loan_no）。"""
+    cols: List[str] = []
+    for col in UPDATE_COLS:
+        tv = before.get(col)
         sv = source.get(col)
         if tv is None and sv is None:
             continue
         if str(tv) != str(sv):
-            return True
-    return False
+            cols.append(col)
+    return cols
 
 
-def build_plan_in_memory(
-    candidates: List[dict],
-    source_by_ext: Dict[str, dict],
-    miss_reason: Dict[str, str],
-    meta_by_ext: Dict[str, Tuple[str, str]],
-    min_sn_len: int = 15,
-) -> List[dict]:
-    plan: List[dict] = []
-    skip_n = 0
-    for row in candidates:
-        wrong = str(row["loan_no"])
-        app_no = str(row.get("application_no") or "")
-        ext_sn = extract_market_no(app_no, wrong)
-        if not ext_sn:
-            skip_n += 1
-            continue
-
-        src_row = source_by_ext.get(ext_sn)
-        mode = "source"
-        if not src_row:
-            pair = meta_by_ext.get(ext_sn)
-            if pair and miss_reason.get(ext_sn) == "no_repay_plan":
-                src_row = build_rekey_row_from_before(
-                    row, app_no, pair[0], ext_sn, min_sn_len
-                )
-                mode = "rekey_only" if src_row else ""
-            if not src_row:
-                skip_n += 1
-                continue
-
-        correct = str(src_row["loan_no"])
-        if correct == wrong:
-            if not row_needs_sync(row, src_row):
-                continue
-            mode = "sync_status"
-        elif not is_long_loan_no(wrong, min_sn_len):
-            mode = "rekey_short"
-
-        plan.append(
-            {
-                "wrong_loan_no": wrong,
-                "correct_loan_no": correct,
-                "legacy_loan_no": "",
-                "application_no": str(src_row.get("application_no") or app_no),
-                "app_id": "",
-                "market_no": ext_sn,
-                "source_row": src_row,
-                "before_wrong": dict(row),
-                "sync_mode": mode,
-                "target_due_date": str(row.get("due_date") or ""),
-                "target_status": str(row.get("status") or ""),
-            }
-        )
-    if skip_n:
-        print("plan_skip=%s (no ext_sn / no core.application / no repay_plan)" % skip_n, flush=True)
-    return plan
+def row_needs_sync(target: dict, source: dict) -> bool:
+    return bool(diff_update_cols(target, source))
 
 
-def _merge_source_row(before: dict, source_row: dict) -> dict:
+def _build_after(before: dict, source_row: dict, update_cols: List[str], loan_no: str) -> dict:
     after = dict(before)
-    for col in LOAN_COLS:
-        if col in source_row:
-            after[col] = source_row[col]
+    for col in update_cols:
+        after[col] = source_row[col]
+    after["loan_no"] = loan_no
     return after
 
 
-def _loan_present(tgt, loan_no: str, loan_no_set: Optional[set]) -> bool:
-    if loan_no_set is not None:
-        return loan_no in loan_no_set
-    return loan_exists(tgt, loan_no)
+def _plan_audit_row(plan_row: dict) -> dict:
+    return {
+        "wrong_loan_no": plan_row["loan_no"],
+        "correct_loan_no": plan_row.get("correct_loan_no") or plan_row["loan_no"],
+        "application_no": plan_row.get("application_no") or "",
+        "sync_mode": plan_row.get("mode") or "",
+    }
+
+
+def build_plan(
+    candidates: List[dict],
+    source_by_ext: Dict[str, dict],
+    repay_by_core_sn: Dict[str, dict],
+    min_sn_len: int,
+) -> Tuple[List[dict], Dict[str, int]]:
+    plan: List[dict] = []
+    stats: Dict[str, int] = {}
+    for row in candidates:
+        loan_no = str(row.get("loan_no") or "")
+        app_no = str(row.get("application_no") or "")
+
+        if is_long_loan_no(loan_no, min_sn_len):
+            ext_sn = extract_market_no(app_no, loan_no)
+            if not ext_sn:
+                stats["skip_no_ext_sn"] = stats.get("skip_no_ext_sn", 0) + 1
+                continue
+            src_row = source_by_ext.get(ext_sn)
+            if not src_row:
+                stats["skip_no_source_long"] = stats.get("skip_no_source_long", 0) + 1
+                continue
+            correct = str(src_row["loan_no"])
+            update_cols = diff_update_cols(row, src_row)
+            if correct == loan_no:
+                if not update_cols:
+                    stats["skip_already_ok"] = stats.get("skip_already_ok", 0) + 1
+                    continue
+                mode = "sync_status"
+            else:
+                mode = "rekey_long"
+        else:
+            parsed = parse_loan_middle(loan_no)
+            if not parsed:
+                stats["skip_bad_loan_no"] = stats.get("skip_bad_loan_no", 0) + 1
+                continue
+            core_sn = parsed[0]
+            if not is_plausible_core_sn(core_sn, "", min_sn_len):
+                stats["skip_bad_core_sn"] = stats.get("skip_bad_core_sn", 0) + 1
+                continue
+            rp = repay_by_core_sn.get(core_sn)
+            if not rp:
+                stats["skip_no_repay_plan"] = stats.get("skip_no_repay_plan", 0) + 1
+                continue
+            src_row = mig._build_loan_row(rp, app_no)
+            correct = loan_no
+            update_cols = diff_update_cols(row, src_row)
+            if not update_cols:
+                stats["skip_already_ok"] = stats.get("skip_already_ok", 0) + 1
+                continue
+            mode = "sync_status"
+
+        if mode == "rekey_long":
+            update_cols = diff_update_cols(row, src_row)
+
+        plan.append(
+            {
+                "loan_no": loan_no,
+                "correct_loan_no": correct,
+                "application_no": str(src_row.get("application_no") or app_no),
+                "source_row": src_row,
+                "before": dict(row),
+                "mode": mode,
+                "update_cols": update_cols,
+                "ext_sn": extract_market_no(app_no, loan_no) if mode == "rekey_long" else "",
+            }
+        )
+        stats[mode] = stats.get(mode, 0) + 1
+    return plan, stats
 
 
 def _build_set_sql(cols: List[str]) -> str:
@@ -376,360 +348,96 @@ def _sync_update(tgt, loan_no: str, source_row: dict, cols: List[str]) -> int:
 
 
 def _rekey_update(
-    tgt, wrong: str, correct: str, source_row: dict, cols: List[str]
+    tgt, loan_no: str, correct: str, source_row: dict, cols: List[str]
 ) -> int:
-    vals = [source_row[c] for c in cols]
+    if cols:
+        vals = [source_row[c] for c in cols]
+        sql = "UPDATE loan SET loan_no=%%s, %s WHERE loan_no=%%s" % _build_set_sql(cols)
+        args = [correct] + vals + [loan_no]
+    else:
+        sql = "UPDATE loan SET loan_no=%s WHERE loan_no=%s"
+        args = [correct, loan_no]
     with tgt.cursor() as cur:
-        cur.execute(
-            "UPDATE loan SET loan_no=%%s, %s WHERE loan_no=%%s"
-            % _build_set_sql(cols),
-            [correct] + vals + [wrong],
-        )
+        cur.execute(sql, args)
         return cur.rowcount
 
 
-def _delete_loan(tgt, loan_no: str) -> int:
-    with tgt.cursor() as cur:
-        cur.execute("DELETE FROM loan WHERE loan_no=%s", (loan_no,))
-        return cur.rowcount
-
-
-def _delete_pk_duplicates(
-    tgt,
-    source_row: dict,
-    keep_loan_no: str,
-    loan_no_set: Optional[set] = None,
-    cache: Optional[Dict[str, dict]] = None,
-) -> List[str]:
-    """删除与 source_row 同 (application_no, period, roll_sequence) 的其它 loan 行。"""
-    app_no = str(source_row.get("application_no") or "").strip()
-    if not app_no:
-        return []
-    period = source_row.get("period", 1)
-    roll = source_row.get("roll_sequence", 0)
-    removed: List[str] = []
-    with tgt.cursor() as cur:
-        cur.execute(
-            """
-            SELECT loan_no FROM loan
-            WHERE application_no=%s AND period=%s AND roll_sequence=%s
-              AND loan_no<>%s
-            """,
-            (app_no, period, roll, keep_loan_no),
-        )
-        dupes = [str(r["loan_no"]) for r in cur.fetchall()]
-    for ln in dupes:
-        if _delete_loan(tgt, ln):
-            removed.append(ln)
-            if loan_no_set is not None:
-                loan_no_set.discard(ln)
-            if cache is not None:
-                cache.pop(ln, None)
-    return removed
-
-
-def _sync_update_safe(tgt, loan_no: str, source_row: dict) -> int:
-    """先全量同步；1062 时仅同步非 PK 列（status/金额等）。"""
-    try:
-        return _sync_update(tgt, loan_no, source_row, SYNC_COLS)
-    except pymysql.err.IntegrityError as exc:
-        if exc.args[0] != 1062:
-            raise
-        return _sync_update(tgt, loan_no, source_row, STATUS_SYNC_COLS)
-
-
-def _apply_sync_delete(
-    tgt,
-    wrong: str,
-    correct: str,
-    source_row: dict,
-    before_wrong: dict,
-    before_correct: Optional[dict],
-    dry_run: bool,
-    row_audit: Optional[RowChangeAuditLog],
-    loan_no_set: Optional[set],
-    cache: Dict[str, dict],
-) -> str:
-    """先删 wrong / PK 重复行，再更新 correct（避免 1062）。"""
-    if dry_run:
-        if before_correct and row_audit:
-            row_audit.record_modified(
-                "would_sync_correct",
-                before_correct,
-                _merge_source_row(before_correct, source_row),
-            )
-        if row_audit:
-            row_audit.record_deleted("would_delete_wrong", before_wrong)
-        return "ok"
-
-    if wrong != correct and _loan_present(tgt, wrong, loan_no_set):
-        _delete_loan(tgt, wrong)
-        if loan_no_set is not None:
-            loan_no_set.discard(wrong)
-        cache.pop(wrong, None)
-
-    _delete_pk_duplicates(tgt, source_row, correct, loan_no_set, cache)
-    if not _sync_update_safe(tgt, correct, source_row):
-        return "missing"
-
-    if row_audit and before_correct:
-        row_audit.record_modified(
-            "sync_correct",
-            before_correct,
-            _merge_source_row(before_correct, source_row),
-        )
-    if row_audit and wrong != correct:
-        row_audit.record_deleted("delete_wrong", before_wrong)
-    if loan_no_set is not None:
-        loan_no_set.add(correct)
-    cache[correct] = _merge_source_row(before_correct or {}, source_row)
-    return "ok"
-
-
-def _finalize_write(tgt, tracker: Optional[CommitTracker], dry_run: bool) -> None:
-    if tracker:
-        tracker.note_write()
-    elif not dry_run:
-        tgt.commit()
-
-
-def sort_plan_for_apply(plan: List[dict]) -> List[dict]:
-    """同一 correct_loan_no：先 rekey/sync_delete，后 sync_status。"""
-
-    def sort_key(row: dict):
-        wrong = row["wrong_loan_no"]
-        correct = row["correct_loan_no"]
-        if wrong != correct:
-            priority = 0
-        elif row.get("sync_mode") == "sync_status":
-            priority = 2
-        else:
-            priority = 1
-        return (correct, priority, wrong)
-
-    return sorted(plan, key=sort_key)
-
-
-def sync_one_loan(
+def apply_one_loan(
     tgt,
     plan_row: dict,
     dry_run: bool,
     audit: RepairAuditLog,
     row_audit: Optional[RowChangeAuditLog],
     tracker: Optional[CommitTracker],
-    loan_no_set: Optional[set] = None,
-    loan_by_no: Optional[Dict[str, dict]] = None,
 ) -> str:
-    wrong = plan_row["wrong_loan_no"]
-    correct = plan_row["correct_loan_no"]
+    loan_no = plan_row["loan_no"]
+    mode = plan_row["mode"]
     source_row = plan_row["source_row"]
-    mode = plan_row.get("sync_mode", "")
-    cache = loan_by_no or {}
-    before_wrong = plan_row.get("before_wrong") or cache.get(wrong)
+    correct = plan_row["correct_loan_no"]
+    before = plan_row["before"]
+    update_cols = diff_update_cols(before, source_row)
+    audit_row = _plan_audit_row(plan_row)
+    cols_hint = ",".join(update_cols) if update_cols else "loan_no"
 
-    if not _loan_present(tgt, wrong, loan_no_set):
-        if _loan_present(tgt, correct, loan_no_set):
-            audit.record("skip_done", plan_row, "wrong_missing_correct_exists")
-            return "skip_done"
-        audit.record("skip", plan_row, "wrong_missing")
-        return "skip_missing"
-
-    if not before_wrong:
-        before_wrong = fetch_loan_row(tgt, wrong)
-    if not before_wrong:
-        audit.record("skip", plan_row, "fetch_wrong_missing")
-        return "skip_missing"
-
-    def _track_rekey(after: dict):
-        if loan_no_set is not None:
-            loan_no_set.discard(wrong)
-            loan_no_set.add(correct)
-            cache.pop(wrong, None)
-            cache[correct] = after
-
-    def _handle_1062(exc: Exception, action: str) -> str:
-        """1062: 先删 wrong / PK 重复行，再更新 correct 或 sync_status。"""
-        if correct != wrong and loan_exists(tgt, correct):
-            before_correct = cache.get(correct) or fetch_loan_row(tgt, correct)
-            result = _apply_sync_delete(
-                tgt,
-                wrong,
-                correct,
-                source_row,
-                before_wrong,
-                before_correct,
-                dry_run,
-                row_audit,
-                loan_no_set,
-                cache,
-            )
-            if result == "missing":
-                audit.record("skip", plan_row, "sync_delete_after_1062_no_row")
-                return "missing"
-            audit.record(
-                "sync_delete_after_1062",
-                plan_row,
-                "%s:%s" % (action, exc),
-            )
-            _finalize_write(tgt, tracker, dry_run)
-            return "ok"
-        if _loan_present(tgt, wrong, loan_no_set):
-            if not dry_run:
-                _delete_pk_duplicates(tgt, source_row, wrong, loan_no_set, cache)
-                if not _sync_update_safe(tgt, wrong, source_row):
-                    audit.record("skip", plan_row, "sync_status_no_row_after_1062")
-                    return "missing"
-                if loan_no_set is not None:
-                    cache[wrong] = _merge_source_row(before_wrong, source_row)
-                if row_audit:
-                    row_audit.record_modified(
-                        "sync_status_after_1062",
-                        before_wrong,
-                        _merge_source_row(before_wrong, source_row),
-                    )
-            audit.record("sync_status_after_1062", plan_row, "%s:%s" % (action, exc))
-            _finalize_write(tgt, tracker, dry_run)
-            return "ok"
-        audit.record("skip", plan_row, "duplicate_key:%s" % exc)
-        return "skip_duplicate"
-
-    if mode == "sync_status" or wrong == correct:
+    if mode == "rekey_long":
+        if loan_exists(tgt, correct) and correct != loan_no:
+            audit.record("skip", audit_row, "correct_loan_no_exists")
+            return "skip"
+        after = _build_after(before, source_row, update_cols, correct)
         if dry_run:
-            after = _merge_source_row(before_wrong, source_row)
             if row_audit:
-                row_audit.record_modified("would_sync_status", before_wrong, after)
-            audit.record("would_sync_status", plan_row, "sync_status")
+                row_audit.record_modified("would_rekey_long", before, after)
+            audit.record("would_rekey_long", audit_row, "rekey_long:%s" % cols_hint)
             return "ok"
-        after = _merge_source_row(before_wrong, source_row)
         try:
-            if not dry_run:
-                _delete_pk_duplicates(tgt, source_row, wrong, loan_no_set, cache)
-            if not _sync_update(tgt, wrong, source_row, STATUS_SYNC_COLS):
-                audit.record("skip", plan_row, "sync_status_no_row")
-                return "missing"
+            if not _rekey_update(tgt, loan_no, correct, source_row, update_cols):
+                tgt.rollback()
+                audit.record("skip", audit_row, "rekey_no_row")
+                return "skip"
         except pymysql.err.IntegrityError as exc:
-            if exc.args[0] != 1062:
-                raise
-            return _handle_1062(exc, "sync_status")
+            tgt.rollback()
+            audit.record("skip", audit_row, "rekey_duplicate:%s" % exc)
+            return "skip"
         if row_audit:
-            row_audit.record_modified("sync_status", before_wrong, after)
-        if loan_no_set is not None:
-            cache[wrong] = after
-        audit.record("sync_status", plan_row, "sync_status")
-        _finalize_write(tgt, tracker, dry_run)
-        return "ok"
-
-    if _loan_present(tgt, correct, loan_no_set) and correct != wrong:
-        before_correct = cache.get(correct) or fetch_loan_row(tgt, correct)
+            row_audit.record_modified("rekey_long", before, after)
+        audit.record("rekey_long", audit_row, "rekey_long:%s" % cols_hint)
+    else:
+        if not update_cols:
+            audit.record("skip", audit_row, "already_ok")
+            return "skip"
+        after = _build_after(before, source_row, update_cols, loan_no)
         if dry_run:
-            if before_correct and row_audit:
-                row_audit.record_modified(
-                    "would_sync_correct",
-                    before_correct,
-                    _merge_source_row(before_correct, source_row),
-                )
             if row_audit:
-                row_audit.record_deleted("would_delete_wrong", before_wrong)
-            audit.record(
-                "would_sync_delete",
-                plan_row,
-                plan_row.get("sync_mode", "update_correct+delete_wrong"),
-            )
+                row_audit.record_modified("would_sync_status", before, after)
+            audit.record("would_sync_status", audit_row, "sync:%s" % cols_hint)
             return "ok"
         try:
-            result = _apply_sync_delete(
-                tgt,
-                wrong,
-                correct,
-                source_row,
-                before_wrong,
-                before_correct,
-                dry_run,
-                row_audit,
-                loan_no_set,
-                cache,
-            )
+            if not _sync_update(tgt, loan_no, source_row, update_cols):
+                tgt.rollback()
+                audit.record("skip", audit_row, "sync_no_row")
+                return "skip"
         except pymysql.err.IntegrityError as exc:
-            if exc.args[0] != 1062:
-                raise
-            return _handle_1062(exc, "sync_delete")
-        if result == "missing":
-            audit.record("skip", plan_row, "sync_delete_no_row")
-            return "missing"
-        audit.record("sync_delete", plan_row, plan_row.get("sync_mode", ""))
-        _finalize_write(tgt, tracker, dry_run)
-        return "ok"
-
-    if loan_exists(tgt, correct) and correct != wrong:
-        before_correct = fetch_loan_row(tgt, correct)
-        if dry_run:
-            if before_correct and row_audit:
-                row_audit.record_modified(
-                    "would_sync_correct",
-                    before_correct,
-                    _merge_source_row(before_correct, source_row),
-                )
-            if row_audit:
-                row_audit.record_deleted("would_delete_wrong", before_wrong)
-            audit.record("would_sync_delete", plan_row, "race_correct_exists")
-            return "ok"
-        try:
-            result = _apply_sync_delete(
-                tgt,
-                wrong,
-                correct,
-                source_row,
-                before_wrong,
-                before_correct,
-                dry_run,
-                row_audit,
-                loan_no_set,
-                cache,
-            )
-        except pymysql.err.IntegrityError as exc:
-            if exc.args[0] != 1062:
-                raise
-            return _handle_1062(exc, "sync_delete")
-        if result == "missing":
-            audit.record("skip", plan_row, "sync_delete_no_row")
-            return "missing"
-        audit.record("sync_delete", plan_row, "race_correct_exists")
-        _finalize_write(tgt, tracker, dry_run)
-        return "ok"
-
-    if dry_run:
-        after = _merge_source_row(before_wrong, source_row)
+            tgt.rollback()
+            audit.record("skip", audit_row, "sync_duplicate:%s" % exc)
+            return "skip"
         if row_audit:
-            row_audit.record_modified("would_rekey_sync", before_wrong, after)
-        audit.record("would_rekey_sync", plan_row, plan_row.get("sync_mode", ""))
-        return "ok"
-    after = _merge_source_row(before_wrong, source_row)
-    if not dry_run:
-        _delete_pk_duplicates(tgt, source_row, wrong, loan_no_set, cache)
-    try:
-        if not _rekey_update(tgt, wrong, correct, source_row, SYNC_COLS):
-            audit.record("skip", plan_row, "rekey_update_no_row")
-            return "missing"
-    except pymysql.err.IntegrityError as exc:
-        if exc.args[0] != 1062:
-            raise
-        return _handle_1062(exc, "rekey")
-    if row_audit:
-        row_audit.record_modified("rekey_sync", before_wrong, after)
-    _track_rekey(after)
-    audit.record("rekey_sync", plan_row, plan_row.get("sync_mode", ""))
-    _finalize_write(tgt, tracker, dry_run)
+            row_audit.record_modified("sync_status", before, after)
+        audit.record("sync_status", audit_row, "sync:%s" % cols_hint)
+
+    if tracker:
+        tracker.note_write()
+    elif not dry_run:
+        tgt.commit()
     return "ok"
 
 
 def split_plan_chunks(plan: List[dict], workers: int) -> List[List[dict]]:
-    """按 correct_loan_no 哈希分片，避免并行 worker 同时改同一 loan_no。"""
     n = max(1, int(workers))
     if not plan:
         return []
     chunks: List[List[dict]] = [[] for _ in range(n)]
     for row in plan:
-        key = str(row.get("correct_loan_no") or row["wrong_loan_no"])
+        key = str(row.get("loan_no") or "")
         idx = int(hashlib.md5(key.encode("utf-8")).hexdigest(), 16) % n
         chunks[idx].append(row)
     return chunks
@@ -742,7 +450,7 @@ def _worker_repair_log_path(base: str, worker_id: int) -> str:
     return str(p.with_name("%s.w%s%s" % (p.stem, worker_id, p.suffix or ".csv")))
 
 
-def run_sync_chunk(
+def run_apply_chunk(
     tgt,
     chunk: List[dict],
     dry_run: bool,
@@ -760,10 +468,8 @@ def run_sync_chunk(
             break
         result = exec_with_retry(
             tgt,
-            lambda r=row: sync_one_loan(
-                tgt, r, dry_run, audit, row_audit, tracker, None, None
-            ),
-            "sync %s" % row["wrong_loan_no"],
+            lambda r=row: apply_one_loan(tgt, r, dry_run, audit, row_audit, tracker),
+            "apply %s" % row["loan_no"],
         )
         if result == "ok":
             ok += 1
@@ -772,20 +478,24 @@ def run_sync_chunk(
         if i % max(1, log_every) == 0:
             print(
                 "%sprogress ok=%s skip=%s last=%s mode=%s"
-                % (prefix, ok, skip, row["wrong_loan_no"], row.get("sync_mode", "")),
+                % (prefix, ok, skip, row["loan_no"], row.get("mode", "")),
                 flush=True,
             )
     tracker.flush()
+    if not dry_run and tracker.pending <= 0:
+        try:
+            tgt.commit()
+        except Exception:
+            pass
     return ok, skip
 
 
-def sync_worker_run(spec: dict) -> Tuple[int, int]:
+def apply_worker_run(spec: dict) -> Tuple[int, int]:
     worker_id = spec["worker_id"]
     workers = spec["workers"]
     label = "[%s/%s] " % (worker_id, workers)
     chunk = spec.get("plan_chunk") or []
     if not chunk:
-        print("%sempty chunk, skip" % label, flush=True)
         return 0, 0
 
     cfg = load_env(Path(spec["env"]))
@@ -800,17 +510,11 @@ def sync_worker_run(spec: dict) -> Tuple[int, int]:
 
     try:
         print(
-            "%sstart rows=%s first=%s last=%s log=%s"
-            % (
-                label,
-                len(chunk),
-                chunk[0]["wrong_loan_no"],
-                chunk[-1]["wrong_loan_no"],
-                spec.get("repair_log") or "",
-            ),
+            "%sstart rows=%s first=%s last=%s"
+            % (label, len(chunk), chunk[0]["loan_no"], chunk[-1]["loan_no"]),
             flush=True,
         )
-        ok, skip = run_sync_chunk(
+        ok, skip = run_apply_chunk(
             tgt,
             chunk,
             spec["dry_run"],
@@ -829,7 +533,7 @@ def sync_worker_run(spec: dict) -> Tuple[int, int]:
         tgt.close()
 
 
-def run_sync_parallel(
+def run_apply_parallel(
     plan: List[dict],
     workers: int,
     env_path: str,
@@ -862,70 +566,42 @@ def run_sync_parallel(
         )
     if not specs:
         return 0, 0
-
-    for spec in specs:
-        chunk = spec["plan_chunk"]
-        print(
-            "  worker %s/%s: rows=%s [%s .. %s] log=%s"
-            % (
-                spec["worker_id"],
-                workers,
-                len(chunk),
-                chunk[0]["wrong_loan_no"],
-                chunk[-1]["wrong_loan_no"],
-                spec.get("repair_log") or "",
-            ),
-            flush=True,
-        )
-
     ctx = multiprocessing.get_context("spawn")
     with ctx.Pool(processes=len(specs)) as pool:
-        results = pool.map(sync_worker_run, specs)
-
+        results = pool.map(apply_worker_run, specs)
     total_ok = sum(r[0] for r in results)
     total_skip = sum(r[1] for r in results)
-    print(
-        "sync parallel done workers=%s ok=%s skip=%s"
-        % (len(specs), total_ok, total_skip),
-        flush=True,
-    )
+    print("parallel done workers=%s ok=%s skip=%s" % (len(specs), total_ok, total_skip), flush=True)
     return total_ok, total_skip
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(
-        description="Fix long loan_no + sync status from source (due_date/status filter)"
+        description="Fix long loan_no + sync status from ng_loan_core.repay_plan"
     )
     p.add_argument("--env", default=str(HERE / "ng_migration.env"))
     p.add_argument("--apply", action="store_true")
     p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--due-before", default="2026-07-01", help="due_date < 该日期")
-    p.add_argument("--status", default="20", help="仅处理该 status")
-    p.add_argument("--min-sn-len", type=int, default=15, help="loan_no 中间段最小长度")
-    p.add_argument("--workers", type=int, default=8, help="并行写库进程数")
-    p.add_argument("--commit-every", type=int, default=100)
+    p.add_argument("--due-before", default="2026-07-01")
+    p.add_argument("--status", default="20")
+    p.add_argument("--min-sn-len", type=int, default=15)
+    p.add_argument("--workers", type=int, default=1)
+    p.add_argument("--commit-every", type=int, default=50)
     p.add_argument("--work-limit", type=int, default=0)
     p.add_argument("--log-every", type=int, default=100)
     p.add_argument("--repair-log", default="")
     p.add_argument("--no-repair-log", action="store_true")
-    p.add_argument(
-        "--long-only",
-        action="store_true",
-        help="仅处理 loan_no 长号行（默认处理全部 status 匹配行，短号只同步 status）",
-    )
+    p.add_argument("--long-only", action="store_true")
     p.add_argument("--plan-only", action="store_true")
     args = p.parse_args(argv)
     if args.apply and args.dry_run:
         p.error("use either --apply or --dry-run")
-    if args.workers < 1:
-        p.error("--workers must be >= 1")
     dry_run = not args.apply
 
     cfg = load_env(Path(args.env))
     env_path = str(Path(args.env).resolve())
     repair_log = args.repair_log or (
-        "/tmp/repair_loan_status20_%s.csv"
-        % datetime.now().strftime("%Y%m%d_%H%M%S")
+        "/tmp/repair_loan_status20_%s.csv" % datetime.now().strftime("%Y%m%d_%H%M%S")
     )
     audit = RepairAuditLog(
         repair_log if not args.no_repair_log else None,
@@ -939,35 +615,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     src = connect_source(cfg)
     try:
         print(
-            "start bulk due_before=%s status=%s min_sn_len=%s workers=%s "
-            "commit_every=%s dry_run=%s plan_only=%s"
-            % (
-                args.due_before,
-                args.status,
-                args.min_sn_len,
-                args.workers,
-                args.commit_every,
-                dry_run,
-                args.plan_only,
-            ),
+            "start due_before=%s status=%s workers=%s dry_run=%s"
+            % (args.due_before, args.status, args.workers, dry_run),
             flush=True,
         )
         run_t0 = time.time()
 
-        print("load target loans ...", flush=True)
-        t0 = time.time()
         all_loans = exec_with_retry(
             tgt,
             lambda: load_all_target_loans(tgt, args.due_before, args.status),
-            "load_all_target_loans",
+            "load loans",
         )
-        loan_by_no = {str(r["loan_no"]): r for r in all_loans}
-        loan_no_set = set(loan_by_no.keys())
-        print(
-            "target_loans=%s elapsed=%.1fs"
-            % (len(all_loans), time.time() - t0),
-            flush=True,
-        )
+        print("target_loans=%s" % len(all_loans), flush=True)
+        if not all_loans:
+            return 0
 
         candidates = (
             filter_long_candidates(all_loans, args.min_sn_len)
@@ -975,156 +636,86 @@ def main(argv: Optional[List[str]] = None) -> int:
             else all_loans
         )
         long_n = sum(
-            1 for r in candidates if is_long_loan_no(str(r.get("loan_no") or ""), args.min_sn_len)
+            1 for r in candidates
+            if is_long_loan_no(str(r.get("loan_no") or ""), args.min_sn_len)
         )
         print(
-            "candidates=%s long=%s short=%s long_only=%s"
-            % (len(candidates), long_n, len(candidates) - long_n, args.long_only),
+            "candidates=%s long=%s short=%s"
+            % (len(candidates), long_n, len(candidates) - long_n),
             flush=True,
         )
-        if not candidates:
-            print("no candidate loans", flush=True)
-            return 0
 
-        ext_sns = sorted(
-            {
-                extract_market_no(
-                    str(r.get("application_no") or ""),
-                    str(r.get("loan_no") or ""),
-                )
-                for r in candidates
-            }
-            - {""}
-        )
-        target_app_by_ext = {
-            extract_market_no(
-                str(r.get("application_no") or ""),
-                str(r.get("loan_no") or ""),
-            ): str(r.get("application_no") or "")
-            for r in candidates
-        }
-        target_app_by_ext = {k: v for k, v in target_app_by_ext.items() if k and v}
+        ext_sns: List[str] = []
+        core_sns: List[str] = []
+        target_app_by_ext: Dict[str, str] = {}
+        for r in candidates:
+            loan_no = str(r.get("loan_no") or "")
+            app_no = str(r.get("application_no") or "")
+            if is_long_loan_no(loan_no, args.min_sn_len):
+                ext = extract_market_no(app_no, loan_no)
+                if ext:
+                    ext_sns.append(ext)
+                    if app_no:
+                        target_app_by_ext[ext] = app_no
+            else:
+                parsed = parse_loan_middle(loan_no)
+                if parsed and is_plausible_core_sn(parsed[0], "", args.min_sn_len):
+                    core_sns.append(parsed[0])
 
-        print(
-            "load source core.application ext_sn=%s ..." % len(ext_sns),
-            flush=True,
-        )
+        print("load source long ext_sn=%s short core_sn=%s ..." % (len(set(ext_sns)), len(set(core_sns))), flush=True)
         t0 = time.time()
-        source_by_ext, miss_reason, meta_by_ext = fetch_source_loans_bulk(
-            src, ext_sns, target_app_by_ext, args.min_sn_len
+        source_by_ext = fetch_source_for_long(
+            src, sorted(set(ext_sns)), target_app_by_ext, args.min_sn_len
         )
+        repay_by_core_sn = fetch_repay_plan_by_sns(src, sorted(set(core_sns)))
         print(
-            "core_application=%s repay_plan_hits=%s miss=%s elapsed=%.1fs"
-            % (
-                len(meta_by_ext),
-                len(source_by_ext),
-                len(miss_reason),
-                time.time() - t0,
-            ),
+            "source long_hits=%s short_repay_hits=%s elapsed=%.1fs"
+            % (len(source_by_ext), len(repay_by_core_sn), time.time() - t0),
             flush=True,
         )
 
-        plan = build_plan_in_memory(
-            candidates,
-            source_by_ext,
-            miss_reason,
-            meta_by_ext,
-            args.min_sn_len,
+        plan, plan_stats = build_plan(
+            candidates, source_by_ext, repay_by_core_sn, args.min_sn_len
         )
         if args.work_limit:
             plan = plan[: args.work_limit]
-        modes: Dict[str, int] = {}
-        for row in plan:
-            m = str(row.get("sync_mode") or "")
-            modes[m] = modes.get(m, 0) + 1
-        print(
-            "repair_plan=%s modes=%s"
-            % (len(plan), modes),
-            flush=True,
-        )
-        for row in plan[:20]:
-            src_row = row["source_row"]
-            if row.get("sync_mode") == "sync_status":
-                print(
-                    "  %s sync_status tgt_status=%s -> src_status=%s due=%s"
-                    % (
-                        row["wrong_loan_no"],
-                        row.get("target_status"),
-                        src_row.get("status"),
-                        src_row.get("due_date"),
-                    ),
-                    flush=True,
-                )
-            else:
-                print(
-                    "  %s -> %s mode=%s app=%s src_status=%s due=%s"
-                    % (
-                        row["wrong_loan_no"],
-                        row["correct_loan_no"],
-                        row.get("sync_mode", ""),
-                        row["application_no"],
-                        src_row.get("status"),
-                        src_row.get("due_date"),
-                    ),
-                    flush=True,
-                )
-        if len(plan) > 20:
-            print("  ... and %s more" % (len(plan) - 20), flush=True)
+        print("repair_plan=%s plan_stats=%s" % (len(plan), plan_stats), flush=True)
+        for row in plan[:15]:
+            print(
+                "  %s mode=%s cols=%s status %s=>%s"
+                % (
+                    row["loan_no"],
+                    row["mode"],
+                    ",".join(row.get("update_cols") or []) or "-",
+                    row["before"].get("status"),
+                    row["source_row"].get("status"),
+                ),
+                flush=True,
+            )
+        if len(plan) > 15:
+            print("  ... and %s more" % (len(plan) - 15), flush=True)
         if args.plan_only:
             return 0 if plan else 1
         if not plan:
             return 0
 
-        plan = sort_plan_for_apply(plan)
-
         if args.workers > 1:
             audit.close()
             row_audit.close()
-            ok, skip = run_sync_parallel(
-                plan,
-                args.workers,
-                env_path,
-                dry_run,
-                args.work_limit,
-                args.log_every,
-                args.commit_every,
-                repair_log if not args.no_repair_log else "",
-                args.no_repair_log,
+            ok, skip = run_apply_parallel(
+                plan, args.workers, env_path, dry_run,
+                args.work_limit, args.log_every, args.commit_every,
+                repair_log if not args.no_repair_log else "", args.no_repair_log,
             )
         else:
             ok = skip = 0
-            tracker = CommitTracker(tgt, args.commit_every, dry_run)
-            for i, row in enumerate(plan, 1):
-                if args.work_limit and ok >= args.work_limit:
-                    break
-                result = exec_with_retry(
-                    tgt,
-                    lambda r=row: sync_one_loan(
-                        tgt,
-                        r,
-                        dry_run,
-                        audit,
-                        row_audit,
-                        tracker,
-                        loan_no_set,
-                        loan_by_no,
-                    ),
-                    "sync %s" % row["wrong_loan_no"],
-                )
-                if result == "ok":
-                    ok += 1
-                else:
-                    skip += 1
-                if i % max(1, args.log_every) == 0:
-                    print(
-                        "progress ok=%s skip=%s last=%s mode=%s"
-                        % (ok, skip, row["wrong_loan_no"], row.get("sync_mode", "")),
-                        flush=True,
-                    )
-            tracker.flush()
+            ok, skip = run_apply_chunk(
+                tgt, plan, dry_run, audit, row_audit,
+                args.commit_every, args.work_limit, args.log_every,
+            )
 
         print(
-            "finished plan=%s ok=%s skip=%s elapsed=%.1fs repair_log=%s"
+            "finished plan=%s ok=%s skip=%s elapsed=%.1fs log=%s"
             % (len(plan), ok, skip, time.time() - run_t0, repair_log),
             flush=True,
         )
