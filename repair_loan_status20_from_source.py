@@ -12,9 +12,10 @@
 
 Usage:
   python3 repair_loan_status20_from_source.py --env ./ng_migration.env --dry-run --plan-only
-  python3 repair_loan_status20_from_source.py --env ./ng_migration.env --apply --commit-every 50
+  python3 repair_loan_status20_from_source.py --env ./ng_migration.env --apply --workers 8 --commit-every 100
 """
 import argparse
+import multiprocessing
 import re
 import time
 from datetime import datetime
@@ -32,6 +33,7 @@ from repair_loan_no_from_audit import (
     cols_sql,
     exec_with_retry,
     fetch_loan_row,
+    loan_exists,
 )
 
 HERE = Path(__file__).resolve().parent
@@ -346,6 +348,12 @@ def _merge_source_row(before: dict, source_row: dict) -> dict:
     return after
 
 
+def _loan_present(tgt, loan_no: str, loan_no_set: Optional[set]) -> bool:
+    if loan_no_set is not None:
+        return loan_no in loan_no_set
+    return loan_exists(tgt, loan_no)
+
+
 def sync_one_loan(
     tgt,
     plan_row: dict,
@@ -353,16 +361,17 @@ def sync_one_loan(
     audit: RepairAuditLog,
     row_audit: Optional[RowChangeAuditLog],
     tracker: Optional[CommitTracker],
-    loan_no_set: set,
-    loan_by_no: Dict[str, dict],
+    loan_no_set: Optional[set] = None,
+    loan_by_no: Optional[Dict[str, dict]] = None,
 ) -> str:
     wrong = plan_row["wrong_loan_no"]
     correct = plan_row["correct_loan_no"]
     source_row = plan_row["source_row"]
-    before_wrong = plan_row.get("before_wrong") or loan_by_no.get(wrong)
+    cache = loan_by_no or {}
+    before_wrong = plan_row.get("before_wrong") or cache.get(wrong)
 
-    if wrong not in loan_no_set:
-        if correct in loan_no_set:
+    if not _loan_present(tgt, wrong, loan_no_set):
+        if _loan_present(tgt, correct, loan_no_set):
             audit.record("skip_done", plan_row, "wrong_missing_correct_exists")
             return "skip_done"
         audit.record("skip", plan_row, "wrong_missing")
@@ -378,6 +387,13 @@ def sync_one_loan(
     set_sql = ", ".join(set_parts)
     sync_vals = [source_row[c] for c in SYNC_COLS]
     mode = plan_row.get("sync_mode", "")
+
+    def _track_rekey():
+        if loan_no_set is not None:
+            loan_no_set.discard(wrong)
+            loan_no_set.add(correct)
+            cache.pop(wrong, None)
+            cache[correct] = after
 
     if mode == "sync_status" or wrong == correct:
         if dry_run:
@@ -397,7 +413,8 @@ def sync_one_loan(
                 return "missing"
         if row_audit:
             row_audit.record_modified("sync_status", before_wrong, after)
-        loan_by_no[wrong] = after
+        if loan_no_set is not None:
+            cache[wrong] = after
         audit.record("sync_status", plan_row, "sync_status")
         if tracker:
             tracker.note_write()
@@ -405,8 +422,8 @@ def sync_one_loan(
             tgt.commit()
         return "ok"
 
-    if correct in loan_no_set and correct != wrong:
-        before_correct = loan_by_no.get(correct) or fetch_loan_row(tgt, correct)
+    if _loan_present(tgt, correct, loan_no_set) and correct != wrong:
+        before_correct = cache.get(correct) or fetch_loan_row(tgt, correct)
         if dry_run:
             if before_correct and row_audit:
                 row_audit.record_modified(
@@ -440,10 +457,11 @@ def sync_one_loan(
             if not cur.rowcount:
                 audit.record("skip", plan_row, "delete_wrong_failed")
                 return "missing"
-        loan_no_set.discard(wrong)
-        loan_no_set.add(correct)
-        loan_by_no[correct] = _merge_source_row(before_correct or {}, source_row)
-        loan_by_no.pop(wrong, None)
+        if loan_no_set is not None:
+            loan_no_set.discard(wrong)
+            loan_no_set.add(correct)
+        cache[correct] = _merge_source_row(before_correct or {}, source_row)
+        cache.pop(wrong, None)
         audit.record("sync_delete", plan_row, plan_row.get("sync_mode", ""))
     else:
         if dry_run:
@@ -463,10 +481,7 @@ def sync_one_loan(
                 return "missing"
         if row_audit:
             row_audit.record_modified("rekey_sync", before_wrong, after)
-        loan_no_set.discard(wrong)
-        loan_no_set.add(correct)
-        loan_by_no[correct] = after
-        loan_by_no.pop(wrong, None)
+        _track_rekey()
         audit.record("rekey_sync", plan_row, plan_row.get("sync_mode", ""))
 
     if tracker:
@@ -474,6 +489,176 @@ def sync_one_loan(
     else:
         tgt.commit()
     return "ok"
+
+
+def split_plan_chunks(plan: List[dict], workers: int) -> List[List[dict]]:
+    n = max(1, int(workers))
+    if not plan:
+        return []
+    size = len(plan)
+    chunks: List[List[dict]] = []
+    for i in range(n):
+        start = i * size // n
+        end = (i + 1) * size // n
+        chunks.append(plan[start:end] if start < end else [])
+    return chunks
+
+
+def _worker_repair_log_path(base: str, worker_id: int) -> str:
+    if not base:
+        return ""
+    p = Path(base)
+    return str(p.with_name("%s.w%s%s" % (p.stem, worker_id, p.suffix or ".csv")))
+
+
+def run_sync_chunk(
+    tgt,
+    chunk: List[dict],
+    dry_run: bool,
+    audit: RepairAuditLog,
+    row_audit: Optional[RowChangeAuditLog],
+    commit_every: int,
+    work_limit: int,
+    log_every: int,
+    prefix: str = "",
+) -> Tuple[int, int]:
+    ok = skip = 0
+    tracker = CommitTracker(tgt, commit_every, dry_run)
+    for i, row in enumerate(chunk, 1):
+        if work_limit and ok >= work_limit:
+            break
+        result = exec_with_retry(
+            tgt,
+            lambda r=row: sync_one_loan(
+                tgt, r, dry_run, audit, row_audit, tracker, None, None
+            ),
+            "sync %s" % row["wrong_loan_no"],
+        )
+        if result == "ok":
+            ok += 1
+        else:
+            skip += 1
+        if i % max(1, log_every) == 0:
+            print(
+                "%sprogress ok=%s skip=%s last=%s mode=%s"
+                % (prefix, ok, skip, row["wrong_loan_no"], row.get("sync_mode", "")),
+                flush=True,
+            )
+    tracker.flush()
+    return ok, skip
+
+
+def sync_worker_run(spec: dict) -> Tuple[int, int]:
+    worker_id = spec["worker_id"]
+    workers = spec["workers"]
+    label = "[%s/%s] " % (worker_id, workers)
+    chunk = spec.get("plan_chunk") or []
+    if not chunk:
+        print("%sempty chunk, skip" % label, flush=True)
+        return 0, 0
+
+    cfg = load_env(Path(spec["env"]))
+    tgt = connect_target(cfg)
+    if spec.get("no_repair_log"):
+        audit = RepairAuditLog(None, enabled=False)
+        row_audit = RowChangeAuditLog("", enabled=False)
+    else:
+        repair_log = spec.get("repair_log") or ""
+        audit = RepairAuditLog(repair_log or None, enabled=bool(repair_log))
+        row_audit = RowChangeAuditLog(repair_log or "", enabled=bool(repair_log))
+
+    try:
+        print(
+            "%sstart rows=%s first=%s last=%s log=%s"
+            % (
+                label,
+                len(chunk),
+                chunk[0]["wrong_loan_no"],
+                chunk[-1]["wrong_loan_no"],
+                spec.get("repair_log") or "",
+            ),
+            flush=True,
+        )
+        ok, skip = run_sync_chunk(
+            tgt,
+            chunk,
+            spec["dry_run"],
+            audit,
+            row_audit,
+            spec["commit_every"],
+            spec["work_limit"],
+            spec["log_every"],
+            label,
+        )
+        print("%sdone ok=%s skip=%s" % (label, ok, skip), flush=True)
+        return ok, skip
+    finally:
+        audit.close()
+        row_audit.close()
+        tgt.close()
+
+
+def run_sync_parallel(
+    plan: List[dict],
+    workers: int,
+    env_path: str,
+    dry_run: bool,
+    work_limit: int,
+    log_every: int,
+    commit_every: int,
+    repair_log_path: str,
+    no_repair_log: bool,
+) -> Tuple[int, int]:
+    chunks = split_plan_chunks(plan, workers)
+    specs = []
+    for i, chunk in enumerate(chunks):
+        if not chunk:
+            continue
+        wlog = _worker_repair_log_path(repair_log_path, i) if repair_log_path else ""
+        specs.append(
+            {
+                "worker_id": i,
+                "workers": workers,
+                "env": env_path,
+                "dry_run": dry_run,
+                "work_limit": work_limit,
+                "log_every": log_every,
+                "commit_every": commit_every,
+                "plan_chunk": chunk,
+                "repair_log": wlog,
+                "no_repair_log": no_repair_log,
+            }
+        )
+    if not specs:
+        return 0, 0
+
+    for spec in specs:
+        chunk = spec["plan_chunk"]
+        print(
+            "  worker %s/%s: rows=%s [%s .. %s] log=%s"
+            % (
+                spec["worker_id"],
+                workers,
+                len(chunk),
+                chunk[0]["wrong_loan_no"],
+                chunk[-1]["wrong_loan_no"],
+                spec.get("repair_log") or "",
+            ),
+            flush=True,
+        )
+
+    ctx = multiprocessing.get_context("spawn")
+    with ctx.Pool(processes=len(specs)) as pool:
+        results = pool.map(sync_worker_run, specs)
+
+    total_ok = sum(r[0] for r in results)
+    total_skip = sum(r[1] for r in results)
+    print(
+        "sync parallel done workers=%s ok=%s skip=%s"
+        % (len(specs), total_ok, total_skip),
+        flush=True,
+    )
+    return total_ok, total_skip
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -486,9 +671,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--due-before", default="2026-07-01", help="due_date < 该日期")
     p.add_argument("--status", default="20", help="仅处理该 status")
     p.add_argument("--min-sn-len", type=int, default=15, help="loan_no 中间段最小长度")
-    p.add_argument("--commit-every", type=int, default=50)
+    p.add_argument("--workers", type=int, default=8, help="并行写库进程数")
+    p.add_argument("--commit-every", type=int, default=100)
     p.add_argument("--work-limit", type=int, default=0)
-    p.add_argument("--log-every", type=int, default=50)
+    p.add_argument("--log-every", type=int, default=100)
     p.add_argument("--repair-log", default="")
     p.add_argument("--no-repair-log", action="store_true")
     p.add_argument(
@@ -500,9 +686,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = p.parse_args(argv)
     if args.apply and args.dry_run:
         p.error("use either --apply or --dry-run")
+    if args.workers < 1:
+        p.error("--workers must be >= 1")
     dry_run = not args.apply
 
     cfg = load_env(Path(args.env))
+    env_path = str(Path(args.env).resolve())
     repair_log = args.repair_log or (
         "/tmp/repair_loan_status20_%s.csv"
         % datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -519,11 +708,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     src = connect_source(cfg)
     try:
         print(
-            "start bulk due_before=%s status=%s min_sn_len=%s dry_run=%s plan_only=%s"
+            "start bulk due_before=%s status=%s min_sn_len=%s workers=%s "
+            "commit_every=%s dry_run=%s plan_only=%s"
             % (
                 args.due_before,
                 args.status,
                 args.min_sn_len,
+                args.workers,
+                args.commit_every,
                 dry_run,
                 args.plan_only,
             ),
@@ -652,34 +844,52 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not plan:
             return 0
 
-        ok = skip = 0
-        tracker = CommitTracker(tgt, args.commit_every, dry_run)
-        for i, row in enumerate(plan, 1):
-            result = exec_with_retry(
-                tgt,
-                lambda r=row: sync_one_loan(
-                    tgt,
-                    r,
-                    dry_run,
-                    audit,
-                    row_audit,
-                    tracker,
-                    loan_no_set,
-                    loan_by_no,
-                ),
-                "sync %s" % row["wrong_loan_no"],
+        if args.workers > 1:
+            audit.close()
+            row_audit.close()
+            ok, skip = run_sync_parallel(
+                plan,
+                args.workers,
+                env_path,
+                dry_run,
+                args.work_limit,
+                args.log_every,
+                args.commit_every,
+                repair_log if not args.no_repair_log else "",
+                args.no_repair_log,
             )
-            if result == "ok":
-                ok += 1
-            else:
-                skip += 1
-            if i % max(1, args.log_every) == 0:
-                print(
-                    "progress ok=%s skip=%s last=%s mode=%s"
-                    % (ok, skip, row["wrong_loan_no"], row.get("sync_mode", "")),
-                    flush=True,
+        else:
+            ok = skip = 0
+            tracker = CommitTracker(tgt, args.commit_every, dry_run)
+            for i, row in enumerate(plan, 1):
+                if args.work_limit and ok >= args.work_limit:
+                    break
+                result = exec_with_retry(
+                    tgt,
+                    lambda r=row: sync_one_loan(
+                        tgt,
+                        r,
+                        dry_run,
+                        audit,
+                        row_audit,
+                        tracker,
+                        loan_no_set,
+                        loan_by_no,
+                    ),
+                    "sync %s" % row["wrong_loan_no"],
                 )
-        tracker.flush()
+                if result == "ok":
+                    ok += 1
+                else:
+                    skip += 1
+                if i % max(1, args.log_every) == 0:
+                    print(
+                        "progress ok=%s skip=%s last=%s mode=%s"
+                        % (ok, skip, row["wrong_loan_no"], row.get("sync_mode", "")),
+                        flush=True,
+                    )
+            tracker.flush()
+
         print(
             "finished plan=%s ok=%s skip=%s elapsed=%.1fs repair_log=%s"
             % (len(plan), ok, skip, time.time() - run_t0, repair_log),
