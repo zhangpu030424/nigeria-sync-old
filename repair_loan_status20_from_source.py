@@ -14,8 +14,7 @@
   3. 仅 UPDATE status/金额/日期等，不改 loan_no；失败则 skip
 
 同一 loan_no 重复行（application_no 后缀误用 core sn）:
-  删除 ng0564-{core_sn} 行，保留 ng{appId}-{market 长号} 行（按主键删，不限 status）
-  若同一 market 长号多行（如 ng0562-178... vs ng20572350-178...）：以源库 market 为准，否则留更长 application_no
+  删除错 application_no 行，保留 market 长号行（按主键删，默认扫全表不限 due_date/status）
 
 Usage:
   python3 repair_loan_status20_from_source.py --env ./ng_migration.env --dry-run --plan-only
@@ -147,13 +146,18 @@ def is_wrong_application_no(
     return suffix == core_sn and len(suffix) < min_sn_len
 
 
-def load_loans_for_dup_check(tgt, due_before: str) -> List[dict]:
-    """due_date 范围内全部 loan（不限 status），用于查重复 loan_no。"""
-    sql = """
-        SELECT %s FROM loan WHERE due_date < %%s ORDER BY loan_no ASC
-    """ % cols_sql(LOAN_COLS)
+def load_loans_for_dup_check(tgt, due_before: Optional[str] = None) -> List[dict]:
+    """查重复 loan_no；due_before 为空则扫全表（不限 status / due_date）。"""
+    if due_before:
+        sql = """
+            SELECT %s FROM loan WHERE due_date < %%s ORDER BY loan_no ASC
+        """ % cols_sql(LOAN_COLS)
+        args = (due_before,)
+    else:
+        sql = "SELECT %s FROM loan ORDER BY loan_no ASC" % cols_sql(LOAN_COLS)
+        args = ()
     with tgt.cursor() as cur:
-        cur.execute(sql, (due_before,))
+        cur.execute(sql, args)
         return list(cur.fetchall())
 
 
@@ -1011,7 +1015,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--env", default=str(HERE / "ng_migration.env"))
     p.add_argument("--apply", action="store_true")
     p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--due-before", default="2026-07-01")
+    p.add_argument("--due-before", default="2026-07-01", help="sync 用：due_date < 该日期")
+    p.add_argument(
+        "--dup-due-before",
+        default="",
+        help="dup 用：due_date < 该日期；默认空=扫全表所有 loan",
+    )
     p.add_argument("--status", default="20")
     p.add_argument("--min-sn-len", type=int, default=15)
     p.add_argument("--workers", type=int, default=1)
@@ -1029,7 +1038,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument(
         "--list-dup",
         action="store_true",
-        help="仅列出同一 loan_no 多行（不写库），查 due_before 内全部 status",
+        help="仅列出同一 loan_no 多行（不写库）；默认扫全表",
     )
     p.add_argument("--plan-only", action="store_true")
     args = p.parse_args(argv)
@@ -1041,14 +1050,17 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     cfg = load_env(Path(args.env))
 
+    dup_due_before = (args.dup_due_before or "").strip() or None
+
     if args.list_dup:
         tgt = connect_target(cfg)
         src = connect_source(cfg)
         try:
-            print("list-dup due_before=%s (all status)" % args.due_before, flush=True)
+            scope = dup_due_before or "ALL"
+            print("list-dup scope=%s (all status)" % scope, flush=True)
             rows = exec_with_retry(
                 tgt,
-                lambda: load_loans_for_dup_check(tgt, args.due_before),
+                lambda: load_loans_for_dup_check(tgt, dup_due_before),
                 "load dup check",
             )
             dup_groups = group_dup_loan_nos(rows)
@@ -1080,8 +1092,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     src = connect_source(cfg)
     try:
         print(
-            "start due_before=%s status=%s workers=%s dry_run=%s"
-            % (args.due_before, args.status, args.workers, dry_run),
+            "start sync_due_before=%s status=%s dup_scope=%s workers=%s dry_run=%s"
+            % (
+                args.due_before,
+                args.status,
+                dup_due_before or "ALL",
+                args.workers,
+                dry_run,
+            ),
             flush=True,
         )
         run_t0 = time.time()
@@ -1092,9 +1110,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not args.no_fix_dup_app_no:
             dup_rows = exec_with_retry(
                 tgt,
-                lambda: load_loans_for_dup_check(tgt, args.due_before),
+                lambda: load_loans_for_dup_check(tgt, dup_due_before),
                 "load dup check",
             )
+            print("dup_scan_rows=%s" % len(dup_rows), flush=True)
             dup_groups = group_dup_loan_nos(dup_rows)
             dup_ext_sns = collect_ext_sns_from_dup_groups(dup_groups, args.min_sn_len)
             dup_market = fetch_market_app_no_by_ext_sn(src, dup_ext_sns)
@@ -1103,8 +1122,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
             dup_skip_pks = {row_pk(p["before"]) for p in dup_plan}
             print(
-                "dup_plan=%s dup_stats=%s (due_before only, all status)"
-                % (len(dup_plan), dup_stats),
+                "dup_plan=%s dup_stats=%s scope=%s"
+                % (len(dup_plan), dup_stats, dup_due_before or "ALL"),
                 flush=True,
             )
             for row in dup_plan[:10]:
