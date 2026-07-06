@@ -7,7 +7,8 @@
   2. 用 old_loan_no 在本地拼目标号，例如:
        NG-217798621621  ->  ng-217798621621-01000
   3. 用 CSV 的 new_loan_no（库里当前错误号）定位 loan 行并改成目标号
-  4. 每条打印 REPAIR_AUDIT；删除/修改的完整行写入 .deleted.csv / .modified.csv
+  4. 同时把 loan.application_no 设为 CSV 的 new_application_no（market 长号，如 ng0515-178...）
+  5. loan_no 已改对但 application_no 仍是短号时，单独修正 application_no
 
 审计 CSV 列（与 backfill_delete_audit_*.csv 一致）:
   ts,action,table,old_application_no,new_application_no,old_loan_no,new_loan_no,app_id
@@ -414,6 +415,57 @@ def insert_row(tgt, table: str, cols: List[str], row: dict) -> None:
         cur.execute(sql, [row[c] for c in cols])
 
 
+def _apply_loan_application_no(row: dict, app_no: str) -> dict:
+    out = dict(row)
+    if app_no:
+        out["application_no"] = app_no
+    return out
+
+
+def _fix_loan_application_no_if_needed(
+    tgt,
+    loan_no: str,
+    want_app_no: str,
+    plan_row: dict,
+    dry_run: bool,
+    audit: RepairAuditLog,
+    row_audit: Optional[RowChangeAuditLog],
+    tracker: Optional[CommitTracker],
+) -> bool:
+    """loan_no 已对但 application_no 仍是短号后缀时，改成 market 长号。"""
+    if not want_app_no:
+        return False
+    current = fetch_loan_application_no(tgt, loan_no)
+    if not current or current == want_app_no:
+        return False
+    before = fetch_loan_row(tgt, loan_no)
+    if dry_run:
+        if before and row_audit:
+            row_audit.record_modified(
+                "would_fix_application_no",
+                before,
+                _apply_loan_application_no(before, want_app_no),
+            )
+        audit.record("would_fix_app_no", plan_row, "fix_application_no")
+        return True
+    with tgt.cursor() as cur:
+        cur.execute(
+            "UPDATE loan SET application_no=%s WHERE loan_no=%s",
+            (want_app_no, loan_no),
+        )
+        if not cur.rowcount:
+            return False
+    after = fetch_loan_row(tgt, loan_no) or _apply_loan_application_no(before or {}, want_app_no)
+    if row_audit and before:
+        row_audit.record_modified("fix_application_no", before, after)
+    audit.record("fix_app_no", plan_row, "fix_application_no")
+    if tracker:
+        tracker.note_write()
+    else:
+        tgt.commit()
+    return True
+
+
 def repair_one_loan(
     tgt,
     row: dict,
@@ -429,16 +481,16 @@ def repair_one_loan(
 
     if not loan_exists(tgt, wrong):
         if loan_exists(tgt, correct):
+            if _fix_loan_application_no_if_needed(
+                tgt, correct, app_no, row, dry_run, audit, row_audit, tracker
+            ):
+                return "ok"
             audit.record("skip_done", row, "wrong_missing_correct_exists")
             return "skip_done"
         audit.record("skip", row, "wrong_missing")
         return "skip_missing"
 
     if loan_exists(tgt, correct):
-        existing_app = fetch_loan_application_no(tgt, correct)
-        if app_no and existing_app and existing_app != app_no:
-            audit.record("skip", row, "conflict_correct_app")
-            return "conflict"
         before = fetch_loan_row(tgt, wrong)
         if dry_run:
             if before and row_audit:
@@ -453,6 +505,9 @@ def repair_one_loan(
                 audit.record("skip", row, "delete_wrong_failed")
                 return "missing"
         audit.record("delete", row, "delete_wrong_keep_correct")
+        _fix_loan_application_no_if_needed(
+            tgt, correct, app_no, row, dry_run, audit, row_audit, tracker
+        )
         if tracker:
             tracker.note_write()
         else:
@@ -462,17 +517,17 @@ def repair_one_loan(
     before = fetch_loan_row(tgt, wrong)
     if dry_run:
         if before and row_audit:
-            after = dict(before)
+            after = _apply_loan_application_no(before, app_no)
             after["loan_no"] = correct
             row_audit.record_modified("would_update", before, after)
-        audit.record("would_update", row, "update_loan_no")
+        audit.record("would_update", row, "update_loan_no_and_app_no" if app_no else "update_loan_no")
         return "ok"
 
     if strategy == "insert-delete":
         if not before:
             audit.record("skip", row, "fetch_wrong_missing")
             return "missing"
-        after = dict(before)
+        after = _apply_loan_application_no(before, app_no)
         after["loan_no"] = correct
         insert_row(tgt, "loan", LOAN_COLS, after)
         with tgt.cursor() as cur:
@@ -487,15 +542,25 @@ def repair_one_loan(
         if not before:
             audit.record("skip", row, "fetch_wrong_missing")
             return "missing"
-        with tgt.cursor() as cur:
-            cur.execute(
-                "UPDATE loan SET loan_no=%s WHERE loan_no=%s",
-                (correct, wrong),
-            )
-            if not cur.rowcount:
-                audit.record("skip", row, "update_no_row")
-                return "missing"
-        after = fetch_loan_row(tgt, correct) or dict(before)
+        if app_no:
+            with tgt.cursor() as cur:
+                cur.execute(
+                    "UPDATE loan SET loan_no=%s, application_no=%s WHERE loan_no=%s",
+                    (correct, app_no, wrong),
+                )
+                if not cur.rowcount:
+                    audit.record("skip", row, "update_no_row")
+                    return "missing"
+        else:
+            with tgt.cursor() as cur:
+                cur.execute(
+                    "UPDATE loan SET loan_no=%s WHERE loan_no=%s",
+                    (correct, wrong),
+                )
+                if not cur.rowcount:
+                    audit.record("skip", row, "update_no_row")
+                    return "missing"
+        after = fetch_loan_row(tgt, correct) or _apply_loan_application_no(before, app_no)
         after["loan_no"] = correct
         if row_audit:
             row_audit.record_modified("update", before, after)
