@@ -7,14 +7,24 @@ Loan 逻辑（单遍）:
   2. 先 =旧号，再 LIKE 'ng____-旧号' 查 application，有则改，无则 skip
 
 New format:
-  application_no = ng{app_id:04d}-{old_application_no}
-  loan_no        = ng-{old_application_no}-01000
+  application_no = ng{app_id:04d}-{old_application_no}   (market 旧单号)
+  loan_no        = ng-{core_sn}-01000                    (与 ng_migration_run.format_loan_no 一致)
+
+  core_sn 来源（优先级）:
+    1. application.sn
+    2. 旧 loan_no 形如 NG-217809955941 / ng-217809955941
+
+  --repair-wrong-loan: 修复曾用 market 号拼 loan_no 的行（ng-{18位}-01000 → ng-{core_sn}-01000）
+
+  --from-audit-log: 读取 backfill_delete_audit_*.csv / backfill_loan.log 中的删除记录，
+    按 old_loan_no(NG-xxx) 还原为 ng-{core_sn}-01000；同样输出 DELETE_AUDIT 到新日志。
 
 Performance:
   --scan-size 150  --commit-every 20  --workers 4  (按 loan_no 分段并行)
 """
 import argparse
 import multiprocessing
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +38,10 @@ import ng_migration_run as mig
 HERE = Path(__file__).resolve().parent
 LOAN_COLS = mig.LOAN_INSERT_COLS
 APP_COLS = mig.APPLICATION_INSERT_COLS
+LEGACY_LOAN_NO_RE = re.compile(r"^[Nn][Gg]-(\d+)$")
+NEW_LOAN_NO_RE = re.compile(r"^[Nn][Gg]-(\d+)-(\d{5})$")
+DELETE_AUDIT_LINE_RE = re.compile(r"^DELETE_AUDIT\s+(.+)$")
+AUDIT_HEADER = "ts,action,table,old_application_no,new_application_no,old_loan_no,new_loan_no,app_id"
 
 
 def load_env(path: Path) -> Dict[str, str]:
@@ -60,8 +74,29 @@ def new_application_no(app_id, old_no: str) -> str:
     return "ng%04d-%s" % (int(app_id), old_no)
 
 
-def new_loan_no(old_app_no: str) -> str:
-    return "ng-%s-01000" % old_app_no
+def extract_core_sn_from_legacy_loan_no(loan_no: str) -> str:
+    """旧目标库 loan_no 多为 NG-{core_sn}，不含 -01000 后缀。"""
+    m = LEGACY_LOAN_NO_RE.match(str(loan_no or "").strip())
+    return m.group(1) if m else ""
+
+
+def parse_loan_no_middle_sn(loan_no: str) -> str:
+    m = NEW_LOAN_NO_RE.match(str(loan_no or "").strip())
+    return m.group(1) if m else ""
+
+
+def resolve_core_sn(row: dict, old_loan_no: str) -> str:
+    cs = str(row.get("core_sn") or "").strip()
+    if cs:
+        return cs
+    return extract_core_sn_from_legacy_loan_no(old_loan_no)
+
+
+def new_loan_no_for_row(row: dict, old_loan_no: str) -> str:
+    core_sn = resolve_core_sn(row, old_loan_no)
+    if not core_sn:
+        return ""
+    return mig.format_loan_no(core_sn, 1, 0)
 
 
 def is_numeric_application_no(app_no: str) -> bool:
@@ -128,6 +163,187 @@ class DeleteAuditLog(object):
             self._fp.flush()
 
 
+def parse_audit_record_line(line: str) -> Optional[dict]:
+    """Parse one CSV audit row or DELETE_AUDIT log line."""
+    raw = str(line or "").strip()
+    if not raw or raw == AUDIT_HEADER or raw.endswith(AUDIT_HEADER):
+        return None
+    m = DELETE_AUDIT_LINE_RE.match(raw)
+    if m:
+        raw = m.group(1).strip()
+    if raw.startswith("ts,action,"):
+        return None
+    parts = raw.split(",")
+    if len(parts) < 8:
+        return None
+    return {
+        "ts": parts[0].strip(),
+        "action": parts[1].strip(),
+        "table": parts[2].strip(),
+        "old_application_no": parts[3].strip(),
+        "new_application_no": parts[4].strip(),
+        "old_loan_no": parts[5].strip(),
+        "new_loan_no": parts[6].strip(),
+        "app_id": parts[7].strip(),
+    }
+
+
+def _is_worker_audit_path(path: Path) -> bool:
+    return bool(re.search(r"\.w\d+$", path.stem))
+
+
+def expand_audit_log_paths(paths: List[str], merge_worker_logs: bool = True) -> List[str]:
+    """Expand base audit csv to sibling .w0.csv ... if present."""
+    out = []  # type: List[str]
+    seen = set()
+    for raw in paths:
+        base = Path(raw).expanduser()
+        candidates = [base]
+        if merge_worker_logs and base.suffix.lower() == ".csv" and not _is_worker_audit_path(base):
+            stem, suffix = base.stem, base.suffix
+            parent = base.parent
+            for i in range(32):
+                wp = parent / ("%s.w%s%s" % (stem, i, suffix))
+                if wp.exists():
+                    candidates.append(wp)
+        for cand in candidates:
+            if not cand.exists():
+                continue
+            key = str(cand.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+def load_audit_records(paths: List[str]) -> List[dict]:
+    records = []  # type: List[dict]
+    for path in paths:
+        p = Path(path)
+        text = p.read_text(encoding="utf-8", errors="replace")
+        for line in text.splitlines():
+            rec = parse_audit_record_line(line)
+            if rec:
+                rec["_source"] = str(p)
+                records.append(rec)
+    return records
+
+
+def build_repair_rows_from_audit(records: List[dict]) -> List[dict]:
+    """Turn delete audit rows into loan repair jobs (wrong new_loan_no -> core sn loan)."""
+    out = []  # type: List[dict]
+    seen_wrong = set()
+    skipped = {}  # type: Dict[str, int]
+
+    for rec in records:
+        if rec.get("table") != "loan":
+            skipped["not_loan"] = skipped.get("not_loan", 0) + 1
+            continue
+        if rec.get("action") not in ("delete", "would_delete"):
+            skipped["not_delete"] = skipped.get("not_delete", 0) + 1
+            continue
+        wrong_loan = str(rec.get("new_loan_no") or "").strip()
+        legacy_loan = str(rec.get("old_loan_no") or "").strip()
+        if not wrong_loan or not legacy_loan:
+            skipped["missing_loan_no"] = skipped.get("missing_loan_no", 0) + 1
+            continue
+        core_sn = extract_core_sn_from_legacy_loan_no(legacy_loan)
+        if not core_sn:
+            skipped["no_core_sn"] = skipped.get("no_core_sn", 0) + 1
+            continue
+        correct_loan = mig.format_loan_no(core_sn, 1, 0)
+        if not correct_loan or correct_loan == wrong_loan:
+            skipped["already_correct"] = skipped.get("already_correct", 0) + 1
+            continue
+        if wrong_loan in seen_wrong:
+            skipped["dup_wrong_loan"] = skipped.get("dup_wrong_loan", 0) + 1
+            continue
+        seen_wrong.add(wrong_loan)
+        out.append(
+            {
+                "loan_no": wrong_loan,
+                "application_no": rec.get("new_application_no") or rec.get("old_application_no"),
+                "new_application_no": rec.get("new_application_no") or "",
+                "app_id": rec.get("app_id"),
+                "core_sn": core_sn,
+                "new_loan_no": correct_loan,
+                "audit_old_loan_no": legacy_loan,
+                "audit_source": rec.get("_source", ""),
+            }
+        )
+    out.sort(key=lambda r: str(r["loan_no"]))
+    if skipped:
+        print(
+            "audit_repair_skipped %s"
+            % " ".join("%s=%s" % (k, v) for k, v in sorted(skipped.items())),
+            flush=True,
+        )
+    return out
+
+
+def summarize_audit_repair_plan(rows: List[dict], paths: List[str]) -> None:
+    print("=== audit repair plan ===", flush=True)
+    print("audit_files=%s" % len(paths), flush=True)
+    for p in paths:
+        print("  %s" % p, flush=True)
+    print("repair_rows=%s" % len(rows), flush=True)
+    for row in rows[:10]:
+        print(
+            "  sample wrong=%s -> correct=%s legacy=%s app=%s"
+            % (
+                row["loan_no"],
+                row["new_loan_no"],
+                row.get("audit_old_loan_no", ""),
+                row.get("new_application_no", ""),
+            ),
+            flush=True,
+        )
+    if len(rows) > 10:
+        print("  ... and %s more" % (len(rows) - 10), flush=True)
+
+
+def run_loans_from_audit(
+    tgt,
+    repair_rows: List[dict],
+    dry_run: bool,
+    strategy: str,
+    work_limit: int,
+    log_every: int,
+    audit: Optional[DeleteAuditLog],
+    commit_every: int,
+) -> Tuple[int, int]:
+    ok = skip = 0
+    tracker = CommitTracker(tgt, commit_every, dry_run)
+    status_counts = {}  # type: Dict[str, int]
+    for row in repair_rows:
+        loan_no = str(row["loan_no"])
+        status = exec_with_retry(
+            tgt,
+            lambda r=row: update_one_loan(tgt, r, dry_run, strategy, audit, tracker),
+            "loan audit-repair loan_no=%s" % loan_no,
+        )
+        status_counts[status] = status_counts.get(status, 0) + 1
+        if status == "ok":
+            ok += 1
+        else:
+            skip += 1
+        if work_limit and ok >= work_limit:
+            tracker.flush()
+            print("loan audit-repair stop work_limit=%s" % work_limit, flush=True)
+            break
+        if (ok + skip) and (ok + skip) % log_every == 0:
+            print(
+                "loan audit-repair progress ok=%s skip=%s last=%s"
+                % (ok, skip, loan_no),
+                flush=True,
+            )
+    tracker.flush()
+    reasons = " ".join("%s=%s" % (k, v) for k, v in sorted(status_counts.items()))
+    print("loan audit-repair done ok=%s skip=%s reasons=[%s]" % (ok, skip, reasons or "-"), flush=True)
+    return ok, skip
+
+
 def exec_with_retry(tgt, fn, what: str):
     for attempt in range(5):
         try:
@@ -192,12 +408,68 @@ def scan_loan_numeric_batch(
         return list(cur.fetchall())
 
 
+def scan_repair_wrong_loan_batch(
+    tgt,
+    after_loan_no: str,
+    scan_limit: int,
+    wrong_sn_min_len: int,
+    loan_no_max: Optional[str] = None,
+) -> List[dict]:
+    """曾错误 backfill：loan_no 中间段用了 market 长号，需按 application.sn 改回。"""
+    sql = """
+        SELECT l.loan_no, l.application_no, a.app_id, a.sn AS core_sn
+        FROM loan l
+        INNER JOIN application a ON a.application_no = l.application_no
+        WHERE l.loan_no > %s
+          AND l.loan_no REGEXP '^[Nn][Gg]-[0-9]+-[0-9]{5}$'
+          AND a.sn IS NOT NULL AND a.sn <> ''
+    """
+    params = [after_loan_no or ""]
+    if loan_no_max:
+        sql += " AND l.loan_no <= %s"
+        params.append(loan_no_max)
+    sql += " ORDER BY l.loan_no ASC LIMIT %s"
+    params.append(scan_limit * 3)
+    with tgt.cursor() as cur:
+        cur.execute(sql, params)
+        rows = list(cur.fetchall())
+    out = []
+    for row in rows:
+        old_loan = str(row["loan_no"])
+        middle = parse_loan_no_middle_sn(old_loan)
+        if wrong_sn_min_len > 0 and len(middle) < wrong_sn_min_len:
+            continue
+        core_sn = str(row.get("core_sn") or "").strip()
+        if not core_sn:
+            continue
+        want = mig.format_loan_no(core_sn, 1, 0)
+        if not want or want == old_loan:
+            continue
+        out.append(
+            {
+                "loan_no": old_loan,
+                "application_no": row["application_no"],
+                "app_id": row["app_id"],
+                "new_application_no": row["application_no"],
+                "core_sn": core_sn,
+                "new_loan_no": want,
+            }
+        )
+        if len(out) >= scan_limit:
+            break
+    return out
+
+
+def enrich_repair_loan_candidates(rows: List[dict]) -> List[dict]:
+    return [r for r in rows if r.get("new_loan_no")]
+
+
 def lookup_application_for_old_loan(tgt, old_app_no: str) -> Optional[dict]:
     """先精确查旧号，再 LIKE 'ng____-旧号'（app_id 用 _ 占位，从结果行读取）。"""
     with tgt.cursor() as cur:
         cur.execute(
             """
-            SELECT application_no, app_id
+            SELECT application_no, app_id, sn
             FROM application
             WHERE application_no = %s
             LIMIT 1
@@ -209,13 +481,14 @@ def lookup_application_for_old_loan(tgt, old_app_no: str) -> Optional[dict]:
         return {
             "new_application_no": new_application_no(row["app_id"], old_app_no),
             "app_id": row["app_id"],
+            "core_sn": str(row.get("sn") or "").strip(),
         }
 
     pattern = "ng____-%s" % old_app_no
     with tgt.cursor() as cur:
         cur.execute(
             """
-            SELECT application_no, app_id
+            SELECT application_no, app_id, sn
             FROM application
             WHERE application_no LIKE %s
             LIMIT 5
@@ -229,6 +502,7 @@ def lookup_application_for_old_loan(tgt, old_app_no: str) -> Optional[dict]:
             return {
                 "new_application_no": app_no,
                 "app_id": row["app_id"],
+                "core_sn": str(row.get("sn") or "").strip(),
             }
     return None
 
@@ -246,6 +520,8 @@ def enrich_loan_candidates(tgt, loans: List[dict]) -> List[dict]:
                 "application_no": row["application_no"],
                 "app_id": match["app_id"],
                 "new_application_no": match["new_application_no"],
+                "core_sn": match.get("core_sn")
+                or extract_core_sn_from_legacy_loan_no(row["loan_no"]),
             }
         )
     return out
@@ -322,7 +598,12 @@ def update_one_loan(
         new_app = str(row["new_application_no"])
     else:
         new_app = new_application_no(row["app_id"], old_app_no)
-    new_loan = new_loan_no(old_app_no)
+    if row.get("new_loan_no"):
+        new_loan = str(row["new_loan_no"])
+    else:
+        new_loan = new_loan_no_for_row(row, old_loan_no)
+    if not new_loan:
+        return "skip_no_core_sn"
     if new_app == old_app_no and new_loan == old_loan_no:
         return "skip"
 
@@ -585,6 +866,8 @@ def _run_loan_pass(
     loan_no_min: str = "",
     loan_no_max: Optional[str] = None,
     worker_label: str = "",
+    repair_wrong_loan: bool = False,
+    wrong_sn_min_len: int = 15,
 ) -> Tuple[int, int]:
     """纯数字 application_no 的 loan → 查 application → 有则改，无则 skip。"""
     ok = skip = scanned = 0
@@ -592,16 +875,26 @@ def _run_loan_pass(
     batch_no = 0
     while True:
         batch_no += 1
-        rows = exec_with_retry(
-            tgt,
-            lambda: scan_loan_numeric_batch(tgt, after, scan_size, loan_no_max),
-            "loan scan after=%s max=%s" % (after, loan_no_max or "*"),
-        )
+        if repair_wrong_loan:
+            rows = exec_with_retry(
+                tgt,
+                lambda: scan_repair_wrong_loan_batch(
+                    tgt, after, scan_size, wrong_sn_min_len, loan_no_max
+                ),
+                "loan repair scan after=%s max=%s" % (after, loan_no_max or "*"),
+            )
+            todo = enrich_repair_loan_candidates(rows)
+        else:
+            rows = exec_with_retry(
+                tgt,
+                lambda: scan_loan_numeric_batch(tgt, after, scan_size, loan_no_max),
+                "loan scan after=%s max=%s" % (after, loan_no_max or "*"),
+            )
+            todo = enrich_loan_candidates(tgt, rows)
         if not rows:
             break
         after = str(rows[-1]["loan_no"])
         scanned += len(rows)
-        todo = enrich_loan_candidates(tgt, rows)
         orphan_batch = len(rows) - len(todo)
         status_counts = {}  # type: Dict[str, int]
         for row in todo:
@@ -665,11 +958,20 @@ def run_loans(
     loan_no_min: str = "",
     loan_no_max: Optional[str] = None,
     worker_label: str = "",
+    repair_wrong_loan: bool = False,
+    wrong_sn_min_len: int = 15,
 ) -> Tuple[int, int]:
-    _log(
-        worker_label,
-        "loan: REGEXP '^[0-9]+$' 扫待改行，=旧号 / ng____-旧号 查 application",
-    )
+    if repair_wrong_loan:
+        _log(
+            worker_label,
+            "loan repair: ng-{长market号}-01000 → ng-{application.sn}-01000 (min_len=%s)"
+            % wrong_sn_min_len,
+        )
+    else:
+        _log(
+            worker_label,
+            "loan: REGEXP '^[0-9]+$' 扫待改行，=旧号 / ng____-旧号 查 application",
+        )
     if loan_no_max or loan_no_min:
         _log(
             worker_label,
@@ -688,6 +990,8 @@ def run_loans(
         loan_no_min,
         loan_no_max,
         worker_label,
+        repair_wrong_loan,
+        wrong_sn_min_len,
     )
 
 
@@ -865,6 +1169,8 @@ def loan_worker_run(spec: dict) -> Tuple[int, int]:
             lo,
             hi,
             label,
+            spec.get("repair_wrong_loan", False),
+            spec.get("wrong_sn_min_len", 15),
         )
         _log(label, "done ok=%s skip=%s delete_log=%s" % (ok, skip, delete_log or ""))
         return ok, skip
@@ -914,6 +1220,8 @@ def run_loans_parallel(args, cfg_path: str, delete_log_path: str) -> Tuple[int, 
                 "segment": seg,
                 "delete_log": wlog,
                 "no_delete_log": args.no_delete_log,
+                "repair_wrong_loan": getattr(args, "repair_wrong_loan", False),
+                "wrong_sn_min_len": getattr(args, "wrong_sn_min_len", 15),
             }
         )
 
@@ -1003,12 +1311,51 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=0,
         help="optional orphan_loan COUNT from SQL for cross-check",
     )
+    p.add_argument(
+        "--repair-wrong-loan",
+        action="store_true",
+        help="修复曾错误 backfill 的 loan_no（ng-{market长号}-01000 → ng-{core_sn}-01000）",
+    )
+    p.add_argument(
+        "--wrong-sn-min-len",
+        type=int,
+        default=15,
+        help="--repair-wrong-loan 时，仅处理 loan_no 中间段长度 >= 该值的行（默认 15）",
+    )
+    p.add_argument(
+        "--from-audit-log",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="从 backfill 审计 CSV / backfill_loan.log 修复；可多次指定或逗号分隔",
+    )
+    p.add_argument(
+        "--no-merge-worker-logs",
+        action="store_true",
+        help="--from-audit-log 时不自动合并同目录 .w0.csv .w1.csv ...",
+    )
     args = p.parse_args(argv)
+    audit_log_inputs = []
+    for item in args.from_audit_log:
+        for part in str(item).split(","):
+            part = part.strip()
+            if part:
+                audit_log_inputs.append(part)
+    if audit_log_inputs and args.repair_wrong_loan:
+        print("warning: --from-audit-log 优先，忽略 --repair-wrong-loan", flush=True)
+        args.repair_wrong_loan = False
+    if args.repair_wrong_loan and args.workers > 1:
+        print("warning: --repair-wrong-loan 不支持多 worker，已降为 workers=1", flush=True)
+        args.workers = 1
     if args.apply and args.dry_run:
         p.error("use either --apply or --dry-run, not both")
     dry_run = not args.apply
 
     delete_log_path = args.delete_log
+    if audit_log_inputs and not delete_log_path and not args.no_delete_log:
+        delete_log_path = "/tmp/backfill_repair_audit_loan_%s.csv" % datetime.now().strftime(
+            "%Y%m%d_%H%M%S"
+        )
     if args.count_only:
         audit = DeleteAuditLog(None, enabled=False)
     else:
@@ -1019,6 +1366,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         audit = DeleteAuditLog(delete_log_path or None, enabled=not args.no_delete_log)
 
     cfg = load_env(Path(args.env))
+    audit_paths = expand_audit_log_paths(
+        audit_log_inputs, merge_worker_logs=not args.no_merge_worker_logs
+    )
+    repair_rows_from_audit = []  # type: List[dict]
+    if audit_paths:
+        print("loading audit logs paths=%s" % len(audit_paths), flush=True)
+        audit_records = load_audit_records(audit_paths)
+        print("audit_records=%s" % len(audit_records), flush=True)
+        repair_rows_from_audit = build_repair_rows_from_audit(audit_records)
+        summarize_audit_repair_plan(repair_rows_from_audit, audit_paths)
+        if args.count_only:
+            print("count_only finished (audit repair plan only)", flush=True)
+            return 0
+        if not repair_rows_from_audit:
+            print("no repair rows from audit logs", flush=True)
+            return 1
+
     tgt = connect_target(cfg)
     try:
         if args.count_only:
@@ -1033,7 +1397,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         print(
             "start dry_run=%s strategy=%s tables=%s scan_size=%s commit_every=%s "
-            "workers=%s work_limit=%s delete_log=%s"
+            "workers=%s work_limit=%s repair_wrong_loan=%s from_audit=%s delete_log=%s"
             % (
                 dry_run,
                 args.strategy,
@@ -1042,12 +1406,27 @@ def main(argv: Optional[List[str]] = None) -> int:
                 args.commit_every,
                 args.workers,
                 args.work_limit,
+                args.repair_wrong_loan,
+                len(repair_rows_from_audit),
                 delete_log_path if not args.no_delete_log else "(disabled)",
             ),
             flush=True,
         )
         if args.tables in ("loan", "all"):
-            if args.workers > 1 and args.worker_id < 0:
+            if repair_rows_from_audit:
+                if args.workers > 1:
+                    print("warning: --workers ignored for --from-audit-log", flush=True)
+                ok, skip = run_loans_from_audit(
+                    tgt,
+                    repair_rows_from_audit,
+                    dry_run,
+                    args.strategy,
+                    args.work_limit,
+                    args.log_every,
+                    audit,
+                    args.commit_every,
+                )
+            elif args.workers > 1 and args.worker_id < 0:
                 ok, skip = run_loans_parallel(args, args.env, delete_log_path)
             else:
                 seg_max = args.loan_no_max or None
@@ -1066,6 +1445,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     args.loan_no_min,
                     seg_max,
                     label,
+                    args.repair_wrong_loan,
+                    args.wrong_sn_min_len,
                 )
             print("loan done ok=%s skip=%s" % (ok, skip), flush=True)
         if args.tables in ("application", "all"):

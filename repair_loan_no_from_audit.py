@@ -1,0 +1,594 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""按 backfill 审计 CSV 修复 loan_no。
+
+流程:
+  1. 读本地审计 CSV（及可选 backfill_loan.log）
+  2. 用 old_loan_no 在本地拼目标号，例如:
+       NG-217798621621  ->  ng-217798621621-01000
+  3. 用 CSV 的 new_loan_no（库里当前错误号）定位 loan 行并改成目标号
+  4. 每条打印 REPAIR_AUDIT 并写入 --repair-log
+
+审计 CSV 列（与 backfill_delete_audit_*.csv 一致）:
+  ts,action,table,old_application_no,new_application_no,old_loan_no,new_loan_no,app_id
+
+Usage:
+  # 仅生成修复计划（不写库）
+  python3 repair_loan_no_from_audit.py \\
+    --audit-csv /tmp/backfill_delete_audit_loan.csv \\
+    --plan-out /tmp/repair_loan_plan.csv
+
+  # 试跑
+  python3 repair_loan_no_from_audit.py \\
+    --env ./ng_migration.env --dry-run \\
+    --audit-csv /tmp/backfill_delete_audit_loan.csv,/tmp/backfill_loan.log \\
+    --repair-log /tmp/repair_loan_audit.csv
+
+  # 正式修复
+  python3 repair_loan_no_from_audit.py \\
+    --env ./ng_migration.env --apply \\
+    --audit-csv /tmp/backfill_delete_audit_loan.csv \\
+    --repair-log /tmp/repair_loan_audit.csv \\
+    --commit-every 20
+"""
+import argparse
+import re
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, TextIO, Tuple
+
+import pymysql
+from pymysql.cursors import DictCursor
+
+import ng_migration_run as mig
+
+HERE = Path(__file__).resolve().parent
+LOAN_COLS = mig.LOAN_INSERT_COLS
+LEGACY_LOAN_NO_RE = re.compile(r"^[Nn][Gg]-(\d+)$")
+DELETE_AUDIT_LINE_RE = re.compile(r"^DELETE_AUDIT\s+(.+)$")
+REPAIR_AUDIT_LINE_RE = re.compile(r"^REPAIR_AUDIT\s+(.+)$")
+AUDIT_HEADER = (
+    "ts,action,table,old_application_no,new_application_no,"
+    "old_loan_no,new_loan_no,app_id"
+)
+PLAN_HEADER = (
+    "wrong_loan_no,correct_loan_no,legacy_loan_no,application_no,app_id,source"
+)
+
+
+def load_env(path: Path) -> Dict[str, str]:
+    cfg: Dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        cfg[k.strip()] = v.strip().strip("'\"")
+    return cfg
+
+
+def connect_target(cfg: Dict[str, str]):
+    return pymysql.connect(
+        host=cfg["TARGET_HOST"],
+        port=int(cfg.get("TARGET_PORT", "3306")),
+        user=cfg["TARGET_USER"],
+        password=cfg["TARGET_PASSWORD"],
+        database=cfg.get("TARGET_DB", "ng"),
+        charset="utf8mb4",
+        cursorclass=DictCursor,
+        read_timeout=3600,
+        write_timeout=3600,
+        autocommit=False,
+    )
+
+
+def core_sn_from_legacy_loan_no(loan_no: str) -> str:
+    m = LEGACY_LOAN_NO_RE.match(str(loan_no or "").strip())
+    return m.group(1) if m else ""
+
+
+def correct_loan_no_from_legacy(legacy_loan_no: str) -> str:
+    core_sn = core_sn_from_legacy_loan_no(legacy_loan_no)
+    if not core_sn:
+        return ""
+    return mig.format_loan_no(core_sn, 1, 0)
+
+
+def parse_audit_line(line: str) -> Optional[dict]:
+    raw = str(line or "").strip()
+    if not raw or raw == AUDIT_HEADER:
+        return None
+    for pat in (DELETE_AUDIT_LINE_RE, REPAIR_AUDIT_LINE_RE):
+        m = pat.match(raw)
+        if m:
+            raw = m.group(1).strip()
+            break
+    if raw.startswith("ts,action,"):
+        return None
+    parts = raw.split(",")
+    if len(parts) < 8:
+        return None
+    return {
+        "ts": parts[0].strip(),
+        "action": parts[1].strip(),
+        "table": parts[2].strip(),
+        "old_application_no": parts[3].strip(),
+        "new_application_no": parts[4].strip(),
+        "old_loan_no": parts[5].strip(),
+        "new_loan_no": parts[6].strip(),
+        "app_id": parts[7].strip(),
+    }
+
+
+def _is_worker_audit_path(path: Path) -> bool:
+    return bool(re.search(r"\.w\d+$", path.stem))
+
+
+def expand_audit_paths(paths: List[str], merge_worker_logs: bool) -> List[str]:
+    out = []  # type: List[str]
+    seen = set()
+    for raw in paths:
+        base = Path(raw).expanduser()
+        candidates = [base]
+        if merge_worker_logs and base.suffix.lower() == ".csv" and not _is_worker_audit_path(base):
+            for i in range(32):
+                wp = base.parent / ("%s.w%s%s" % (base.stem, i, base.suffix))
+                if wp.exists():
+                    candidates.append(wp)
+        for cand in candidates:
+            if not cand.exists():
+                continue
+            key = str(cand.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+def load_audit_records(paths: List[str]) -> List[dict]:
+    records = []  # type: List[dict]
+    for path in paths:
+        p = Path(path)
+        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            rec = parse_audit_line(line)
+            if rec:
+                rec["_source"] = str(p)
+                records.append(rec)
+    return records
+
+
+def build_repair_plan(records: List[dict]) -> Tuple[List[dict], Dict[str, int]]:
+    """wrong_loan_no=CSV new_loan_no; correct_loan_no=由 old_loan_no 本地拼接。"""
+    plan = []  # type: List[dict]
+    seen_wrong = set()
+    skipped = {}  # type: Dict[str, int]
+
+    for rec in records:
+        if rec.get("table") != "loan":
+            skipped["not_loan"] = skipped.get("not_loan", 0) + 1
+            continue
+        if rec.get("action") not in ("delete", "would_delete"):
+            skipped["not_delete"] = skipped.get("not_delete", 0) + 1
+            continue
+
+        legacy = str(rec.get("old_loan_no") or "").strip()
+        wrong = str(rec.get("new_loan_no") or "").strip()
+        if not legacy or not wrong:
+            skipped["missing_loan_no"] = skipped.get("missing_loan_no", 0) + 1
+            continue
+
+        correct = correct_loan_no_from_legacy(legacy)
+        if not correct:
+            skipped["bad_legacy"] = skipped.get("bad_legacy", 0) + 1
+            continue
+        if correct == wrong:
+            skipped["already_correct"] = skipped.get("already_correct", 0) + 1
+            continue
+        if wrong in seen_wrong:
+            skipped["dup_wrong"] = skipped.get("dup_wrong", 0) + 1
+            continue
+
+        seen_wrong.add(wrong)
+        plan.append(
+            {
+                "wrong_loan_no": wrong,
+                "correct_loan_no": correct,
+                "legacy_loan_no": legacy,
+                "application_no": rec.get("new_application_no")
+                or rec.get("old_application_no")
+                or "",
+                "app_id": rec.get("app_id") or "",
+                "source": rec.get("_source", ""),
+            }
+        )
+
+    plan.sort(key=lambda r: r["wrong_loan_no"])
+    return plan, skipped
+
+
+def write_plan_csv(path: str, plan: List[dict]) -> None:
+    with open(path, "w", encoding="utf-8") as fp:
+        fp.write(PLAN_HEADER + "\n")
+        for row in plan:
+            fp.write(
+                "%s,%s,%s,%s,%s,%s\n"
+                % (
+                    row["wrong_loan_no"],
+                    row["correct_loan_no"],
+                    row["legacy_loan_no"],
+                    row["application_no"],
+                    row["app_id"],
+                    row.get("source", ""),
+                )
+            )
+
+
+class RepairAuditLog(object):
+    HEADER = (
+        "ts,action,wrong_loan_no,correct_loan_no,legacy_loan_no,"
+        "application_no,app_id,result"
+    )
+
+    def __init__(self, path: Optional[str], enabled: bool = True):
+        self.enabled = enabled
+        self.path = path
+        self._fp = None  # type: Optional[TextIO]
+        if enabled and path:
+            self._fp = open(path, "a", encoding="utf-8")
+            if self._fp.tell() == 0:
+                self._fp.write(self.HEADER + "\n")
+                self._fp.flush()
+
+    def close(self):
+        if self._fp:
+            self._fp.close()
+            self._fp = None
+
+    def record(self, action: str, row: dict, result: str):
+        if not self.enabled:
+            return
+        line = "%s,%s,%s,%s,%s,%s,%s,%s" % (
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            action,
+            row.get("wrong_loan_no", ""),
+            row.get("correct_loan_no", ""),
+            row.get("legacy_loan_no", ""),
+            row.get("application_no", ""),
+            row.get("app_id", ""),
+            result,
+        )
+        print("REPAIR_AUDIT %s" % line, flush=True)
+        if self._fp:
+            self._fp.write(line + "\n")
+            self._fp.flush()
+
+
+def exec_with_retry(tgt, fn, what: str):
+    for attempt in range(5):
+        try:
+            return fn()
+        except pymysql.Error as exc:
+            try:
+                tgt.rollback()
+            except Exception:
+                pass
+            if attempt >= 4:
+                raise
+            print("%s retry err=%s" % (what, exc), flush=True)
+            tgt.ping(reconnect=True)
+            time.sleep(2)
+    return None
+
+
+class CommitTracker(object):
+    def __init__(self, conn, every: int, dry_run: bool):
+        self.conn = conn
+        self.every = max(0, int(every))
+        self.dry_run = dry_run
+        self.pending = 0
+
+    def note_write(self):
+        if self.dry_run or self.every <= 0:
+            return
+        self.pending += 1
+        if self.pending >= self.every:
+            self.flush()
+
+    def flush(self):
+        if self.dry_run or self.pending <= 0:
+            return
+        self.conn.commit()
+        self.pending = 0
+
+
+def cols_sql(cols: List[str]) -> str:
+    return ", ".join("`%s`" % c for c in cols)
+
+
+def loan_exists(tgt, loan_no: str) -> bool:
+    with tgt.cursor() as cur:
+        cur.execute("SELECT 1 FROM loan WHERE loan_no=%s LIMIT 1", (loan_no,))
+        return cur.fetchone() is not None
+
+
+def fetch_loan_row(tgt, loan_no: str) -> Optional[dict]:
+    sql = "SELECT %s FROM loan WHERE loan_no=%%s" % cols_sql(LOAN_COLS)
+    with tgt.cursor() as cur:
+        cur.execute(sql, (loan_no,))
+        return cur.fetchone()
+
+
+def fetch_loan_application_no(tgt, loan_no: str) -> Optional[str]:
+    with tgt.cursor() as cur:
+        cur.execute(
+            "SELECT application_no FROM loan WHERE loan_no=%s LIMIT 1", (loan_no,)
+        )
+        row = cur.fetchone()
+        return str(row["application_no"]) if row else None
+
+
+def insert_row(tgt, table: str, cols: List[str], row: dict) -> None:
+    placeholders = ", ".join(["%s"] * len(cols))
+    sql = "INSERT INTO %s (%s) VALUES (%s)" % (table, cols_sql(cols), placeholders)
+    with tgt.cursor() as cur:
+        cur.execute(sql, [row[c] for c in cols])
+
+
+def repair_one_loan(
+    tgt,
+    row: dict,
+    dry_run: bool,
+    strategy: str,
+    audit: RepairAuditLog,
+    tracker: Optional[CommitTracker],
+) -> str:
+    wrong = row["wrong_loan_no"]
+    correct = row["correct_loan_no"]
+    app_no = row.get("application_no") or ""
+
+    if not loan_exists(tgt, wrong):
+        if loan_exists(tgt, correct):
+            audit.record("skip_done", row, "wrong_missing_correct_exists")
+            return "skip_done"
+        audit.record("skip", row, "wrong_missing")
+        return "skip_missing"
+
+    if loan_exists(tgt, correct):
+        existing_app = fetch_loan_application_no(tgt, correct)
+        if app_no and existing_app and existing_app != app_no:
+            audit.record("skip", row, "conflict_correct_app")
+            return "conflict"
+        if dry_run:
+            audit.record("would_delete", row, "delete_wrong_keep_correct")
+            return "ok"
+        with tgt.cursor() as cur:
+            cur.execute("DELETE FROM loan WHERE loan_no=%s", (wrong,))
+            if not cur.rowcount:
+                audit.record("skip", row, "delete_wrong_failed")
+                return "missing"
+        audit.record("delete", row, "delete_wrong_keep_correct")
+        if tracker:
+            tracker.note_write()
+        else:
+            tgt.commit()
+        return "ok"
+
+    if dry_run:
+        audit.record("would_update", row, "update_loan_no")
+        return "ok"
+
+    if strategy == "insert-delete":
+        full = fetch_loan_row(tgt, wrong)
+        if not full:
+            audit.record("skip", row, "fetch_wrong_missing")
+            return "missing"
+        full["loan_no"] = correct
+        insert_row(tgt, "loan", LOAN_COLS, full)
+        with tgt.cursor() as cur:
+            cur.execute("DELETE FROM loan WHERE loan_no=%s", (wrong,))
+            if not cur.rowcount:
+                raise RuntimeError("delete failed wrong_loan_no=%s" % wrong)
+        audit.record("update", row, "insert_delete")
+    else:
+        with tgt.cursor() as cur:
+            cur.execute(
+                "UPDATE loan SET loan_no=%s WHERE loan_no=%s",
+                (correct, wrong),
+            )
+            if not cur.rowcount:
+                audit.record("skip", row, "update_no_row")
+                return "missing"
+        audit.record("update", row, "update_loan_no")
+
+    if tracker:
+        tracker.note_write()
+    else:
+        tgt.commit()
+    return "ok"
+
+
+def run_repair(
+    tgt,
+    plan: List[dict],
+    dry_run: bool,
+    strategy: str,
+    work_limit: int,
+    log_every: int,
+    audit: RepairAuditLog,
+    commit_every: int,
+) -> Tuple[int, int]:
+    ok = skip = 0
+    tracker = CommitTracker(tgt, commit_every, dry_run)
+    counts = {}  # type: Dict[str, int]
+    for row in plan:
+        status = exec_with_retry(
+            tgt,
+            lambda r=row: repair_one_loan(tgt, r, dry_run, strategy, audit, tracker),
+            "repair wrong=%s" % row["wrong_loan_no"],
+        )
+        counts[status] = counts.get(status, 0) + 1
+        if status == "ok":
+            ok += 1
+        else:
+            skip += 1
+        if work_limit and ok >= work_limit:
+            tracker.flush()
+            print("stop work_limit=%s" % work_limit, flush=True)
+            break
+        if (ok + skip) % max(1, log_every) == 0:
+            print(
+                "progress ok=%s skip=%s last_wrong=%s"
+                % (ok, skip, row["wrong_loan_no"]),
+                flush=True,
+            )
+    tracker.flush()
+    reasons = " ".join("%s=%s" % (k, v) for k, v in sorted(counts.items()))
+    print("repair done ok=%s skip=%s reasons=[%s]" % (ok, skip, reasons or "-"), flush=True)
+    return ok, skip
+
+
+def split_csv_args(values: List[str]) -> List[str]:
+    out = []
+    for v in values:
+        for part in str(v).split(","):
+            part = part.strip()
+            if part:
+                out.append(part)
+    return out
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    p = argparse.ArgumentParser(
+        description="Read backfill audit CSV, fix loan_no: wrong(new_loan_no) -> correct(from old_loan_no)"
+    )
+    p.add_argument("--env", default=str(HERE / "ng_migration.env"))
+    p.add_argument("--apply", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument(
+        "--audit-csv",
+        action="append",
+        default=[],
+        help="审计 CSV 或 backfill_loan.log；可多次或逗号分隔",
+    )
+    p.add_argument(
+        "--no-merge-worker-logs",
+        action="store_true",
+        help="不自动合并 .w0.csv .w1.csv ...",
+    )
+    p.add_argument(
+        "--plan-out",
+        default="",
+        help="把本地拼好的修复计划写出 CSV（wrong -> correct）",
+    )
+    p.add_argument(
+        "--plan-only",
+        action="store_true",
+        help="只读审计、拼计划、写 --plan-out，不连库",
+    )
+    p.add_argument(
+        "--strategy",
+        choices=["update", "insert-delete"],
+        default="update",
+        help="update: 原地改 loan_no；insert-delete: INSERT 新行再 DELETE 旧行",
+    )
+    p.add_argument("--commit-every", type=int, default=20)
+    p.add_argument("--work-limit", type=int, default=0)
+    p.add_argument("--log-every", type=int, default=100)
+    p.add_argument(
+        "--repair-log",
+        default="",
+        help="REPAIR_AUDIT 日志路径（默认 /tmp/repair_loan_audit_YYYYMMDD_HHMMSS.csv）",
+    )
+    p.add_argument("--no-repair-log", action="store_true")
+    args = p.parse_args(argv)
+
+    if args.apply and args.dry_run:
+        p.error("use either --apply or --dry-run, not both")
+    dry_run = not args.apply
+
+    inputs = split_csv_args(args.audit_csv)
+    if not inputs:
+        p.error("--audit-csv is required")
+
+    paths = expand_audit_paths(inputs, merge_worker_logs=not args.no_merge_worker_logs)
+    if not paths:
+        print("no audit files found", flush=True)
+        return 1
+
+    print("audit_files=%s" % len(paths), flush=True)
+    for path in paths:
+        print("  %s" % path, flush=True)
+
+    records = load_audit_records(paths)
+    print("audit_records=%s" % len(records), flush=True)
+    plan, skipped = build_repair_plan(records)
+    if skipped:
+        print(
+            "plan_skipped %s"
+            % " ".join("%s=%s" % (k, v) for k, v in sorted(skipped.items())),
+            flush=True,
+        )
+    print("repair_plan=%s" % len(plan), flush=True)
+    for row in plan[:10]:
+        print(
+            "  %s -> %s (legacy=%s)"
+            % (row["wrong_loan_no"], row["correct_loan_no"], row["legacy_loan_no"]),
+            flush=True,
+        )
+    if len(plan) > 10:
+        print("  ... and %s more" % (len(plan) - 10), flush=True)
+
+    plan_out = args.plan_out
+    if not plan_out and (args.plan_only or dry_run):
+        plan_out = "/tmp/repair_loan_plan.csv"
+    if plan_out:
+        write_plan_csv(plan_out, plan)
+        print("plan_out=%s rows=%s" % (plan_out, len(plan)), flush=True)
+
+    if args.plan_only:
+        return 0 if plan else 1
+
+    repair_log = args.repair_log
+    if not repair_log and not args.no_repair_log:
+        repair_log = "/tmp/repair_loan_audit_%s.csv" % datetime.now().strftime(
+            "%Y%m%d_%H%M%S"
+        )
+    audit = RepairAuditLog(repair_log or None, enabled=not args.no_repair_log)
+
+    cfg = load_env(Path(args.env))
+    tgt = connect_target(cfg)
+    try:
+        print(
+            "start dry_run=%s strategy=%s plan=%s commit_every=%s repair_log=%s"
+            % (
+                dry_run,
+                args.strategy,
+                len(plan),
+                args.commit_every,
+                repair_log if not args.no_repair_log else "(disabled)",
+            ),
+            flush=True,
+        )
+        if not plan:
+            return 1
+        ok, skip = run_repair(
+            tgt,
+            plan,
+            dry_run,
+            args.strategy,
+            args.work_limit,
+            args.log_every,
+            audit,
+            args.commit_every,
+        )
+        print("finished ok=%s skip=%s repair_log=%s" % (ok, skip, repair_log or ""), flush=True)
+        return 0 if ok or skip else 1
+    finally:
+        audit.close()
+        tgt.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
