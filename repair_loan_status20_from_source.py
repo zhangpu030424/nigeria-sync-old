@@ -5,7 +5,7 @@
 策略（默认 bulk）:
   1. 一次查出目标库 due_date/status 符合条件的全部 loan
   2. 内存中按 loan_no 中间段长度筛长号
-  3. 源库批量: ng_loan_core.application(ext_sn) + ng_loan_core.loan(sn)
+  3. 源库批量: ng_loan_core.application(ext_sn) + ng_loan_core.repay_plan(sn)
   4. 内存拼修复计划后批量写库
 
 Usage:
@@ -121,8 +121,8 @@ def filter_long_candidates(rows: List[dict], min_sn_len: int) -> List[dict]:
     return out
 
 
-def fetch_core_loans_by_sns(src, core_sns: List[str]) -> Dict[str, dict]:
-    """ng_loan_core.loan by sn -> repay_plan 同构字段 dict。"""
+def fetch_repay_plan_by_sns(src, core_sns: List[str]) -> Dict[str, dict]:
+    """core sn -> repay_plan 行（取最大 plan_sn，与 ng_migration_run 一致）。"""
     if not core_sns:
         return {}
     uniq = sorted({str(x).strip() for x in core_sns if x})
@@ -134,11 +134,16 @@ def fetch_core_loans_by_sns(src, core_sns: List[str]) -> Dict[str, dict]:
         with src.cursor() as cur:
             cur.execute(
                 f"""
-                SELECT l.sn, l.start_date, l.due_date, l.prin_amt, l.interest,
-                       l.orig_fee, l.penalty, l.amt, l.`status`, l.repaid_amt,
-                       l.repay_last_time, l.settle_time, l.created_at
-                FROM {c}.loan l
-                WHERE l.sn IN ({ph})
+                SELECT rp.sn, rp.plan_sn, rp.start_date, rp.due_date, rp.prin_amt,
+                       rp.interest, rp.orig_fee, rp.penalty, rp.amt, rp.`status`,
+                       rp.repaid_amt, rp.repay_last_time, rp.settle_time, rp.created_at
+                FROM {c}.repay_plan rp
+                INNER JOIN (
+                    SELECT sn, MAX(plan_sn) AS max_plan_sn
+                    FROM {c}.repay_plan
+                    WHERE sn IN ({ph})
+                    GROUP BY sn
+                ) pick ON rp.sn = pick.sn AND rp.plan_sn = pick.max_plan_sn
                 """,
                 part,
             )
@@ -183,10 +188,10 @@ def fetch_source_loans_bulk(
     src,
     market_nos: List[str],
     target_app_by_market: Optional[Dict[str, str]] = None,
-) -> Tuple[Dict[str, dict], Dict[str, str]]:
-    """market applicationNo -> 目标形态 loan 行；miss_reason。"""
+) -> Tuple[Dict[str, dict], Dict[str, str], Dict[str, Tuple[str, str]]]:
+    """market applicationNo -> loan 行；miss_reason；meta(ext_sn->core_sn,app_no)。"""
     if not market_nos:
-        return {}, {}
+        return {}, {}, {}
     uniq = sorted({str(x).strip() for x in market_nos if x})
     target_app_by_market = target_app_by_market or {}
     meta = fetch_source_market_meta(src, uniq)
@@ -195,7 +200,7 @@ def fetch_source_loans_bulk(
         core_only = fetch_core_application_by_ext_sn(src, missing)
         for ext_sn, core_sn in core_only.items():
             meta[ext_sn] = (core_sn, target_app_by_market.get(ext_sn, ""))
-    core_loans = fetch_core_loans_by_sns(src, [v[0] for v in meta.values()])
+    repay_plans = fetch_repay_plan_by_sns(src, [v[0] for v in meta.values()])
     by_market: Dict[str, dict] = {}
     miss_reason: Dict[str, str] = {}
     for market_no in uniq:
@@ -207,12 +212,12 @@ def fetch_source_loans_bulk(
         if not app_no:
             miss_reason[market_no] = "no_app_no"
             continue
-        rp = core_loans.get(core_sn)
+        rp = repay_plans.get(core_sn)
         if not rp:
-            miss_reason[market_no] = "no_core_loan"
+            miss_reason[market_no] = "no_repay_plan"
             continue
         by_market[market_no] = mig._build_loan_row(rp, app_no)
-    return by_market, miss_reason
+    return by_market, miss_reason, meta
 
 
 def build_rekey_row_from_before(
@@ -233,6 +238,7 @@ def build_plan_in_memory(
     source_by_market: Dict[str, dict],
     miss_reason: Dict[str, str],
     target_sn_by_app: Dict[str, str],
+    meta_by_market: Dict[str, Tuple[str, str]],
 ) -> List[dict]:
     plan: List[dict] = []
     for row in candidates:
@@ -247,6 +253,10 @@ def build_plan_in_memory(
         mode = "source"
         if not src_row:
             core_sn = target_sn_by_app.get(app_no, "")
+            if not core_sn:
+                pair = meta_by_market.get(market_no)
+                if pair:
+                    core_sn = pair[0]
             if core_sn:
                 src_row = build_rekey_row_from_before(row, app_no, core_sn)
                 mode = "rekey_only" if src_row else ""
@@ -548,14 +558,19 @@ def main(argv: Optional[List[str]] = None) -> int:
             {str(r.get("application_no") or "").strip() for r in candidates} - {""}
         )
 
-        print("load source core.loan market_nos=%s ..." % len(market_nos), flush=True)
+        print("load source repay_plan market_nos=%s ..." % len(market_nos), flush=True)
         t0 = time.time()
-        source_by_market, miss_reason = fetch_source_loans_bulk(
+        source_by_market, miss_reason, meta_by_market = fetch_source_loans_bulk(
             src, market_nos, target_app_by_market
         )
         print(
-            "source_hits=%s miss=%s elapsed=%.1fs"
-            % (len(source_by_market), len(miss_reason), time.time() - t0),
+            "source_hits=%s miss=%s meta=%s elapsed=%.1fs"
+            % (
+                len(source_by_market),
+                len(miss_reason),
+                len(meta_by_market),
+                time.time() - t0,
+            ),
             flush=True,
         )
 
@@ -569,7 +584,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
 
         plan = build_plan_in_memory(
-            candidates, source_by_market, miss_reason, target_sn_by_app
+            candidates,
+            source_by_market,
+            miss_reason,
+            target_sn_by_app,
+            meta_by_market,
         )
         if args.work_limit:
             plan = plan[: args.work_limit]
