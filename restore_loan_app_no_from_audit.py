@@ -2,17 +2,9 @@
 # -*- coding: utf-8 -*-
 """从 repair_loan_status20 审计 CSV 恢复 loan.application_no。
 
-repair_loan_status20 误走 delete_long 时：删了 application_no 正确的长号行，
-留下 loan_no 已对、application_no 错的短号行。本脚本读审计里记录的
-correct_loan_no + application_no，写回目标库。
-
-优先读主日志:
-  /tmp/repair_loan_status20_YYYYMMDD_HHMMSS.csv
-  action in (drop_long, rekey_long, rekey_keep_app_no)
-  → correct_loan_no + application_no
-
-补充读 deleted 侧车:
-  *.deleted.csv  action=delete_long
+并行 --workers N 时主 CSV 常为空，真实记录在:
+  /tmp/repair_loan_status20_xxx.w0.csv ... .w9.csv
+  /tmp/repair_loan_status20_xxx.w0.deleted.csv ...（delete_long 含正确 application_no）
 
 Usage:
   python3 restore_loan_app_no_from_audit.py \\
@@ -27,7 +19,6 @@ Usage:
 """
 import argparse
 import csv
-import json
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -38,17 +29,7 @@ from pymysql.cursors import DictCursor
 from repair_loan_no_from_audit import CommitTracker, exec_with_retry
 
 HERE = Path(__file__).resolve().parent
-REPAIR_HEADER = (
-    "ts",
-    "action",
-    "wrong_loan_no",
-    "correct_loan_no",
-    "legacy_loan_no",
-    "application_no",
-    "app_id",
-    "result",
-)
-DELETED_HEADER = ("ts", "action", "loan_no", "application_no", "row_json")
+LOAN_NO_RE = re.compile(r"^[Nn][Gg]-(\d+)-(\d{5})$")
 RESTORE_ACTIONS = frozenset(
     {
         "drop_long",
@@ -60,6 +41,7 @@ RESTORE_ACTIONS = frozenset(
     }
 )
 APP_SUFFIX_RE = re.compile(r"^ng\d+-(.+)$", re.I)
+TS_LEN = 19  # YYYY-MM-DD HH:MM:SS
 
 
 def load_env(path: Path) -> Dict[str, str]:
@@ -88,9 +70,33 @@ def connect_target(cfg: Dict[str, str]):
     )
 
 
-def deleted_sidecar(audit_path: str) -> str:
+def discover_repair_logs(audit_path: str) -> List[str]:
     p = Path(audit_path)
-    return str(p.with_name("%s.deleted%s" % (p.stem, p.suffix or ".csv")))
+    out: List[str] = []
+    if p.is_file():
+        out.append(str(p))
+    suffix = p.suffix or ".csv"
+    for f in sorted(p.parent.glob("%s.w*%s" % (p.stem, suffix))):
+        out.append(str(f))
+    return out
+
+
+def discover_deleted_logs(audit_path: str) -> List[str]:
+    p = Path(audit_path)
+    suffix = p.suffix or ".csv"
+    patterns = [
+        "%s.deleted%s" % (p.stem, suffix),
+        "%s.w*.deleted%s" % (p.stem, suffix),
+    ]
+    out: List[str] = []
+    seen = set()
+    for pat in patterns:
+        for f in sorted(p.parent.glob(pat)):
+            s = str(f)
+            if s not in seen:
+                seen.add(s)
+                out.append(s)
+    return out
 
 
 def market_suffix(application_no: str) -> str:
@@ -98,81 +104,134 @@ def market_suffix(application_no: str) -> str:
     return m.group(1).strip() if m else ""
 
 
-def load_plan_from_repair_csv(audit_path: str) -> Tuple[Dict[str, str], Dict[str, int]]:
-    """loan_no -> want application_no"""
+def is_short_loan_no(loan_no: str, min_sn_len: int = 15) -> bool:
+    m = LOAN_NO_RE.match(str(loan_no or "").strip())
+    return bool(m and len(m.group(1)) < min_sn_len)
+
+
+def parse_repair_line(line: str) -> Optional[dict]:
+    line = line.strip()
+    if not line or line.startswith("ts,"):
+        return None
+    if line.startswith("REPAIR_AUDIT "):
+        line = line[len("REPAIR_AUDIT ") :]
+    row = next(csv.reader([line]))
+    if len(row) < 8:
+        return None
+    return {
+        "ts": row[0],
+        "action": row[1].strip(),
+        "wrong_loan_no": row[2].strip(),
+        "correct_loan_no": row[3].strip(),
+        "legacy_loan_no": row[4].strip(),
+        "application_no": row[5].strip(),
+        "app_id": row[6].strip(),
+        "result": ",".join(row[7:]).strip(),
+    }
+
+
+def parse_deleted_line(line: str) -> Optional[dict]:
+    line = line.strip()
+    if not line or line.startswith("ts,"):
+        return None
+    if line.startswith("ROW_DELETED "):
+        line = line[len("ROW_DELETED ") :]
+    json_start = line.find("{")
+    if json_start < 0:
+        return None
+    prefix = line[:json_start].rstrip(",")
+    row_json = line[json_start:]
+    parts = prefix.split(",")
+    if len(parts) < 4:
+        if len(line) > TS_LEN and line[TS_LEN] == ",":
+            ts = line[:TS_LEN]
+            rest = line[TS_LEN + 1 :]
+            json_start = rest.find("{")
+            if json_start < 0:
+                return None
+            parts = rest[:json_start].rstrip(",").split(",")
+            if len(parts) < 3:
+                return None
+            return {
+                "ts": ts,
+                "action": parts[0].strip(),
+                "loan_no": parts[1].strip(),
+                "application_no": parts[2].strip(),
+                "row_json": rest[json_start:],
+            }
+        return None
+    return {
+        "ts": parts[0].strip(),
+        "action": parts[1].strip(),
+        "loan_no": parts[2].strip(),
+        "application_no": parts[3].strip(),
+        "row_json": row_json,
+    }
+
+
+def load_plan_from_repair_files(paths: List[str]) -> Tuple[Dict[str, str], Dict[str, int]]:
     plan: Dict[str, str] = {}
-    stats: Dict[str, int] = {"lines": 0}
-    path = Path(audit_path)
-    if not path.is_file():
-        raise FileNotFoundError("audit not found: %s" % audit_path)
-    with path.open("r", encoding="utf-8", newline="") as fp:
-        for raw in fp:
-            line = raw.strip()
-            if not line:
-                continue
-            if line.startswith("REPAIR_AUDIT "):
-                line = line[len("REPAIR_AUDIT ") :]
-            row = next(csv.reader([line]))
-            if row[0] == "ts":
-                continue
-            if len(row) < 8:
-                continue
-            stats["lines"] += 1
-            rec = dict(zip(REPAIR_HEADER, row[:8]))
-            action = rec.get("action", "").strip()
-            stats[action] = stats.get(action, 0) + 1
-            if action not in RESTORE_ACTIONS:
-                continue
-            loan_no = str(rec.get("correct_loan_no") or "").strip()
-            app_no = str(rec.get("application_no") or "").strip()
-            if not loan_no or not app_no:
-                stats["skip_incomplete"] = stats.get("skip_incomplete", 0) + 1
-                continue
-            plan[loan_no] = app_no
+    stats: Dict[str, int] = {"files": 0, "lines": 0}
+    for path in paths:
+        p = Path(path)
+        if not p.is_file():
+            stats["missing_files"] = stats.get("missing_files", 0) + 1
+            continue
+        stats["files"] += 1
+        with p.open("r", encoding="utf-8") as fp:
+            for raw in fp:
+                rec = parse_repair_line(raw)
+                if not rec:
+                    continue
+                stats["lines"] += 1
+                action = rec["action"]
+                stats[action] = stats.get(action, 0) + 1
+                if action not in RESTORE_ACTIONS:
+                    continue
+                loan_no = rec["correct_loan_no"]
+                app_no = rec["application_no"]
+                if not loan_no or not app_no:
+                    stats["skip_incomplete"] = stats.get("skip_incomplete", 0) + 1
+                    continue
+                plan[loan_no] = app_no
     return plan, stats
 
 
-def load_plan_from_deleted_csv(deleted_path: str) -> Dict[str, str]:
-    """market_suffix -> application_no（delete_long 被删长号行上的正确 app_no）"""
+def load_market_map_from_deleted_files(paths: List[str]) -> Tuple[Dict[str, str], Dict[str, int]]:
+    """market_suffix -> 正确 application_no（来自 delete_long 被删长号行）。"""
     by_market: Dict[str, str] = {}
-    path = Path(deleted_path)
-    if not path.is_file():
-        return by_market
-    with path.open("r", encoding="utf-8", newline="") as fp:
-        for raw in fp:
-            line = raw.strip()
-            if not line:
-                continue
-            if line.startswith("ROW_DELETED "):
-                line = line[len("ROW_DELETED ") :]
-            row = next(csv.reader([line]))
-            if row[0] == "ts":
-                continue
-            if len(row) < 5:
-                continue
-            rec = dict(zip(DELETED_HEADER, row[:5]))
-            if rec.get("action") != "delete_long":
-                continue
-            app_no = str(rec.get("application_no") or "").strip()
-            suffix = market_suffix(app_no)
-            if app_no and suffix:
-                by_market[suffix] = app_no
-    return by_market
+    stats: Dict[str, int] = {"files": 0, "lines": 0, "delete_long": 0}
+    for path in paths:
+        p = Path(path)
+        if not p.is_file():
+            continue
+        stats["files"] += 1
+        with p.open("r", encoding="utf-8") as fp:
+            for raw in fp:
+                rec = parse_deleted_line(raw)
+                if not rec:
+                    continue
+                stats["lines"] += 1
+                if rec["action"] != "delete_long":
+                    continue
+                stats["delete_long"] += 1
+                app_no = rec["application_no"]
+                suffix = market_suffix(app_no)
+                if app_no and suffix:
+                    by_market[suffix] = app_no
+    return by_market, stats
 
 
-def enrich_plan_from_deleted(
-    tgt, by_market: Dict[str, str], plan: Dict[str, str]
+def enrich_plan_from_market_map(
+    tgt, by_market: Dict[str, str], plan: Dict[str, str], min_sn_len: int
 ) -> int:
-    """对主日志未覆盖的短号行，按 market 后缀从 deleted 审计补全。"""
     if not by_market:
         return 0
     added = 0
     suffixes = sorted(by_market.keys())
     for i in range(0, len(suffixes), 200):
         part = suffixes[i : i + 200]
-        cond = " OR ".join(
-            ["application_no LIKE %s"] * len(part)
-        )
+        cond = " OR ".join(["application_no LIKE %s"] * len(part))
         params = ["ng%%-%s" % s for s in part]
         with tgt.cursor() as cur:
             cur.execute(
@@ -180,7 +239,6 @@ def enrich_plan_from_deleted(
                 SELECT loan_no, application_no
                 FROM loan
                 WHERE (%s)
-                  AND loan_no REGEXP '^[Nn][Gg]-[0-9]+-[0-9]{5}$'
                 """
                 % cond,
                 params,
@@ -188,11 +246,14 @@ def enrich_plan_from_deleted(
             rows = list(cur.fetchall())
         for row in rows:
             ln = str(row["loan_no"])
+            if not is_short_loan_no(ln, min_sn_len):
+                continue
             if ln in plan:
                 continue
             suffix = market_suffix(str(row["application_no"]))
             want = by_market.get(suffix, "")
-            if want and want != str(row["application_no"]):
+            cur_app = str(row["application_no"])
+            if want and want != cur_app:
                 plan[ln] = want
                 added += 1
     return added
@@ -211,9 +272,7 @@ def fetch_current_app_no(tgt, loan_no: str) -> str:
 def loan_pk_exists(tgt, app_no: str, loan_no: str) -> bool:
     with tgt.cursor() as cur:
         cur.execute(
-            """
-            SELECT period, roll_sequence FROM loan WHERE loan_no=%s LIMIT 1
-            """,
+            "SELECT period, roll_sequence FROM loan WHERE loan_no=%s LIMIT 1",
             (loan_no,),
         )
         row = cur.fetchone()
@@ -276,14 +335,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         description="Restore loan.application_no from repair_loan_status20 audit CSV"
     )
     p.add_argument("--env", default=str(HERE / "ng_migration.env"))
-    p.add_argument("--audit", required=True, help="repair_loan_status20 主审计 CSV 路径")
+    p.add_argument("--audit", required=True, help="repair 主审计路径（自动找 .w0..wN 与 deleted）")
     p.add_argument("--apply", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument(
-        "--use-deleted",
+        "--no-deleted",
         action="store_true",
-        help="主日志未命中时，用 *.deleted.csv 的 delete_long 按 market 后缀补全",
+        help="不读 *.deleted.csv（默认会读 worker deleted 侧车）",
     )
+    p.add_argument("--min-sn-len", type=int, default=15)
     p.add_argument("--commit-every", type=int, default=50)
     p.add_argument("--log-every", type=int, default=100)
     args = p.parse_args(argv)
@@ -291,21 +351,32 @@ def main(argv: Optional[List[str]] = None) -> int:
         p.error("use either --apply or --dry-run")
     dry_run = not args.apply
 
-    plan, stats = load_plan_from_repair_csv(args.audit)
-    print("audit=%s repair_stats=%s plan_from_repair=%s" % (args.audit, stats, len(plan)), flush=True)
+    repair_files = discover_repair_logs(args.audit)
+    deleted_files = [] if args.no_deleted else discover_deleted_logs(args.audit)
+    print("repair_files=%s" % repair_files, flush=True)
+    print("deleted_files=%s" % deleted_files, flush=True)
+
+    plan, repair_stats = load_plan_from_repair_files(repair_files)
+    print(
+        "repair_stats=%s plan_from_repair=%s"
+        % (repair_stats, len(plan)),
+        flush=True,
+    )
 
     cfg = load_env(Path(args.env))
     tgt = connect_target(cfg)
     try:
-        if args.use_deleted:
-            deleted = deleted_sidecar(args.audit)
-            by_market = load_plan_from_deleted_csv(deleted)
-            added = enrich_plan_from_deleted(tgt, by_market, plan)
+        if deleted_files:
+            by_market, del_stats = load_market_map_from_deleted_files(deleted_files)
+            added = enrich_plan_from_market_map(
+                tgt, by_market, plan, args.min_sn_len
+            )
             print(
-                "deleted_sidecar=%s market_map=%s plan_added=%s total_plan=%s"
-                % (deleted, len(by_market), added, len(plan)),
+                "deleted_stats=%s market_map=%s plan_added=%s total_plan=%s"
+                % (del_stats, len(by_market), added, len(plan)),
                 flush=True,
             )
+
         items = sorted(plan.items())
         print("restore_plan=%s dry_run=%s" % (len(items), dry_run), flush=True)
         for loan_no, app_no in items[:20]:
@@ -313,8 +384,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         if len(items) > 20:
             print("  ... and %s more" % (len(items) - 20), flush=True)
         if not items:
-            print("nothing to restore", flush=True)
-            return 0
+            print(
+                "nothing to restore; check: ls -la %s*"
+                % Path(args.audit).with_suffix(""),
+                flush=True,
+            )
+            return 1
 
         ok = skip = 0
         tracker = CommitTracker(tgt, args.commit_every, dry_run)
