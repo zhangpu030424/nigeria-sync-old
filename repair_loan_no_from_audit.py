@@ -29,9 +29,10 @@ Usage:
     --env ./ng_migration.env --apply \\
     --audit-csv /tmp/backfill_delete_audit_loan.csv \\
     --repair-log /tmp/repair_loan_audit.csv \\
-    --commit-every 20
+    --commit-every 20 --workers 4
 """
 import argparse
+import multiprocessing
 import re
 import time
 from datetime import datetime
@@ -418,10 +419,12 @@ def run_repair(
     log_every: int,
     audit: RepairAuditLog,
     commit_every: int,
+    worker_label: str = "",
 ) -> Tuple[int, int]:
     ok = skip = 0
     tracker = CommitTracker(tgt, commit_every, dry_run)
     counts = {}  # type: Dict[str, int]
+    prefix = "[%s] " % worker_label if worker_label else ""
     for row in plan:
         status = exec_with_retry(
             tgt,
@@ -435,18 +438,158 @@ def run_repair(
             skip += 1
         if work_limit and ok >= work_limit:
             tracker.flush()
-            print("stop work_limit=%s" % work_limit, flush=True)
+            print("%sstop work_limit=%s" % (prefix, work_limit), flush=True)
             break
         if (ok + skip) % max(1, log_every) == 0:
             print(
-                "progress ok=%s skip=%s last_wrong=%s"
-                % (ok, skip, row["wrong_loan_no"]),
+                "%sprogress ok=%s skip=%s last_wrong=%s"
+                % (prefix, ok, skip, row["wrong_loan_no"]),
                 flush=True,
             )
     tracker.flush()
     reasons = " ".join("%s=%s" % (k, v) for k, v in sorted(counts.items()))
-    print("repair done ok=%s skip=%s reasons=[%s]" % (ok, skip, reasons or "-"), flush=True)
+    print(
+        "%srepair done ok=%s skip=%s reasons=[%s]" % (prefix, ok, skip, reasons or "-"),
+        flush=True,
+    )
     return ok, skip
+
+
+def split_plan_chunks(plan: List[dict], workers: int) -> List[List[dict]]:
+    n = max(1, int(workers))
+    if not plan:
+        return []
+    size = len(plan)
+    chunks = []  # type: List[List[dict]]
+    for i in range(n):
+        start = i * size // n
+        end = (i + 1) * size // n
+        if start >= end:
+            chunks.append([])
+        else:
+            chunks.append(plan[start:end])
+    return chunks
+
+
+def _worker_repair_log_path(base: str, worker_id: int) -> str:
+    if not base:
+        return ""
+    p = Path(base)
+    return str(p.with_name("%s.w%s%s" % (p.stem, worker_id, p.suffix or ".csv")))
+
+
+def repair_worker_run(spec: dict) -> Tuple[int, int]:
+    worker_id = spec["worker_id"]
+    workers = spec["workers"]
+    label = "w%s/%s" % (worker_id, workers)
+    chunk = spec.get("plan_chunk") or []
+    if not chunk:
+        print("[%s] empty chunk, skip" % label, flush=True)
+        return 0, 0
+
+    cfg = load_env(Path(spec["env"]))
+    tgt = connect_target(cfg)
+    if spec.get("no_repair_log"):
+        audit = RepairAuditLog(None, enabled=False)
+        repair_log = ""
+    else:
+        repair_log = spec.get("repair_log") or ""
+        audit = RepairAuditLog(repair_log or None, enabled=bool(repair_log))
+
+    try:
+        print(
+            "[%s] start rows=%s first=%s last=%s repair_log=%s"
+            % (
+                label,
+                len(chunk),
+                chunk[0]["wrong_loan_no"],
+                chunk[-1]["wrong_loan_no"],
+                repair_log or "",
+            ),
+            flush=True,
+        )
+        ok, skip = run_repair(
+            tgt,
+            chunk,
+            spec["dry_run"],
+            spec["strategy"],
+            spec["work_limit"],
+            spec["log_every"],
+            audit,
+            spec["commit_every"],
+            label,
+        )
+        print("[%s] done ok=%s skip=%s" % (label, ok, skip), flush=True)
+        return ok, skip
+    finally:
+        audit.close()
+        tgt.close()
+
+
+def run_repair_parallel(
+    plan: List[dict],
+    workers: int,
+    env_path: str,
+    dry_run: bool,
+    strategy: str,
+    work_limit: int,
+    log_every: int,
+    commit_every: int,
+    repair_log_path: str,
+    no_repair_log: bool,
+) -> Tuple[int, int]:
+    chunks = split_plan_chunks(plan, workers)
+    specs = []
+    for i, chunk in enumerate(chunks):
+        if not chunk:
+            continue
+        wlog = _worker_repair_log_path(repair_log_path, i) if repair_log_path else ""
+        specs.append(
+            {
+                "worker_id": i,
+                "workers": workers,
+                "env": env_path,
+                "dry_run": dry_run,
+                "strategy": strategy,
+                "work_limit": work_limit,
+                "log_every": log_every,
+                "commit_every": commit_every,
+                "plan_chunk": chunk,
+                "repair_log": wlog,
+                "no_repair_log": no_repair_log,
+            }
+        )
+    if not specs:
+        print("no plan rows to process", flush=True)
+        return 0, 0
+
+    for spec in specs:
+        chunk = spec["plan_chunk"]
+        print(
+            "  worker %s/%s: rows=%s [%s .. %s] log=%s"
+            % (
+                spec["worker_id"],
+                workers,
+                len(chunk),
+                chunk[0]["wrong_loan_no"],
+                chunk[-1]["wrong_loan_no"],
+                spec.get("repair_log") or "",
+            ),
+            flush=True,
+        )
+
+    ctx = multiprocessing.get_context("spawn")
+    with ctx.Pool(processes=len(specs)) as pool:
+        results = pool.map(repair_worker_run, specs)
+
+    total_ok = sum(r[0] for r in results)
+    total_skip = sum(r[1] for r in results)
+    print(
+        "repair parallel done workers=%s ok=%s skip=%s"
+        % (len(specs), total_ok, total_skip),
+        flush=True,
+    )
+    return total_ok, total_skip
 
 
 def split_csv_args(values: List[str]) -> List[str]:
@@ -496,6 +639,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--commit-every", type=int, default=20)
     p.add_argument("--work-limit", type=int, default=0)
     p.add_argument("--log-every", type=int, default=100)
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="并行 worker 数，按修复计划均分（每 worker 独立连接 + repair_log.wN.csv）",
+    )
     p.add_argument(
         "--repair-log",
         default="",
@@ -550,29 +699,51 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.plan_only:
         return 0 if plan else 1
 
+    if args.workers < 1:
+        p.error("--workers must be >= 1")
+
     repair_log = args.repair_log
     if not repair_log and not args.no_repair_log:
         repair_log = "/tmp/repair_loan_audit_%s.csv" % datetime.now().strftime(
             "%Y%m%d_%H%M%S"
         )
-    audit = RepairAuditLog(repair_log or None, enabled=not args.no_repair_log)
 
+    if not plan:
+        return 1
+
+    print(
+        "start dry_run=%s strategy=%s plan=%s workers=%s commit_every=%s repair_log=%s"
+        % (
+            dry_run,
+            args.strategy,
+            len(plan),
+            args.workers,
+            args.commit_every,
+            repair_log if not args.no_repair_log else "(disabled)",
+        ),
+        flush=True,
+    )
+
+    if args.workers > 1:
+        ok, skip = run_repair_parallel(
+            plan,
+            args.workers,
+            args.env,
+            dry_run,
+            args.strategy,
+            args.work_limit,
+            args.log_every,
+            args.commit_every,
+            repair_log,
+            args.no_repair_log,
+        )
+        print("finished ok=%s skip=%s repair_log=%s" % (ok, skip, repair_log or ""), flush=True)
+        return 0 if ok or skip else 1
+
+    audit = RepairAuditLog(repair_log or None, enabled=not args.no_repair_log)
     cfg = load_env(Path(args.env))
     tgt = connect_target(cfg)
     try:
-        print(
-            "start dry_run=%s strategy=%s plan=%s commit_every=%s repair_log=%s"
-            % (
-                dry_run,
-                args.strategy,
-                len(plan),
-                args.commit_every,
-                repair_log if not args.no_repair_log else "(disabled)",
-            ),
-            flush=True,
-        )
-        if not plan:
-            return 1
         ok, skip = run_repair(
             tgt,
             plan,
