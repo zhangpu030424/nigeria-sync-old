@@ -252,11 +252,12 @@ def build_plan_in_memory(
         src_row = source_by_market.get(market_no)
         mode = "source"
         if not src_row:
-            core_sn = target_sn_by_app.get(app_no, "")
+            core_sn = ""
+            pair = meta_by_market.get(market_no)
+            if pair:
+                core_sn = pair[0]
             if not core_sn:
-                pair = meta_by_market.get(market_no)
-                if pair:
-                    core_sn = pair[0]
+                core_sn = target_sn_by_app.get(app_no, "")
             if core_sn:
                 src_row = build_rekey_row_from_before(row, app_no, core_sn)
                 mode = "rekey_only" if src_row else ""
@@ -291,32 +292,49 @@ def build_plan_in_memory(
 
 
 def fetch_target_sn_by_application_nos(
-    tgt, application_nos: List[str]
+    tgt, application_nos: List[str], label: str = "target_sn"
 ) -> Dict[str, str]:
     """application_no -> core sn（目标库 application 表）。"""
     uniq = sorted({str(x).strip() for x in application_nos if x})
     out: Dict[str, str] = {}
     if not uniq:
         return out
-    for i in range(0, len(uniq), 500):
-        part = uniq[i : i + 500]
+    batch_size = 200
+    batches = (len(uniq) + batch_size - 1) // batch_size
+    for bi, i in enumerate(range(0, len(uniq), batch_size), start=1):
+        part = uniq[i : i + batch_size]
         ph = ",".join(["%s"] * len(part))
-        with tgt.cursor() as cur:
-            cur.execute(
-                f"""
-                SELECT application_no, sn
-                FROM application
-                WHERE application_no IN ({ph})
-                  AND sn IS NOT NULL AND sn <> ''
-                """,
-                part,
-            )
-            for row in cur.fetchall():
-                app_no = str(row["application_no"]).strip()
-                sn = str(row["sn"]).strip()
-                if app_no and sn:
-                    out[app_no] = sn
+        t0 = time.time()
+        rows = exec_with_retry(
+            tgt,
+            lambda p=part: _query_target_sn_batch(tgt, ph, p),
+            "%s batch=%s" % (label, bi),
+        )
+        for row in rows:
+            app_no = str(row["application_no"]).strip()
+            sn = str(row["sn"]).strip()
+            if app_no and sn:
+                out[app_no] = sn
+        print(
+            "%s batch=%s/%s part=%s map=%s elapsed=%.1fs"
+            % (label, bi, batches, len(part), len(out), time.time() - t0),
+            flush=True,
+        )
     return out
+
+
+def _query_target_sn_batch(tgt, ph: str, part: List[str]) -> List[dict]:
+    with tgt.cursor() as cur:
+        cur.execute(
+            """
+            SELECT application_no, sn
+            FROM application
+            WHERE application_no IN (%s)
+              AND sn IS NOT NULL AND sn <> ''
+            """ % ph,
+            part,
+        )
+        return list(cur.fetchall())
 
 
 def fetch_source_market_meta(
@@ -554,9 +572,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         target_app_by_market = {
             k: v for k, v in target_app_by_market.items() if k and v
         }
-        app_nos = sorted(
-            {str(r.get("application_no") or "").strip() for r in candidates} - {""}
-        )
 
         print("load source repay_plan market_nos=%s ..." % len(market_nos), flush=True)
         t0 = time.time()
@@ -574,14 +589,37 @@ def main(argv: Optional[List[str]] = None) -> int:
             flush=True,
         )
 
-        print("load target application.sn app_nos=%s ..." % len(app_nos), flush=True)
-        t0 = time.time()
-        target_sn_by_app = fetch_target_sn_by_application_nos(tgt, app_nos)
-        print(
-            "target_sn_map=%s elapsed=%.1fs"
-            % (len(target_sn_by_app), time.time() - t0),
-            flush=True,
+        app_nos_need_target_sn = sorted(
+            {
+                str(r.get("application_no") or "").strip()
+                for r in candidates
+                if extract_market_no(
+                    str(r.get("application_no") or ""),
+                    str(r.get("loan_no") or ""),
+                )
+                not in meta_by_market
+            }
+            - {""}
         )
+
+        target_sn_by_app: Dict[str, str] = {}
+        if app_nos_need_target_sn:
+            print(
+                "load target application.sn fallback app_nos=%s (skip %s already in source meta) ..."
+                % (len(app_nos_need_target_sn), len(candidates) - len(app_nos_need_target_sn)),
+                flush=True,
+            )
+            t0 = time.time()
+            target_sn_by_app = fetch_target_sn_by_application_nos(
+                tgt, app_nos_need_target_sn, label="target_sn"
+            )
+            print(
+                "target_sn_map=%s elapsed=%.1fs"
+                % (len(target_sn_by_app), time.time() - t0),
+                flush=True,
+            )
+        else:
+            print("skip target application.sn (all covered by source meta)", flush=True)
 
         plan = build_plan_in_memory(
             candidates,
@@ -592,7 +630,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         if args.work_limit:
             plan = plan[: args.work_limit]
-        print("repair_plan=%s" % len(plan), flush=True)
+        modes: Dict[str, int] = {}
+        for row in plan:
+            m = str(row.get("sync_mode") or "")
+            modes[m] = modes.get(m, 0) + 1
+        print(
+            "repair_plan=%s modes=%s"
+            % (len(plan), modes),
+            flush=True,
         for row in plan[:20]:
             src_row = row["source_row"]
             print(
