@@ -2,9 +2,8 @@
 # -*- coding: utf-8 -*-
 """从 repair_loan_status20 审计 CSV 恢复 loan.application_no。
 
-并行 --workers N 时主 CSV 常为空，真实记录在:
-  /tmp/repair_loan_status20_xxx.w0.csv ... .w9.csv
-  /tmp/repair_loan_status20_xxx.w0.deleted.csv ...（delete_long 含正确 application_no）
+流程：只读 CSV 进内存（correct_loan_no -> application_no），再 UPDATE 目标库。
+并行 --workers N 时读 .w0.csv ... .wN.csv（drop_long 行含正确 application_no）。
 
 Usage:
   python3 restore_loan_app_no_from_audit.py \\
@@ -35,13 +34,12 @@ RESTORE_ACTIONS = frozenset(
         "drop_long",
         "rekey_long",
         "rekey_keep_app_no",
-        "would_drop_long",
-        "would_rekey_long",
-        "would_rekey_keep_app_no",
     }
 )
 APP_SUFFIX_RE = re.compile(r"^ng\d+-(.+)$", re.I)
 TS_LEN = 19  # YYYY-MM-DD HH:MM:SS
+# 只匹配 .w0.csv / .w1.csv，排除 .w0.deleted.csv / .w0.modified.csv
+WORKER_REPAIR_RE = re.compile(r"\.w\d+\.csv$", re.I)
 
 
 def load_env(path: Path) -> Dict[str, str]:
@@ -77,7 +75,8 @@ def discover_repair_logs(audit_path: str) -> List[str]:
         out.append(str(p))
     suffix = p.suffix or ".csv"
     for f in sorted(p.parent.glob("%s.w*%s" % (p.stem, suffix))):
-        out.append(str(f))
+        if WORKER_REPAIR_RE.search(f.name):
+            out.append(str(f))
     return out
 
 
@@ -222,40 +221,57 @@ def load_market_map_from_deleted_files(paths: List[str]) -> Tuple[Dict[str, str]
     return by_market, stats
 
 
+def find_loans_by_market_suffix(tgt, suffix: str) -> List[dict]:
+    with tgt.cursor() as cur:
+        cur.execute(
+            """
+            SELECT loan_no, application_no
+            FROM loan
+            WHERE application_no LIKE %s
+            LIMIT 10
+            """,
+            ("%%-%s" % suffix,),
+        )
+        return list(cur.fetchall())
+
+
 def enrich_plan_from_market_map(
     tgt, by_market: Dict[str, str], plan: Dict[str, str], min_sn_len: int
 ) -> int:
+    """按 market 后缀逐条小查询，避免大 OR 导致 2013。"""
     if not by_market:
         return 0
     added = 0
     suffixes = sorted(by_market.keys())
-    for i in range(0, len(suffixes), 200):
-        part = suffixes[i : i + 200]
-        cond = " OR ".join(["application_no LIKE %s"] * len(part))
-        params = ["ng%%-%s" % s for s in part]
-        with tgt.cursor() as cur:
-            cur.execute(
-                """
-                SELECT loan_no, application_no
-                FROM loan
-                WHERE (%s)
-                """
-                % cond,
-                params,
-            )
-            rows = list(cur.fetchall())
-        for row in rows:
+    for i, suffix in enumerate(suffixes, 1):
+        want = by_market[suffix]
+        if not want:
+            continue
+        try:
+            tgt.ping(reconnect=True)
+        except Exception:
+            pass
+        rows = exec_with_retry(
+            tgt,
+            lambda s=suffix: find_loans_by_market_suffix(tgt, s),
+            "lookup market suffix=%s" % suffix,
+        )
+        for row in rows or []:
             ln = str(row["loan_no"])
             if not is_short_loan_no(ln, min_sn_len):
                 continue
             if ln in plan:
                 continue
-            suffix = market_suffix(str(row["application_no"]))
-            want = by_market.get(suffix, "")
             cur_app = str(row["application_no"])
-            if want and want != cur_app:
+            if want != cur_app:
                 plan[ln] = want
                 added += 1
+        if i % 100 == 0:
+            print(
+                "enrich progress %s/%s added=%s plan=%s"
+                % (i, len(suffixes), added, len(plan)),
+                flush=True,
+            )
     return added
 
 
@@ -339,9 +355,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--apply", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument(
-        "--no-deleted",
+        "--use-deleted",
         action="store_true",
-        help="不读 *.deleted.csv（默认会读 worker deleted 侧车）",
+        help="repair 计划不足时，才用 *.deleted.csv 查库补全（默认不查库）",
     )
     p.add_argument("--min-sn-len", type=int, default=15)
     p.add_argument("--commit-every", type=int, default=50)
@@ -352,45 +368,55 @@ def main(argv: Optional[List[str]] = None) -> int:
     dry_run = not args.apply
 
     repair_files = discover_repair_logs(args.audit)
-    deleted_files = [] if args.no_deleted else discover_deleted_logs(args.audit)
     print("repair_files=%s" % repair_files, flush=True)
-    print("deleted_files=%s" % deleted_files, flush=True)
 
     plan, repair_stats = load_plan_from_repair_files(repair_files)
     print(
-        "repair_stats=%s plan_from_repair=%s"
+        "repair_stats=%s plan_in_memory=%s"
         % (repair_stats, len(plan)),
         flush=True,
     )
 
     cfg = load_env(Path(args.env))
+
+    if args.use_deleted:
+        deleted_files = discover_deleted_logs(args.audit)
+        print("deleted_files=%s" % deleted_files, flush=True)
+        if deleted_files:
+            tgt = connect_target(cfg)
+            try:
+                by_market, del_stats = load_market_map_from_deleted_files(deleted_files)
+                need_enrich = len(plan) < del_stats.get("delete_long", 0)
+                added = 0
+                if need_enrich and by_market:
+                    print(
+                        "enrich from deleted market_map=%s"
+                        % len(by_market),
+                        flush=True,
+                    )
+                    added = enrich_plan_from_market_map(
+                        tgt, by_market, plan, args.min_sn_len
+                    )
+                print(
+                    "deleted_stats=%s plan_added=%s total_plan=%s"
+                    % (del_stats, added, len(plan)),
+                    flush=True,
+                )
+            finally:
+                tgt.close()
+
+    items = sorted(plan.items())
+    print("restore_plan=%s dry_run=%s" % (len(items), dry_run), flush=True)
+    for loan_no, app_no in items[:20]:
+        print("  %s -> %s" % (loan_no, app_no), flush=True)
+    if len(items) > 20:
+        print("  ... and %s more" % (len(items) - 20), flush=True)
+    if not items:
+        print("nothing to restore", flush=True)
+        return 1
+
     tgt = connect_target(cfg)
     try:
-        if deleted_files:
-            by_market, del_stats = load_market_map_from_deleted_files(deleted_files)
-            added = enrich_plan_from_market_map(
-                tgt, by_market, plan, args.min_sn_len
-            )
-            print(
-                "deleted_stats=%s market_map=%s plan_added=%s total_plan=%s"
-                % (del_stats, len(by_market), added, len(plan)),
-                flush=True,
-            )
-
-        items = sorted(plan.items())
-        print("restore_plan=%s dry_run=%s" % (len(items), dry_run), flush=True)
-        for loan_no, app_no in items[:20]:
-            print("  %s -> %s" % (loan_no, app_no), flush=True)
-        if len(items) > 20:
-            print("  ... and %s more" % (len(items) - 20), flush=True)
-        if not items:
-            print(
-                "nothing to restore; check: ls -la %s*"
-                % Path(args.audit).with_suffix(""),
-                flush=True,
-            )
-            return 1
-
         ok = skip = 0
         tracker = CommitTracker(tgt, args.commit_every, dry_run)
         for i, (loan_no, want_app) in enumerate(items, 1):
