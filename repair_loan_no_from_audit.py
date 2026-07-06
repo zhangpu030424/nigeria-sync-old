@@ -7,7 +7,7 @@
   2. 用 old_loan_no 在本地拼目标号，例如:
        NG-217798621621  ->  ng-217798621621-01000
   3. 用 CSV 的 new_loan_no（库里当前错误号）定位 loan 行并改成目标号
-  4. 每条打印 REPAIR_AUDIT 并写入 --repair-log
+  4. 每条打印 REPAIR_AUDIT；删除/修改的完整行写入 .deleted.csv / .modified.csv
 
 审计 CSV 列（与 backfill_delete_audit_*.csv 一致）:
   ts,action,table,old_application_no,new_application_no,old_loan_no,new_loan_no,app_id
@@ -32,6 +32,7 @@ Usage:
     --commit-every 20 --workers 4
 """
 import argparse
+import json
 import multiprocessing
 import re
 import time
@@ -56,6 +57,8 @@ AUDIT_HEADER = (
 PLAN_HEADER = (
     "wrong_loan_no,correct_loan_no,legacy_loan_no,application_no,app_id,source"
 )
+DELETED_ROW_HEADER = "ts,action,loan_no,application_no,row_json"
+MODIFIED_ROW_HEADER = "ts,action,old_loan_no,new_loan_no,before_json,after_json"
 
 
 def load_env(path: Path) -> Dict[str, str]:
@@ -266,6 +269,80 @@ class RepairAuditLog(object):
             self._fp.flush()
 
 
+def _loan_row_json(row: Optional[dict]) -> str:
+    if not row:
+        return ""
+    payload = {c: row.get(c) for c in LOAN_COLS}
+    return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def _audit_sidecar_path(base: str, suffix: str) -> str:
+    if not base:
+        return ""
+    p = Path(base)
+    return str(p.with_name("%s.%s%s" % (p.stem, suffix, p.suffix or ".csv")))
+
+
+class RowChangeAuditLog(object):
+    """Record full loan rows for every delete / update."""
+
+    def __init__(self, base_path: str, enabled: bool = True):
+        self.enabled = enabled
+        self.deleted_path = _audit_sidecar_path(base_path, "deleted")
+        self.modified_path = _audit_sidecar_path(base_path, "modified")
+        self._deleted_fp = None  # type: Optional[TextIO]
+        self._modified_fp = None  # type: Optional[TextIO]
+        if enabled and base_path:
+            self._deleted_fp = open(self.deleted_path, "a", encoding="utf-8")
+            if self._deleted_fp.tell() == 0:
+                self._deleted_fp.write(DELETED_ROW_HEADER + "\n")
+            self._modified_fp = open(self.modified_path, "a", encoding="utf-8")
+            if self._modified_fp.tell() == 0:
+                self._modified_fp.write(MODIFIED_ROW_HEADER + "\n")
+
+    def close(self):
+        for fp in (self._deleted_fp, self._modified_fp):
+            if fp:
+                fp.close()
+        self._deleted_fp = None
+        self._modified_fp = None
+
+    def _emit(self, kind: str, line: str):
+        tag = "ROW_DELETED" if kind == "deleted" else "ROW_MODIFIED"
+        print("%s %s" % (tag, line), flush=True)
+        fp = self._deleted_fp if kind == "deleted" else self._modified_fp
+        if fp:
+            fp.write(line + "\n")
+            fp.flush()
+
+    def record_deleted(self, action: str, row: dict):
+        if not self.enabled:
+            return
+        loan_no = str(row.get("loan_no") or "")
+        app_no = str(row.get("application_no") or "")
+        line = "%s,%s,%s,%s,%s" % (
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            action,
+            loan_no,
+            app_no,
+            _loan_row_json(row),
+        )
+        self._emit("deleted", line)
+
+    def record_modified(self, action: str, before: dict, after: dict):
+        if not self.enabled:
+            return
+        line = "%s,%s,%s,%s,%s,%s" % (
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            action,
+            str(before.get("loan_no") or ""),
+            str(after.get("loan_no") or ""),
+            _loan_row_json(before),
+            _loan_row_json(after),
+        )
+        self._emit("modified", line)
+
+
 def exec_with_retry(tgt, fn, what: str):
     for attempt in range(5):
         try:
@@ -343,6 +420,7 @@ def repair_one_loan(
     dry_run: bool,
     strategy: str,
     audit: RepairAuditLog,
+    row_audit: Optional[RowChangeAuditLog],
     tracker: Optional[CommitTracker],
 ) -> str:
     wrong = row["wrong_loan_no"]
@@ -361,9 +439,14 @@ def repair_one_loan(
         if app_no and existing_app and existing_app != app_no:
             audit.record("skip", row, "conflict_correct_app")
             return "conflict"
+        before = fetch_loan_row(tgt, wrong)
         if dry_run:
+            if before and row_audit:
+                row_audit.record_deleted("would_delete", before)
             audit.record("would_delete", row, "delete_wrong_keep_correct")
             return "ok"
+        if before and row_audit:
+            row_audit.record_deleted("delete", before)
         with tgt.cursor() as cur:
             cur.execute("DELETE FROM loan WHERE loan_no=%s", (wrong,))
             if not cur.rowcount:
@@ -376,23 +459,34 @@ def repair_one_loan(
             tgt.commit()
         return "ok"
 
+    before = fetch_loan_row(tgt, wrong)
     if dry_run:
+        if before and row_audit:
+            after = dict(before)
+            after["loan_no"] = correct
+            row_audit.record_modified("would_update", before, after)
         audit.record("would_update", row, "update_loan_no")
         return "ok"
 
     if strategy == "insert-delete":
-        full = fetch_loan_row(tgt, wrong)
-        if not full:
+        if not before:
             audit.record("skip", row, "fetch_wrong_missing")
             return "missing"
-        full["loan_no"] = correct
-        insert_row(tgt, "loan", LOAN_COLS, full)
+        after = dict(before)
+        after["loan_no"] = correct
+        insert_row(tgt, "loan", LOAN_COLS, after)
         with tgt.cursor() as cur:
             cur.execute("DELETE FROM loan WHERE loan_no=%s", (wrong,))
             if not cur.rowcount:
                 raise RuntimeError("delete failed wrong_loan_no=%s" % wrong)
+        if row_audit:
+            row_audit.record_deleted("delete", before)
+            row_audit.record_modified("insert_delete", before, after)
         audit.record("update", row, "insert_delete")
     else:
+        if not before:
+            audit.record("skip", row, "fetch_wrong_missing")
+            return "missing"
         with tgt.cursor() as cur:
             cur.execute(
                 "UPDATE loan SET loan_no=%s WHERE loan_no=%s",
@@ -401,6 +495,10 @@ def repair_one_loan(
             if not cur.rowcount:
                 audit.record("skip", row, "update_no_row")
                 return "missing"
+        after = fetch_loan_row(tgt, correct) or dict(before)
+        after["loan_no"] = correct
+        if row_audit:
+            row_audit.record_modified("update", before, after)
         audit.record("update", row, "update_loan_no")
 
     if tracker:
@@ -418,6 +516,7 @@ def run_repair(
     work_limit: int,
     log_every: int,
     audit: RepairAuditLog,
+    row_audit: Optional[RowChangeAuditLog],
     commit_every: int,
     worker_label: str = "",
 ) -> Tuple[int, int]:
@@ -428,7 +527,9 @@ def run_repair(
     for row in plan:
         status = exec_with_retry(
             tgt,
-            lambda r=row: repair_one_loan(tgt, r, dry_run, strategy, audit, tracker),
+            lambda r=row: repair_one_loan(
+                tgt, r, dry_run, strategy, audit, row_audit, tracker
+            ),
             "repair wrong=%s" % row["wrong_loan_no"],
         )
         counts[status] = counts.get(status, 0) + 1
@@ -491,20 +592,24 @@ def repair_worker_run(spec: dict) -> Tuple[int, int]:
     tgt = connect_target(cfg)
     if spec.get("no_repair_log"):
         audit = RepairAuditLog(None, enabled=False)
+        row_audit = RowChangeAuditLog("", enabled=False)
         repair_log = ""
     else:
         repair_log = spec.get("repair_log") or ""
         audit = RepairAuditLog(repair_log or None, enabled=bool(repair_log))
+        row_audit = RowChangeAuditLog(repair_log or "", enabled=bool(repair_log))
 
     try:
         print(
-            "[%s] start rows=%s first=%s last=%s repair_log=%s"
+            "[%s] start rows=%s first=%s last=%s repair_log=%s deleted=%s modified=%s"
             % (
                 label,
                 len(chunk),
                 chunk[0]["wrong_loan_no"],
                 chunk[-1]["wrong_loan_no"],
                 repair_log or "",
+                row_audit.deleted_path if row_audit.enabled else "",
+                row_audit.modified_path if row_audit.enabled else "",
             ),
             flush=True,
         )
@@ -516,6 +621,7 @@ def repair_worker_run(spec: dict) -> Tuple[int, int]:
             spec["work_limit"],
             spec["log_every"],
             audit,
+            row_audit,
             spec["commit_every"],
             label,
         )
@@ -523,6 +629,8 @@ def repair_worker_run(spec: dict) -> Tuple[int, int]:
         return ok, skip
     finally:
         audit.close()
+        if row_audit:
+            row_audit.close()
         tgt.close()
 
 
@@ -651,6 +759,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="REPAIR_AUDIT 日志路径（默认 /tmp/repair_loan_audit_YYYYMMDD_HHMMSS.csv）",
     )
     p.add_argument("--no-repair-log", action="store_true")
+    p.add_argument(
+        "--no-row-log",
+        action="store_true",
+        help="不记录删除/修改的完整行（默认随 --repair-log 自动写 .deleted.csv / .modified.csv）",
+    )
     args = p.parse_args(argv)
 
     if args.apply and args.dry_run:
@@ -712,7 +825,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
 
     print(
-        "start dry_run=%s strategy=%s plan=%s workers=%s commit_every=%s repair_log=%s"
+        "start dry_run=%s strategy=%s plan=%s workers=%s commit_every=%s repair_log=%s row_log=%s"
         % (
             dry_run,
             args.strategy,
@@ -720,6 +833,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.workers,
             args.commit_every,
             repair_log if not args.no_repair_log else "(disabled)",
+            "off" if args.no_row_log or args.no_repair_log else "deleted+modified",
         ),
         flush=True,
     )
@@ -741,9 +855,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0 if ok or skip else 1
 
     audit = RepairAuditLog(repair_log or None, enabled=not args.no_repair_log)
+    row_audit = RowChangeAuditLog(
+        repair_log or "",
+        enabled=not args.no_repair_log and not args.no_row_log,
+    )
     cfg = load_env(Path(args.env))
     tgt = connect_target(cfg)
     try:
+        if row_audit.enabled:
+            print("row_deleted_log=%s" % row_audit.deleted_path, flush=True)
+            print("row_modified_log=%s" % row_audit.modified_path, flush=True)
         ok, skip = run_repair(
             tgt,
             plan,
@@ -752,12 +873,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.work_limit,
             args.log_every,
             audit,
+            row_audit,
             args.commit_every,
         )
         print("finished ok=%s skip=%s repair_log=%s" % (ok, skip, repair_log or ""), flush=True)
         return 0 if ok or skip else 1
     finally:
         audit.close()
+        row_audit.close()
         tgt.close()
 
 
