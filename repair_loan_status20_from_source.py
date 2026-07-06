@@ -18,6 +18,7 @@
 
 Usage:
   python3 repair_loan_status20_from_source.py --env ./ng_migration.env --dry-run --plan-only
+  python3 repair_loan_status20_from_source.py --env ./ng_migration.env --list-dup
   python3 repair_loan_status20_from_source.py --env ./ng_migration.env --apply --workers 1
 """
 import argparse
@@ -157,6 +158,77 @@ def group_dup_loan_nos(rows: List[dict]) -> Dict[str, List[dict]]:
         if ln:
             grouped[ln].append(row)
     return {k: v for k, v in grouped.items() if len(v) > 1}
+
+
+def report_dup_loan_nos(
+    dup_groups: Dict[str, List[dict]], min_sn_len: int
+) -> Dict[str, int]:
+    """打印同一 loan_no 多行明细，返回统计。"""
+    stats = {
+        "dup_loan_no_count": len(dup_groups),
+        "dup_row_count": sum(len(v) for v in dup_groups.values()),
+        "auto_fixable": 0,
+        "need_manual": 0,
+        "wrong_app_rows": 0,
+    }
+    print(
+        "dup_loan_no_count=%s dup_row_count=%s"
+        % (stats["dup_loan_no_count"], stats["dup_row_count"]),
+        flush=True,
+    )
+    for loan_no, rows in sorted(dup_groups.items()):
+        wrong_rows = [
+            r for r in rows
+            if is_wrong_application_no(str(r.get("application_no") or ""), loan_no, min_sn_len)
+        ]
+        good_rows = [
+            r for r in rows
+            if not is_wrong_application_no(str(r.get("application_no") or ""), loan_no, min_sn_len)
+        ]
+        if wrong_rows and good_rows:
+            tag = "auto_fixable"
+            stats["auto_fixable"] += 1
+        else:
+            tag = "need_manual"
+            stats["need_manual"] += 1
+        stats["wrong_app_rows"] += len(wrong_rows)
+        print(
+            "\nloan_no=%s rows=%s pattern=%s"
+            % (loan_no, len(rows), tag),
+            flush=True,
+        )
+        for r in rows:
+            app_no = str(r.get("application_no") or "")
+            if is_wrong_application_no(app_no, loan_no, min_sn_len):
+                row_tag = "wrong_core_sn_suffix"
+            else:
+                row_tag = "ok_market_suffix"
+            print(
+                "  [%s] application_no=%s status=%s due=%s principal=%s"
+                % (
+                    row_tag,
+                    app_no,
+                    r.get("status"),
+                    r.get("due_date"),
+                    r.get("principal"),
+                ),
+                flush=True,
+            )
+        if wrong_rows and good_rows:
+            print(
+                "  => suggest: DELETE %s KEEP %s"
+                % (
+                    [str(w.get("application_no")) for w in wrong_rows],
+                    str(good_rows[0].get("application_no")),
+                ),
+                flush=True,
+            )
+    print(
+        "\nsummary auto_fixable=%s need_manual=%s wrong_app_rows=%s"
+        % (stats["auto_fixable"], stats["need_manual"], stats["wrong_app_rows"]),
+        flush=True,
+    )
+    return stats
 
 
 def build_dup_app_no_plan(
@@ -891,13 +963,39 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="不删重复 loan_no 下 application_no 后缀为 core sn 的错行",
     )
+    p.add_argument(
+        "--list-dup",
+        action="store_true",
+        help="仅列出同一 loan_no 多行（不写库），查 due_before 内全部 status",
+    )
     p.add_argument("--plan-only", action="store_true")
     args = p.parse_args(argv)
     if args.apply and args.dry_run:
         p.error("use either --apply or --dry-run")
+    if args.list_dup and args.apply:
+        p.error("--list-dup 与 --apply 不能同时使用")
     dry_run = not args.apply
 
     cfg = load_env(Path(args.env))
+
+    if args.list_dup:
+        tgt = connect_target(cfg)
+        try:
+            print("list-dup due_before=%s (all status)" % args.due_before, flush=True)
+            rows = exec_with_retry(
+                tgt,
+                lambda: load_loans_for_dup_check(tgt, args.due_before),
+                "load dup check",
+            )
+            dup_groups = group_dup_loan_nos(rows)
+            if not dup_groups:
+                print("no duplicate loan_no found", flush=True)
+                return 0
+            report_dup_loan_nos(dup_groups, args.min_sn_len)
+            return 0
+        finally:
+            tgt.close()
+
     env_path = str(Path(args.env).resolve())
     repair_log = args.repair_log or (
         "/tmp/repair_loan_status20_%s.csv" % datetime.now().strftime("%Y%m%d_%H%M%S")
