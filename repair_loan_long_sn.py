@@ -84,28 +84,24 @@ def parse_loan_middle(loan_no: str) -> Optional[Tuple[str, int]]:
     return m.group(1), len(m.group(1))
 
 
-def fetch_application_sn(tgt, application_no: str) -> str:
-    if not application_no:
-        return ""
-    with tgt.cursor() as cur:
-        cur.execute(
-            "SELECT sn FROM application WHERE application_no=%s LIMIT 1",
-            (application_no,),
-        )
-        row = cur.fetchone()
-    return str(row["sn"]).strip() if row and row.get("sn") else ""
+def _long_loan_no_regexp(min_sn_len: int) -> str:
+    n = max(1, int(min_sn_len))
+    return r"^[Nn][Gg]-[0-9]{%d,}-[0-9]{5}$" % n
 
 
-def scan_loan_batch(tgt, after: str, limit: int) -> List[dict]:
+def scan_loan_batch(tgt, after: str, limit: int, min_sn_len: int) -> List[dict]:
+    """只扫 loan_no 中间段 >= min_sn_len 的候选行，并 JOIN application 取 core sn。"""
     sql = """
-        SELECT loan_no, application_no
-        FROM loan
-        WHERE loan_no > %s
-        ORDER BY loan_no ASC
+        SELECT l.loan_no, l.application_no, a.sn AS core_sn
+        FROM loan l
+        LEFT JOIN application a ON a.application_no = l.application_no
+        WHERE l.loan_no > %s
+          AND l.loan_no REGEXP %s
+        ORDER BY l.loan_no ASC
         LIMIT %s
     """
     with tgt.cursor() as cur:
-        cur.execute(sql, (after, limit))
+        cur.execute(sql, (after, _long_loan_no_regexp(min_sn_len), limit))
         return list(cur.fetchall())
 
 
@@ -117,8 +113,18 @@ def build_plan_from_scan(
 ) -> List[dict]:
     plan = []
     after = ""
+    batches = 0
     while True:
-        rows = scan_loan_batch(tgt, after, scan_size)
+        try:
+            tgt.ping(reconnect=True)
+        except Exception:
+            pass
+        rows = exec_with_retry(
+            tgt,
+            lambda a=after: scan_loan_batch(tgt, a, scan_size, min_sn_len),
+            "scan loan batch after=%s" % (after or "(start)"),
+        )
+        batches += 1
         if not rows:
             break
         after = str(rows[-1]["loan_no"])
@@ -130,7 +136,7 @@ def build_plan_from_scan(
             if mlen < min_sn_len:
                 continue
             app_no = str(row["application_no"] or "").strip()
-            core_sn = fetch_application_sn(tgt, app_no)
+            core_sn = str(row.get("core_sn") or "").strip()
             if not core_sn:
                 print(
                     "skip no_core_sn loan_no=%s application_no=%s"
@@ -153,6 +159,12 @@ def build_plan_from_scan(
             )
             if work_limit and len(plan) >= work_limit:
                 return plan
+        if batches % 10 == 0:
+            print(
+                "scan progress batches=%s plan=%s last_loan_no=%s"
+                % (batches, len(plan), after),
+                flush=True,
+            )
         if len(rows) < scan_size:
             break
     return plan
