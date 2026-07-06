@@ -26,7 +26,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import pymysql
 from pymysql.cursors import DictCursor
 
-from repair_loan_no_from_audit import CommitTracker, exec_with_retry
+from repair_loan_no_from_audit import exec_with_retry
 
 HERE = Path(__file__).resolve().parent
 
@@ -161,21 +161,28 @@ def build_plan(
     return plan, dict(by_loan)
 
 
-def apply_one(tgt, row: dict, tracker: CommitTracker) -> bool:
+def apply_batch(tgt, rows: List[dict]) -> int:
+    if not rows:
+        return 0
+    parts = []
+    params: List = []
+    for r in rows:
+        parts.append("SELECT %s AS application_no, %s AS old_status, %s AS new_status")
+        params.extend([r["application_no"], r["app_status"], r["loan_status"]])
+    sql = (
+        """
+        UPDATE application a
+        INNER JOIN (
+        """
+        + " UNION ALL ".join(parts)
+        + """
+        ) x ON a.application_no = x.application_no AND a.status = x.old_status
+        SET a.status = x.new_status
+        """
+    )
     with tgt.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE application
-            SET status=%s
-            WHERE application_no=%s AND status=%s
-            """,
-            (row["loan_status"], row["application_no"], row["app_status"]),
-        )
-        n = int(cur.rowcount or 0)
-    if n:
-        tracker.note_write()
-        return True
-    return False
+        cur.execute(sql, tuple(params))
+        return int(cur.rowcount or 0)
 
 
 def run_apply_chunk(
@@ -183,28 +190,35 @@ def run_apply_chunk(
     chunk: List[dict],
     commit_every: int,
     log_every: int,
+    batch_size: int,
     prefix: str = "",
 ) -> Tuple[int, int]:
-    tracker = CommitTracker(tgt, commit_every, dry_run=False)
     ok = skip = 0
-    for i, row in enumerate(chunk, 1):
-        hit = exec_with_retry(
+    pending = 0
+    for i in range(0, len(chunk), batch_size):
+        part = chunk[i : i + batch_size]
+        n = exec_with_retry(
             tgt,
-            lambda r=row: apply_one(tgt, r, tracker),
-            "%supdate %s" % (prefix, row["application_no"]),
+            lambda p=part: apply_batch(tgt, p),
+            "%sbatch update" % prefix,
         )
-        if hit:
-            ok += 1
-        else:
-            skip += 1
-        if i % max(1, log_every) == 0:
+        ok += n
+        skip += len(part) - n
+        pending += n
+        if pending >= commit_every:
+            tgt.commit()
+            pending = 0
+        done = min(i + batch_size, len(chunk))
+        if done % max(1, log_every) == 0 or done == len(chunk):
             print(
-                "%sprogress ok=%s skip=%s last=%s"
-                % (prefix, ok, skip, row["application_no"]),
+                "%sprogress ok=%s skip=%s done=%s/%s"
+                % (prefix, ok, skip, done, len(chunk)),
                 flush=True,
             )
-    tracker.flush()
-    tgt.commit()
+    if pending:
+        tgt.commit()
+    elif ok or skip:
+        tgt.commit()
     return ok, skip
 
 
@@ -223,6 +237,7 @@ def worker_run(spec: dict) -> Tuple[int, int]:
     chunk = spec.get("plan_chunk") or []
     if not chunk:
         return 0, 0
+    time.sleep(spec["worker_id"] * 2)
     cfg = load_env(Path(spec["env"]))
     tgt = connect_target(cfg)
     try:
@@ -241,6 +256,7 @@ def worker_run(spec: dict) -> Tuple[int, int]:
             chunk,
             spec["commit_every"],
             spec["log_every"],
+            spec["batch_size"],
             label,
         )
         print("%sdone ok=%s skip=%s" % (label, ok, skip), flush=True)
@@ -255,7 +271,9 @@ def run_parallel(
     env_path: str,
     commit_every: int,
     log_every: int,
+    batch_size: int,
 ) -> Tuple[int, int]:
+    workers = min(max(1, workers), 4)
     chunks = split_chunks(plan, workers)
     specs = []
     for i, chunk in enumerate(chunks):
@@ -266,6 +284,7 @@ def run_parallel(
                 "env": env_path,
                 "commit_every": commit_every,
                 "log_every": log_every,
+                "batch_size": batch_size,
                 "plan_chunk": chunk,
             }
         )
@@ -285,11 +304,16 @@ def apply_plan(
     env_path: str,
     commit_every: int,
     log_every: int,
+    batch_size: int,
 ) -> Tuple[int, int]:
     if workers <= 1:
-        return run_apply_chunk(tgt, plan, commit_every, log_every)
+        return run_apply_chunk(
+            tgt, plan, commit_every, log_every, batch_size
+        )
     tgt.close()
-    return run_parallel(plan, workers, env_path, commit_every, log_every)
+    return run_parallel(
+        plan, workers, env_path, commit_every, log_every, batch_size
+    )
 
 
 def main(argv: Optional[list] = None) -> int:
@@ -311,9 +335,10 @@ def main(argv: Optional[list] = None) -> int:
         help="只取这些 loan.status，逗号分隔，如 23,27；空=全部",
     )
     p.add_argument("--scan-chunk", type=int, default=500, help="分页 LIMIT 大小")
-    p.add_argument("--workers", type=int, default=1, help="并发进程数（apply 阶段）")
-    p.add_argument("--commit-every", type=int, default=50)
-    p.add_argument("--log-every", type=int, default=200)
+    p.add_argument("--workers", type=int, default=1, help="并发进程数，建议 1~2（经代理易 2013）")
+    p.add_argument("--batch-size", type=int, default=25, help="每条 SQL 批量 UPDATE 行数")
+    p.add_argument("--commit-every", type=int, default=100)
+    p.add_argument("--log-every", type=int, default=500)
     args = p.parse_args(argv)
     if args.apply and args.dry_run:
         p.error("use either --apply or --dry-run")
@@ -367,10 +392,15 @@ def main(argv: Optional[list] = None) -> int:
                 env_path,
                 args.commit_every,
                 args.log_every,
+                args.batch_size,
             )
         else:
             ok, skip = run_apply_chunk(
-                tgt, plan, args.commit_every, args.log_every
+                tgt,
+                plan,
+                args.commit_every,
+                args.log_every,
+                args.batch_size,
             )
         print(
             "done updated=%s skip=%s elapsed=%.1fs"
