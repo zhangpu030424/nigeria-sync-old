@@ -573,6 +573,10 @@ def build_plan(
                 stats["skip_no_ext_sn"] = stats.get("skip_no_ext_sn", 0) + 1
                 continue
             src_row = source_by_ext.get(ext_sn)
+            if src_row:
+                # 始终用目标库当前行的 application_no，不用源库 market 拼出来的 appId
+                src_row = dict(src_row)
+                src_row["application_no"] = app_no
             if not src_row:
                 # 源库无 repay_plan：若目标库已有短号行，仅删长号残留
                 app_key = (
@@ -634,7 +638,7 @@ def build_plan(
             {
                 "loan_no": loan_no,
                 "correct_loan_no": correct,
-                "application_no": str(src_row.get("application_no") or app_no),
+                "application_no": app_no,
                 "source_row": src_row,
                 "before": dict(row),
                 "mode": mode,
@@ -730,7 +734,13 @@ def apply_one_loan(
     source_row = plan_row["source_row"]
     correct = plan_row["correct_loan_no"]
     before = plan_row["before"]
-    update_cols = diff_update_cols(before, source_row) if source_row else []
+    want_app_no = str(
+        plan_row.get("application_no") or before.get("application_no") or ""
+    ).strip()
+    source_for_row = dict(source_row) if source_row else {}
+    if want_app_no and source_for_row:
+        source_for_row["application_no"] = want_app_no
+    update_cols = diff_update_cols(before, source_for_row) if source_for_row else []
     audit_row = _plan_audit_row(plan_row)
     cols_hint = ",".join(update_cols) if update_cols else "-"
 
@@ -778,52 +788,111 @@ def apply_one_loan(
     elif mode == "rekey_long":
         if loan_exists(tgt, correct) and correct != loan_no:
             before_correct = fetch_loan_row(tgt, correct) or {}
-            cols_on_correct = diff_update_cols(before_correct, source_row)
-            hint = ",".join(cols_on_correct) if cols_on_correct else "-"
-            if dry_run:
+            correct_app_no = str(before_correct.get("application_no") or "").strip()
+            app_mismatch = bool(
+                want_app_no and correct_app_no and want_app_no != correct_app_no
+            )
+            if app_mismatch:
+                # 短号行 application_no 与待修复长号行不一致：删错误短号，原地 rekey 长号
+                update_cols_rekey = diff_update_cols(before, source_for_row)
+                hint = ",".join(update_cols_rekey) if update_cols_rekey else "-"
+                after = _build_after(before, source_for_row, update_cols_rekey, correct)
+                if dry_run:
+                    if row_audit:
+                        row_audit.record_deleted("would_delete_wrong_short", before_correct)
+                        row_audit.record_modified("would_rekey_long", before, after)
+                    audit.record(
+                        "would_rekey_keep_app_no",
+                        audit_row,
+                        "drop_short_app=%s rekey:%s" % (correct_app_no, hint),
+                    )
+                    return "ok"
+                try:
+                    if _loan_row_exists(tgt, before_correct):
+                        if not _delete_loan_row(tgt, before_correct):
+                            tgt.rollback()
+                            audit.record("skip", audit_row, "delete_wrong_short_failed")
+                            return "skip"
+                        if row_audit:
+                            row_audit.record_deleted("delete_wrong_short", before_correct)
+                    if not _rekey_update(
+                        tgt, loan_no, correct, source_for_row, update_cols_rekey
+                    ):
+                        tgt.rollback()
+                        audit.record("skip", audit_row, "rekey_after_drop_short_failed")
+                        return "skip"
+                except pymysql.err.IntegrityError as exc:
+                    tgt.rollback()
+                    audit.record("skip", audit_row, "rekey_keep_app_no:%s" % exc)
+                    return "skip"
                 if row_audit:
-                    row_audit.record_deleted("would_delete_long", before)
+                    row_audit.record_modified("rekey_long", before, after)
+                audit.record(
+                    "rekey_keep_app_no",
+                    audit_row,
+                    "drop_short_app=%s rekey:%s" % (correct_app_no, hint),
+                )
+            else:
+                cols_on_correct = diff_update_cols(before_correct, source_for_row)
+                hint = ",".join(cols_on_correct) if cols_on_correct else "-"
+                if dry_run:
+                    if row_audit:
+                        row_audit.record_deleted("would_delete_long", before)
+                        if cols_on_correct:
+                            row_audit.record_modified(
+                                "would_sync_correct",
+                                before_correct,
+                                _build_after(
+                                    before_correct,
+                                    source_for_row,
+                                    cols_on_correct,
+                                    correct,
+                                ),
+                            )
+                    audit.record("would_drop_long", audit_row, "drop_long:%s" % hint)
+                    return "ok"
+                try:
+                    if _loan_row_exists(tgt, before):
+                        if not _delete_loan_row(tgt, before):
+                            tgt.rollback()
+                            audit.record("skip", audit_row, "delete_long_failed")
+                            return "skip"
+                        if row_audit:
+                            row_audit.record_deleted("delete_long", before)
                     if cols_on_correct:
-                        row_audit.record_modified(
-                            "would_sync_correct",
-                            before_correct,
-                            _build_after(before_correct, source_row, cols_on_correct, correct),
-                        )
-                audit.record("would_drop_long", audit_row, "drop_long:%s" % hint)
-                return "ok"
-            try:
-                if _loan_row_exists(tgt, before):
-                    if not _delete_loan_row(tgt, before):
-                        tgt.rollback()
-                        audit.record("skip", audit_row, "delete_long_failed")
-                        return "skip"
-                    if row_audit:
-                        row_audit.record_deleted("delete_long", before)
-                if cols_on_correct:
-                    if not _sync_update(tgt, correct, source_row, cols_on_correct):
-                        tgt.rollback()
-                        audit.record("skip", audit_row, "sync_correct_no_row")
-                        return "skip"
-                    if row_audit:
-                        row_audit.record_modified(
-                            "sync_correct",
-                            before_correct,
-                            _build_after(before_correct, source_row, cols_on_correct, correct),
-                        )
-            except pymysql.err.IntegrityError as exc:
-                tgt.rollback()
-                audit.record("skip", audit_row, "drop_long_duplicate:%s" % exc)
-                return "skip"
-            audit.record("drop_long", audit_row, "drop_long:%s" % hint)
+                        if not _sync_update(tgt, correct, source_for_row, cols_on_correct):
+                            tgt.rollback()
+                            audit.record("skip", audit_row, "sync_correct_no_row")
+                            return "skip"
+                        if row_audit:
+                            row_audit.record_modified(
+                                "sync_correct",
+                                before_correct,
+                                _build_after(
+                                    before_correct,
+                                    source_for_row,
+                                    cols_on_correct,
+                                    correct,
+                                ),
+                            )
+                except pymysql.err.IntegrityError as exc:
+                    tgt.rollback()
+                    audit.record("skip", audit_row, "drop_long_duplicate:%s" % exc)
+                    return "skip"
+                audit.record("drop_long", audit_row, "drop_long:%s" % hint)
         else:
-            after = _build_after(before, source_row, update_cols, correct)
+            update_cols = diff_update_cols(before, source_for_row)
+            cols_hint = ",".join(update_cols) if update_cols else "-"
+            after = _build_after(before, source_for_row, update_cols, correct)
             if dry_run:
                 if row_audit:
                     row_audit.record_modified("would_rekey_long", before, after)
                 audit.record("would_rekey_long", audit_row, "rekey_long:%s" % cols_hint)
                 return "ok"
             try:
-                if not _rekey_update(tgt, loan_no, correct, source_row, update_cols):
+                if not _rekey_update(
+                    tgt, loan_no, correct, source_for_row, update_cols
+                ):
                     tgt.rollback()
                     audit.record("skip", audit_row, "rekey_no_row")
                     return "skip"
@@ -838,14 +907,14 @@ def apply_one_loan(
         if not update_cols:
             audit.record("skip", audit_row, "already_ok")
             return "skip"
-        after = _build_after(before, source_row, update_cols, loan_no)
+        after = _build_after(before, source_for_row, update_cols, loan_no)
         if dry_run:
             if row_audit:
                 row_audit.record_modified("would_sync_status", before, after)
             audit.record("would_sync_status", audit_row, "sync:%s" % cols_hint)
             return "ok"
         try:
-            if not _sync_update(tgt, loan_no, source_row, update_cols):
+            if not _sync_update(tgt, loan_no, source_for_row, update_cols):
                 tgt.rollback()
                 audit.record("skip", audit_row, "sync_no_row")
                 return "skip"
