@@ -14,10 +14,12 @@ Usage:
   python3 restore_loan_app_no_from_audit.py \\
     --env ./ng_migration.env \\
     --audit /tmp/repair_loan_status20_20260706_093302.csv \\
-    --apply --commit-every 50
+    --apply --commit-every 50 --workers 8
 """
 import argparse
 import csv
+import hashlib
+import multiprocessing
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -323,11 +325,6 @@ def apply_one(
         )
         return "skip_pk"
     if dry_run:
-        print(
-            "would_restore loan_no=%s  %s -> %s"
-            % (loan_no, current, want_app),
-            flush=True,
-        )
         return "ok"
     with tgt.cursor() as cur:
         cur.execute(
@@ -346,6 +343,123 @@ def apply_one(
     return "ok"
 
 
+def run_apply_chunk(
+    tgt,
+    chunk: List[dict],
+    dry_run: bool,
+    commit_every: int,
+    log_every: int,
+    prefix: str = "",
+) -> Tuple[int, int]:
+    ok = skip = 0
+    tracker = CommitTracker(tgt, commit_every, dry_run)
+    for i, row in enumerate(chunk, 1):
+        st = exec_with_retry(
+            tgt,
+            lambda r=row: apply_one(
+                tgt,
+                r["loan_no"],
+                r["good_application_no"],
+                dry_run,
+                tracker,
+            ),
+            "%srestore %s" % (prefix, row["loan_no"]),
+        )
+        if st == "ok":
+            ok += 1
+        else:
+            skip += 1
+        if i % max(1, log_every) == 0:
+            print(
+                "%sprogress ok=%s skip=%s last=%s"
+                % (prefix, ok, skip, row["loan_no"]),
+                flush=True,
+            )
+    tracker.flush()
+    return ok, skip
+
+
+def split_plan_chunks(items: List[dict], workers: int) -> List[List[dict]]:
+    n = max(1, int(workers))
+    if not items:
+        return []
+    chunks: List[List[dict]] = [[] for _ in range(n)]
+    for row in items:
+        key = str(row.get("loan_no") or "")
+        idx = int(hashlib.md5(key.encode("utf-8")).hexdigest(), 16) % n
+        chunks[idx].append(row)
+    return [c for c in chunks if c]
+
+
+def restore_worker_run(spec: dict) -> Tuple[int, int]:
+    worker_id = spec["worker_id"]
+    workers = spec["workers"]
+    label = "[%s/%s] " % (worker_id, workers)
+    chunk = spec.get("plan_chunk") or []
+    if not chunk:
+        return 0, 0
+    cfg = load_env(Path(spec["env"]))
+    tgt = connect_target(cfg)
+    try:
+        print(
+            "%sstart rows=%s first=%s last=%s"
+            % (label, len(chunk), chunk[0]["loan_no"], chunk[-1]["loan_no"]),
+            flush=True,
+        )
+        ok, skip = run_apply_chunk(
+            tgt,
+            chunk,
+            spec["dry_run"],
+            spec["commit_every"],
+            spec["log_every"],
+            label,
+        )
+        print("%sdone ok=%s skip=%s" % (label, ok, skip), flush=True)
+        return ok, skip
+    finally:
+        tgt.close()
+
+
+def run_apply_parallel(
+    plan_rows: List[dict],
+    workers: int,
+    env_path: str,
+    dry_run: bool,
+    commit_every: int,
+    log_every: int,
+) -> Tuple[int, int]:
+    chunks = split_plan_chunks(plan_rows, workers)
+    specs = []
+    for i, chunk in enumerate(chunks):
+        if not chunk:
+            continue
+        specs.append(
+            {
+                "worker_id": i,
+                "workers": workers,
+                "env": env_path,
+                "dry_run": dry_run,
+                "commit_every": commit_every,
+                "log_every": log_every,
+                "plan_chunk": chunk,
+            }
+        )
+    if not specs:
+        return 0, 0
+    print("parallel apply workers=%s chunks=%s" % (len(specs), len(plan_rows)), flush=True)
+    ctx = multiprocessing.get_context("spawn")
+    with ctx.Pool(processes=len(specs)) as pool:
+        results = pool.map(restore_worker_run, specs)
+    total_ok = sum(r[0] for r in results)
+    total_skip = sum(r[1] for r in results)
+    print(
+        "parallel done workers=%s ok=%s skip=%s"
+        % (len(specs), total_ok, total_skip),
+        flush=True,
+    )
+    return total_ok, total_skip
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(
         description="Restore loan.application_no from repair_loan_status20 audit CSV"
@@ -360,6 +474,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="repair 计划不足时，才用 *.deleted.csv 查库补全（默认不查库）",
     )
     p.add_argument("--min-sn-len", type=int, default=15)
+    p.add_argument("--workers", type=int, default=1, help="并行写库进程数（默认 1）")
     p.add_argument("--commit-every", type=int, default=50)
     p.add_argument("--log-every", type=int, default=100)
     args = p.parse_args(argv)
@@ -406,41 +521,49 @@ def main(argv: Optional[List[str]] = None) -> int:
                 tgt.close()
 
     items = sorted(plan.items())
-    print("restore_plan=%s dry_run=%s" % (len(items), dry_run), flush=True)
-    for loan_no, app_no in items[:20]:
-        print("  %s -> %s" % (loan_no, app_no), flush=True)
-    if len(items) > 20:
-        print("  ... and %s more" % (len(items) - 20), flush=True)
-    if not items:
+    plan_rows = [
+        {"loan_no": ln, "good_application_no": app} for ln, app in items
+    ]
+    print(
+        "restore_plan=%s dry_run=%s workers=%s"
+        % (len(plan_rows), dry_run, args.workers),
+        flush=True,
+    )
+    for row in plan_rows[:20]:
+        print(
+            "  %s -> %s" % (row["loan_no"], row["good_application_no"]),
+            flush=True,
+        )
+    if len(plan_rows) > 20:
+        print("  ... and %s more" % (len(plan_rows) - 20), flush=True)
+    if not plan_rows:
         print("nothing to restore", flush=True)
         return 1
 
-    tgt = connect_target(cfg)
-    try:
-        ok = skip = 0
-        tracker = CommitTracker(tgt, args.commit_every, dry_run)
-        for i, (loan_no, want_app) in enumerate(items, 1):
-            st = exec_with_retry(
+    env_path = str(Path(args.env).resolve())
+    if args.workers > 1:
+        ok, skip = run_apply_parallel(
+            plan_rows,
+            args.workers,
+            env_path,
+            dry_run,
+            args.commit_every,
+            args.log_every,
+        )
+    else:
+        tgt = connect_target(cfg)
+        try:
+            ok, skip = run_apply_chunk(
                 tgt,
-                lambda ln=loan_no, wa=want_app: apply_one(
-                    tgt, ln, wa, dry_run, tracker
-                ),
-                "restore %s" % loan_no,
+                plan_rows,
+                dry_run,
+                args.commit_every,
+                args.log_every,
             )
-            if st == "ok":
-                ok += 1
-            else:
-                skip += 1
-            if i % max(1, args.log_every) == 0:
-                print(
-                    "progress ok=%s skip=%s last=%s" % (ok, skip, loan_no),
-                    flush=True,
-                )
-        tracker.flush()
-        print("done ok=%s skip=%s" % (ok, skip), flush=True)
-        return 0
-    finally:
-        tgt.close()
+        finally:
+            tgt.close()
+    print("done ok=%s skip=%s" % (ok, skip), flush=True)
+    return 0
 
 
 if __name__ == "__main__":
