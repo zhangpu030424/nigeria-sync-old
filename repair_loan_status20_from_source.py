@@ -394,6 +394,98 @@ def _delete_loan(tgt, loan_no: str) -> int:
         return cur.rowcount
 
 
+def _delete_pk_duplicates(
+    tgt,
+    source_row: dict,
+    keep_loan_no: str,
+    loan_no_set: Optional[set] = None,
+    cache: Optional[Dict[str, dict]] = None,
+) -> List[str]:
+    """删除与 source_row 同 (application_no, period, roll_sequence) 的其它 loan 行。"""
+    app_no = str(source_row.get("application_no") or "").strip()
+    if not app_no:
+        return []
+    period = source_row.get("period", 1)
+    roll = source_row.get("roll_sequence", 0)
+    removed: List[str] = []
+    with tgt.cursor() as cur:
+        cur.execute(
+            """
+            SELECT loan_no FROM loan
+            WHERE application_no=%s AND period=%s AND roll_sequence=%s
+              AND loan_no<>%s
+            """,
+            (app_no, period, roll, keep_loan_no),
+        )
+        dupes = [str(r["loan_no"]) for r in cur.fetchall()]
+    for ln in dupes:
+        if _delete_loan(tgt, ln):
+            removed.append(ln)
+            if loan_no_set is not None:
+                loan_no_set.discard(ln)
+            if cache is not None:
+                cache.pop(ln, None)
+    return removed
+
+
+def _sync_update_safe(tgt, loan_no: str, source_row: dict) -> int:
+    """先全量同步；1062 时仅同步非 PK 列（status/金额等）。"""
+    try:
+        return _sync_update(tgt, loan_no, source_row, SYNC_COLS)
+    except pymysql.err.IntegrityError as exc:
+        if exc.args[0] != 1062:
+            raise
+        return _sync_update(tgt, loan_no, source_row, STATUS_SYNC_COLS)
+
+
+def _apply_sync_delete(
+    tgt,
+    wrong: str,
+    correct: str,
+    source_row: dict,
+    before_wrong: dict,
+    before_correct: Optional[dict],
+    dry_run: bool,
+    row_audit: Optional[RowChangeAuditLog],
+    loan_no_set: Optional[set],
+    cache: Dict[str, dict],
+) -> str:
+    """先删 wrong / PK 重复行，再更新 correct（避免 1062）。"""
+    if dry_run:
+        if before_correct and row_audit:
+            row_audit.record_modified(
+                "would_sync_correct",
+                before_correct,
+                _merge_source_row(before_correct, source_row),
+            )
+        if row_audit:
+            row_audit.record_deleted("would_delete_wrong", before_wrong)
+        return "ok"
+
+    if wrong != correct and _loan_present(tgt, wrong, loan_no_set):
+        _delete_loan(tgt, wrong)
+        if loan_no_set is not None:
+            loan_no_set.discard(wrong)
+        cache.pop(wrong, None)
+
+    _delete_pk_duplicates(tgt, source_row, correct, loan_no_set, cache)
+    if not _sync_update_safe(tgt, correct, source_row):
+        return "missing"
+
+    if row_audit and before_correct:
+        row_audit.record_modified(
+            "sync_correct",
+            before_correct,
+            _merge_source_row(before_correct, source_row),
+        )
+    if row_audit and wrong != correct:
+        row_audit.record_deleted("delete_wrong", before_wrong)
+    if loan_no_set is not None:
+        loan_no_set.add(correct)
+    cache[correct] = _merge_source_row(before_correct or {}, source_row)
+    return "ok"
+
+
 def _finalize_write(tgt, tracker: Optional[CommitTracker], dry_run: bool) -> None:
     if tracker:
         tracker.note_write()
@@ -456,35 +548,24 @@ def sync_one_loan(
             cache[correct] = after
 
     def _handle_1062(exc: Exception, action: str) -> str:
-        """1062: correct 已存在则合并并删 wrong；sync_status 则跳过 PK 列重试。"""
+        """1062: 先删 wrong / PK 重复行，再更新 correct 或 sync_status。"""
         if correct != wrong and loan_exists(tgt, correct):
             before_correct = cache.get(correct) or fetch_loan_row(tgt, correct)
-            if dry_run:
-                if before_correct and row_audit:
-                    row_audit.record_modified(
-                        "would_sync_correct_after_1062",
-                        before_correct,
-                        _merge_source_row(before_correct, source_row),
-                    )
-                if row_audit:
-                    row_audit.record_deleted("would_delete_wrong_after_1062", before_wrong)
-            else:
-                _sync_update(tgt, correct, source_row, SYNC_COLS)
-                if _loan_present(tgt, wrong, loan_no_set):
-                    _delete_loan(tgt, wrong)
-                if row_audit and before_correct:
-                    row_audit.record_modified(
-                        "sync_correct_after_1062",
-                        before_correct,
-                        _merge_source_row(before_correct, source_row),
-                    )
-                if row_audit:
-                    row_audit.record_deleted("delete_wrong_after_1062", before_wrong)
-                if loan_no_set is not None:
-                    loan_no_set.discard(wrong)
-                    loan_no_set.add(correct)
-                    cache.pop(wrong, None)
-                    cache[correct] = _merge_source_row(before_correct or {}, source_row)
+            result = _apply_sync_delete(
+                tgt,
+                wrong,
+                correct,
+                source_row,
+                before_wrong,
+                before_correct,
+                dry_run,
+                row_audit,
+                loan_no_set,
+                cache,
+            )
+            if result == "missing":
+                audit.record("skip", plan_row, "sync_delete_after_1062_no_row")
+                return "missing"
             audit.record(
                 "sync_delete_after_1062",
                 plan_row,
@@ -492,26 +573,21 @@ def sync_one_loan(
             )
             _finalize_write(tgt, tracker, dry_run)
             return "ok"
-        if action == "sync_status" and _loan_present(tgt, wrong, loan_no_set):
-            if dry_run:
-                after = _merge_source_row(before_wrong, source_row)
-                if row_audit:
-                    row_audit.record_modified(
-                        "would_sync_status_no_pk_cols", before_wrong, after
-                    )
-            else:
-                if not _sync_update(tgt, wrong, source_row, STATUS_SYNC_COLS):
+        if _loan_present(tgt, wrong, loan_no_set):
+            if not dry_run:
+                _delete_pk_duplicates(tgt, source_row, wrong, loan_no_set, cache)
+                if not _sync_update_safe(tgt, wrong, source_row):
                     audit.record("skip", plan_row, "sync_status_no_row_after_1062")
                     return "missing"
                 if loan_no_set is not None:
                     cache[wrong] = _merge_source_row(before_wrong, source_row)
                 if row_audit:
                     row_audit.record_modified(
-                        "sync_status_no_pk_cols",
+                        "sync_status_after_1062",
                         before_wrong,
                         _merge_source_row(before_wrong, source_row),
                     )
-            audit.record("sync_status_no_pk_cols", plan_row, "1062_fallback")
+            audit.record("sync_status_after_1062", plan_row, "%s:%s" % (action, exc))
             _finalize_write(tgt, tracker, dry_run)
             return "ok"
         audit.record("skip", plan_row, "duplicate_key:%s" % exc)
@@ -526,6 +602,8 @@ def sync_one_loan(
             return "ok"
         after = _merge_source_row(before_wrong, source_row)
         try:
+            if not dry_run:
+                _delete_pk_duplicates(tgt, source_row, wrong, loan_no_set, cache)
             if not _sync_update(tgt, wrong, source_row, STATUS_SYNC_COLS):
                 audit.record("skip", plan_row, "sync_status_no_row")
                 return "missing"
@@ -559,27 +637,25 @@ def sync_one_loan(
             )
             return "ok"
         try:
-            _sync_update(tgt, correct, source_row, SYNC_COLS)
+            result = _apply_sync_delete(
+                tgt,
+                wrong,
+                correct,
+                source_row,
+                before_wrong,
+                before_correct,
+                dry_run,
+                row_audit,
+                loan_no_set,
+                cache,
+            )
         except pymysql.err.IntegrityError as exc:
             if exc.args[0] != 1062:
                 raise
             return _handle_1062(exc, "sync_delete")
-        if row_audit and before_correct:
-            row_audit.record_modified(
-                "sync_correct",
-                before_correct,
-                _merge_source_row(before_correct, source_row),
-            )
-        if not _delete_loan(tgt, wrong):
-            audit.record("skip", plan_row, "delete_wrong_failed")
+        if result == "missing":
+            audit.record("skip", plan_row, "sync_delete_no_row")
             return "missing"
-        if row_audit:
-            row_audit.record_deleted("delete_wrong", before_wrong)
-        if loan_no_set is not None:
-            loan_no_set.discard(wrong)
-            loan_no_set.add(correct)
-        cache[correct] = _merge_source_row(before_correct or {}, source_row)
-        cache.pop(wrong, None)
         audit.record("sync_delete", plan_row, plan_row.get("sync_mode", ""))
         _finalize_write(tgt, tracker, dry_run)
         return "ok"
@@ -598,27 +674,25 @@ def sync_one_loan(
             audit.record("would_sync_delete", plan_row, "race_correct_exists")
             return "ok"
         try:
-            _sync_update(tgt, correct, source_row, SYNC_COLS)
+            result = _apply_sync_delete(
+                tgt,
+                wrong,
+                correct,
+                source_row,
+                before_wrong,
+                before_correct,
+                dry_run,
+                row_audit,
+                loan_no_set,
+                cache,
+            )
         except pymysql.err.IntegrityError as exc:
             if exc.args[0] != 1062:
                 raise
             return _handle_1062(exc, "sync_delete")
-        if row_audit and before_correct:
-            row_audit.record_modified(
-                "sync_correct",
-                before_correct,
-                _merge_source_row(before_correct, source_row),
-            )
-        if not _delete_loan(tgt, wrong):
-            audit.record("skip", plan_row, "delete_wrong_failed")
+        if result == "missing":
+            audit.record("skip", plan_row, "sync_delete_no_row")
             return "missing"
-        if row_audit:
-            row_audit.record_deleted("delete_wrong", before_wrong)
-        if loan_no_set is not None:
-            loan_no_set.discard(wrong)
-            loan_no_set.add(correct)
-        cache[correct] = _merge_source_row(before_correct or {}, source_row)
-        cache.pop(wrong, None)
         audit.record("sync_delete", plan_row, "race_correct_exists")
         _finalize_write(tgt, tracker, dry_run)
         return "ok"
@@ -630,6 +704,8 @@ def sync_one_loan(
         audit.record("would_rekey_sync", plan_row, plan_row.get("sync_mode", ""))
         return "ok"
     after = _merge_source_row(before_wrong, source_row)
+    if not dry_run:
+        _delete_pk_duplicates(tgt, source_row, wrong, loan_no_set, cache)
     try:
         if not _rekey_update(tgt, wrong, correct, source_row, SYNC_COLS):
             audit.record("skip", plan_row, "rekey_update_no_row")
