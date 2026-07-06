@@ -2,15 +2,14 @@
 # -*- coding: utf-8 -*-
 """将 application.status 与 loan.status 对齐。
 
-等价候选集（你的 SQL，分页执行，避免大 JOIN 一次扫完 2013）:
+直接分页查「不一致」行（约 4561 条），不扫 12 万 loan:
+
   SELECT l.application_no, l.status, a.status
   FROM loan l
   JOIN application a ON a.application_no = l.application_no
-  WHERE l.due_date <= '2026-07-05' AND a.status = 20;
-
-  仅保留 l.status <> a.status 的写入 plan。
-
-实现: 分页扫 loan（due_date 条件）→ 每批 IN 查 application → 内存比对 → 多进程 UPDATE
+  WHERE l.due_date <= '2026-07-05'
+    AND a.status = 20
+    AND l.status <> a.status;
 
 Usage:
   python3 sync_application_status_from_loan.py --env ./ng_migration.env --dry-run
@@ -73,44 +72,37 @@ def _row_rank(row: dict) -> Tuple:
     )
 
 
-def fetch_loan_page(tgt, due_before: str, after: str, limit: int) -> List[dict]:
-    with tgt.cursor() as cur:
-        cur.execute(
-            """
-            SELECT loan_no, application_no, status, due_date, period, roll_sequence
-            FROM loan
-            WHERE due_date <= %s
-              AND application_no IS NOT NULL AND application_no <> ''
-              AND loan_no > %s
-            ORDER BY loan_no ASC
-            LIMIT %s
-            """,
-            (due_before, after, limit),
-        )
-        return list(cur.fetchall())
-
-
-def fetch_application_status(
+def fetch_mismatch_page(
     tgt,
-    app_nos: Sequence[str],
+    due_before: str,
+    after: str,
+    limit: int,
     app_status: Optional[str],
-) -> Dict[str, int]:
-    if not app_nos:
-        return {}
-    ph = ",".join(["%s"] * len(app_nos))
-    sql = (
-        "SELECT application_no, status FROM application WHERE application_no IN (%s)"
-        % ph
-    )
-    params: List = list(app_nos)
+    loan_statuses: Optional[Sequence[str]],
+) -> List[dict]:
+    sql = """
+        SELECT l.loan_no, l.application_no,
+               l.status AS loan_status, a.status AS app_status,
+               l.due_date, l.period, l.roll_sequence
+        FROM loan l
+        INNER JOIN application a ON a.application_no = l.application_no
+        WHERE l.due_date <= %s
+          AND l.status <> a.status
+          AND l.loan_no > %s
+    """
+    params: List = [due_before, after]
     if app_status is not None:
-        sql += " AND status = %s"
+        sql += " AND a.status = %s"
         params.append(int(app_status))
+    if loan_statuses:
+        ph = ",".join(["%s"] * len(loan_statuses))
+        sql += " AND l.status IN (%s)" % ph
+        params.extend(loan_statuses)
+    sql += " ORDER BY l.loan_no ASC LIMIT %s"
+    params.append(limit)
     with tgt.cursor() as cur:
         cur.execute(sql, tuple(params))
-        return {
-            str(r["application_no"]): int(r["status"]) for r in cur.fetchall()
-        }
+        return list(cur.fetchall())
 
 
 def build_plan(
@@ -120,64 +112,44 @@ def build_plan(
     app_status_filter: Optional[str],
     loan_statuses: Optional[Sequence[str]],
 ) -> Tuple[List[dict], Dict[int, int]]:
-    """从 loan 侧分页，等价于你给的 JOIN SQL。"""
     plan_by_app: Dict[str, dict] = {}
-    by_loan: Dict[int, int] = defaultdict(int)
     after = ""
-    total_loan = 0
-    matched = 0
+    total_rows = 0
     while True:
-        loans = exec_with_retry(
+        rows = exec_with_retry(
             tgt,
-            lambda a=after: fetch_loan_page(tgt, due_before, a, scan_chunk),
-            "scan loan",
-        )
-        if not loans:
-            break
-        after = str(loans[-1]["loan_no"])
-        total_loan += len(loans)
-        app_nos = sorted(
-            {str(r["application_no"]).strip() for r in loans if r.get("application_no")}
-        )
-        app_status = exec_with_retry(
-            tgt,
-            lambda nos=app_nos: fetch_application_status(
-                tgt, nos, app_status_filter
+            lambda a=after: fetch_mismatch_page(
+                tgt, due_before, a, scan_chunk, app_status_filter, loan_statuses
             ),
-            "fetch application",
+            "fetch mismatch page",
         )
-        for row in loans:
+        if not rows:
+            break
+        after = str(rows[-1]["loan_no"])
+        total_rows += len(rows)
+        for row in rows:
             app_no = str(row["application_no"]).strip()
-            app_st = app_status.get(app_no)
-            if app_st is None:
-                continue
-            matched += 1
-            loan_st = int(row["status"])
-            if loan_statuses and str(loan_st) not in loan_statuses:
-                continue
-            if app_st == loan_st:
-                continue
-            prev = plan_by_app.get(app_no)
             cur = {
                 "application_no": app_no,
-                "app_status": app_st,
-                "loan_status": loan_st,
+                "app_status": int(row["app_status"]),
+                "loan_status": int(row["loan_status"]),
                 "due_date": row.get("due_date"),
                 "period": row.get("period"),
                 "roll_sequence": row.get("roll_sequence"),
             }
+            prev = plan_by_app.get(app_no)
             if prev is None or _row_rank(cur) >= _row_rank(prev):
                 plan_by_app[app_no] = cur
-        by_loan = defaultdict(int)
-        for st in plan_by_app.values():
-            by_loan[int(st["loan_status"])] += 1
         print(
-            "loan scan total=%s matched_app=%s plan=%s last=%s"
-            % (total_loan, matched, len(plan_by_app), after[-30:]),
+            "mismatch page rows=%s plan=%s last=%s"
+            % (total_rows, len(plan_by_app), after[-30:]),
             flush=True,
         )
-        if len(loans) < scan_chunk:
+        if len(rows) < scan_chunk:
             break
+    by_loan: Dict[int, int] = defaultdict(int)
+    for st in plan_by_app.values():
+        by_loan[int(st["loan_status"])] += 1
     plan = [
         {
             "application_no": v["application_no"],
@@ -338,7 +310,7 @@ def main(argv: Optional[list] = None) -> int:
         default="",
         help="只取这些 loan.status，逗号分隔，如 23,27；空=全部",
     )
-    p.add_argument("--scan-chunk", type=int, default=500, help="loan 分页大小")
+    p.add_argument("--scan-chunk", type=int, default=500, help="分页 LIMIT 大小")
     p.add_argument("--workers", type=int, default=1, help="并发进程数（apply 阶段）")
     p.add_argument("--commit-every", type=int, default=50)
     p.add_argument("--log-every", type=int, default=200)
