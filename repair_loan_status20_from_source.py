@@ -4,7 +4,7 @@
 
 查询链路（与手工 SQL 一致）:
   1. 目标: SELECT * FROM loan WHERE due_date < ? AND status = ?
-  2. 内存筛 loan_no 中间段 >= 15 位（长号）
+  2. 默认处理全部符合条件的 loan（长号改 loan_no + 同步；短号仅同步 status 等）
   3. ext_sn = application_no 后缀（如 166487616812019719）
   4. 源库: SELECT sn FROM ng_loan_core.application WHERE ext_sn = ?
   5. 源库: SELECT * FROM ng_loan_core.repay_plan WHERE sn = ?（取 max plan_sn）
@@ -268,6 +268,18 @@ def build_rekey_row_from_before(
     return row
 
 
+def row_needs_sync(target: dict, source: dict) -> bool:
+    """目标行与源库组装行是否有业务字段差异。"""
+    for col in SYNC_COLS:
+        tv = target.get(col)
+        sv = source.get(col)
+        if tv is None and sv is None:
+            continue
+        if str(tv) != str(sv):
+            return True
+    return False
+
+
 def build_plan_in_memory(
     candidates: List[dict],
     source_by_ext: Dict[str, dict],
@@ -300,7 +312,12 @@ def build_plan_in_memory(
 
         correct = str(src_row["loan_no"])
         if correct == wrong:
-            continue
+            if not row_needs_sync(row, src_row):
+                continue
+            mode = "sync_status"
+        elif not is_long_loan_no(wrong, min_sn_len):
+            mode = "rekey_short"
+
         plan.append(
             {
                 "wrong_loan_no": wrong,
@@ -360,6 +377,33 @@ def sync_one_loan(
     set_parts = ["`%s`=%%s" % c for c in SYNC_COLS]
     set_sql = ", ".join(set_parts)
     sync_vals = [source_row[c] for c in SYNC_COLS]
+    mode = plan_row.get("sync_mode", "")
+
+    if mode == "sync_status" or wrong == correct:
+        if dry_run:
+            after = _merge_source_row(before_wrong, source_row)
+            if row_audit:
+                row_audit.record_modified("would_sync_status", before_wrong, after)
+            audit.record("would_sync_status", plan_row, "sync_status")
+            return "ok"
+        after = _merge_source_row(before_wrong, source_row)
+        with tgt.cursor() as cur:
+            cur.execute(
+                "UPDATE loan SET %s WHERE loan_no=%%s" % set_sql,
+                sync_vals + [wrong],
+            )
+            if not cur.rowcount:
+                audit.record("skip", plan_row, "sync_status_no_row")
+                return "missing"
+        if row_audit:
+            row_audit.record_modified("sync_status", before_wrong, after)
+        loan_by_no[wrong] = after
+        audit.record("sync_status", plan_row, "sync_status")
+        if tracker:
+            tracker.note_write()
+        else:
+            tgt.commit()
+        return "ok"
 
     if correct in loan_no_set and correct != wrong:
         before_correct = loan_by_no.get(correct) or fetch_loan_row(tgt, correct)
@@ -447,6 +491,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--repair-log", default="")
     p.add_argument("--no-repair-log", action="store_true")
+    p.add_argument(
+        "--long-only",
+        action="store_true",
+        help="仅处理 loan_no 长号行（默认处理全部 status 匹配行，短号只同步 status）",
+    )
     p.add_argument("--plan-only", action="store_true")
     args = p.parse_args(argv)
     if args.apply and args.dry_run:
@@ -497,10 +546,21 @@ def main(argv: Optional[List[str]] = None) -> int:
             flush=True,
         )
 
-        candidates = filter_long_candidates(all_loans, args.min_sn_len)
-        print("long_loan_candidates=%s" % len(candidates), flush=True)
+        candidates = (
+            filter_long_candidates(all_loans, args.min_sn_len)
+            if args.long_only
+            else all_loans
+        )
+        long_n = sum(
+            1 for r in candidates if is_long_loan_no(str(r.get("loan_no") or ""), args.min_sn_len)
+        )
+        print(
+            "candidates=%s long=%s short=%s long_only=%s"
+            % (len(candidates), long_n, len(candidates) - long_n, args.long_only),
+            flush=True,
+        )
         if not candidates:
-            print("no long loan_no rows", flush=True)
+            print("no candidate loans", flush=True)
             return 0
 
         ext_sns = sorted(
@@ -561,18 +621,30 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         for row in plan[:20]:
             src_row = row["source_row"]
-            print(
-                "  %s -> %s mode=%s app=%s src_status=%s due=%s"
-                % (
-                    row["wrong_loan_no"],
-                    row["correct_loan_no"],
-                    row.get("sync_mode", ""),
-                    row["application_no"],
-                    src_row.get("status"),
-                    src_row.get("due_date"),
-                ),
-                flush=True,
-            )
+            if row.get("sync_mode") == "sync_status":
+                print(
+                    "  %s sync_status tgt_status=%s -> src_status=%s due=%s"
+                    % (
+                        row["wrong_loan_no"],
+                        row.get("target_status"),
+                        src_row.get("status"),
+                        src_row.get("due_date"),
+                    ),
+                    flush=True,
+                )
+            else:
+                print(
+                    "  %s -> %s mode=%s app=%s src_status=%s due=%s"
+                    % (
+                        row["wrong_loan_no"],
+                        row["correct_loan_no"],
+                        row.get("sync_mode", ""),
+                        row["application_no"],
+                        src_row.get("status"),
+                        src_row.get("due_date"),
+                    ),
+                    flush=True,
+                )
         if len(plan) > 20:
             print("  ... and %s more" % (len(plan) - 20), flush=True)
         if args.plan_only:
