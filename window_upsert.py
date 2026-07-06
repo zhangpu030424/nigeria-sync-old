@@ -9,6 +9,8 @@ Usage:
   python3 window_upsert.py --date-window last-month --dry-run
   python3 window_upsert.py --date-window last-month --apply
   python3 window_upsert.py --date-window last-month --apply --tables application,loan
+  python3 window_upsert.py --date-window last-month --apply --tables loan
+    # 仅 upsert loan（跳过 application 写库；源端走 loan 快速加载）
 """
 import argparse
 import sys
@@ -101,13 +103,17 @@ def _primary_key_cols(table: str, columns: Sequence[str]) -> Tuple[str, ...]:
 
 
 def _filter_specs(table_sel: set) -> List[Tuple[str, List[str], List[str], str]]:
-    user_on = "all" in table_sel or "user" in table_sel
-    app_on = "all" in table_sel or "application" in table_sel
+    if "all" in table_sel:
+        return list(_upsert_table_specs())
     out: List[Tuple[str, List[str], List[str], str]] = []
     for table, cols, upd, attr in _upsert_table_specs():
-        if table in vr.USER_TABLES and not user_on:
-            continue
-        if table in vr.APP_TABLES and not app_on:
+        if table in vr.USER_TABLES:
+            if "user" not in table_sel and table not in table_sel:
+                continue
+        elif table in vr.APP_TABLES:
+            if table not in table_sel:
+                continue
+        elif table not in table_sel:
             continue
         out.append((table, cols, upd, attr))
     return out
@@ -282,7 +288,7 @@ def main(argv: Sequence[str] = None) -> int:
     mig._session_opts(tgt)
     results: Dict[str, Dict[str, int]] = {}
     try:
-        cache = vr.load_window_source_cache(cfg, src, window)
+        cache = vr.load_window_source_cache(cfg, src, window, table_sel=table_sel, tgt=tgt)
         results = execute_window_upsert(cfg, cache, tgt, table_sel, dry_run=dry_run)
     finally:
         mig._close_mysql_conn(src)

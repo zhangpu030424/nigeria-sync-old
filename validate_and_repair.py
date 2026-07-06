@@ -1594,16 +1594,143 @@ def _load_application_batch_source(
     return source_map, app_keys_by_no, mapping_by_app_id, app_rows, loan_rows, mapping_rows
 
 
-def load_window_source_cache(cfg: Dict[str, Any], src, window: DateWindow) -> WindowSourceCache:
+def _window_loan_only_mode(table_sel: Optional[set]) -> bool:
+    if not table_sel or "all" in table_sel:
+        return False
+    sel = {str(x).strip() for x in table_sel if str(x).strip()}
+    return "loan" in sel and "application" not in sel and "id_mapping" not in sel
+
+
+def _source_app_sn_rows(src, app_ids: Sequence[int]) -> List[dict]:
+    ids = sorted({int(x) for x in app_ids if x is not None})
+    if not ids:
+        return []
+    out: List[dict] = []
+    for i in range(0, len(ids), 2000):
+        part = ids[i:i + 2000]
+        ph = ",".join(["%s"] * len(part))
+        out.extend(
+            q_rows(
+                src,
+                f"""
+                SELECT a.id AS app_id, a.applicationNo AS market_no, ca.sn AS core_sn
+                FROM ng_loan_market.application a
+                INNER JOIN ng_loan_core.application ca ON ca.ext_sn = a.applicationNo
+                WHERE a.id IN ({ph})
+                  AND ca.sn IS NOT NULL AND ca.sn <> ''
+                """,
+                part,
+            )
+        )
+    return out
+
+
+def _target_sn_to_app_no(tgt, sn_rows: Sequence[dict]) -> Dict[str, str]:
+    """Build repay_plan.sn -> target application_no using target.application."""
+    if not sn_rows:
+        return {}
+    core_sns = sorted({str(r.get("core_sn") or "").strip() for r in sn_rows if r.get("core_sn")})
+    out: Dict[str, str] = {}
+    for i in range(0, len(core_sns), 2000):
+        part = core_sns[i:i + 2000]
+        ph = ",".join(["%s"] * len(part))
+        for row in q_rows(
+            tgt,
+            f"SELECT sn, application_no FROM application WHERE sn IN ({ph})",
+            part,
+        ):
+            sn = str(row.get("sn") or "").strip()
+            app_no = str(row.get("application_no") or "").strip()
+            if sn and app_no:
+                out[sn] = app_no
+    for row in sn_rows:
+        core_sn = str(row.get("core_sn") or "").strip()
+        market_no = str(row.get("market_no") or "").strip()
+        if not core_sn or core_sn in out or not market_no:
+            continue
+        hits = q_rows(
+            tgt,
+            """
+            SELECT sn, application_no FROM application
+            WHERE application_no = %s OR application_no LIKE %s
+            LIMIT 5
+            """,
+            (market_no, "ng____-%s" % market_no),
+        )
+        for hit in hits:
+            sn = str(hit.get("sn") or "").strip()
+            app_no = str(hit.get("application_no") or "").strip()
+            if sn and app_no:
+                out[sn] = app_no
+    return out
+
+
+def _load_loan_only_batch(
+    cfg: Dict[str, Any],
+    src,
+    tgt,
+    app_ids: Sequence[int],
+) -> List[dict]:
+    sn_rows = _source_app_sn_rows(src, app_ids)
+    sn_to_app_no = _target_sn_to_app_no(tgt, sn_rows)
+    if not sn_to_app_no:
+        repair_log(
+            f"loan-only batch ids={len(set(app_ids))} sn_rows={len(sn_rows)} "
+            "target_map=0 (no application on target?)"
+        )
+        return []
+    loan_rows = mig._fetch_loan_rows_from_source(src, sn_to_app_no)
+    repair_log(
+        f"loan-only batch ids={len(set(app_ids))} sn_rows={len(sn_rows)} "
+        f"target_map={len(sn_to_app_no)} loans={len(loan_rows)}"
+    )
+    return loan_rows
+
+
+def load_window_source_cache(
+    cfg: Dict[str, Any],
+    src,
+    window: DateWindow,
+    table_sel: Optional[set] = None,
+    tgt=None,
+) -> WindowSourceCache:
     """Preload one-month window source rows into memory in batches."""
     cache = WindowSourceCache(window=window)
     batch_size = max(1, int(cfg.get("app_validate_batch", APP_VALIDATE_BATCH)))
+    loan_only = _window_loan_only_mode(table_sel)
     total_t0 = time.time()
     repair_log(
-        f"window cache start range=[{window.start_sql},{window.end_sql}) batch_size={batch_size}"
+        f"window cache start range=[{window.start_sql},{window.end_sql}) batch_size={batch_size} "
+        f"loan_only={int(loan_only)}"
     )
 
     id_t0 = time.time()
+    if loan_only:
+        cache.loan_app_ids = source_application_ids_by_repay_plan_created_window(src, window)
+        cache.all_app_ids = sorted({int(x) for x in cache.loan_app_ids if x is not None})
+        repair_log(
+            f"window cache ids (loan-only) elapsed={time.time() - id_t0:.1f}s "
+            f"loan_apps={len(cache.all_app_ids)}"
+        )
+        if tgt is None:
+            raise ValueError("loan-only window cache requires target connection (tgt)")
+        app_batches = max(1, (len(cache.all_app_ids) + batch_size - 1) // batch_size) if cache.all_app_ids else 0
+        app_t0 = time.time()
+        for batch_no, i in enumerate(range(0, len(cache.all_app_ids), batch_size), start=1):
+            batch_ids = cache.all_app_ids[i:i + batch_size]
+            batch_t0 = time.time()
+            loan_rows = _load_loan_only_batch(cfg, src, tgt, batch_ids)
+            cache.loan_rows.extend(loan_rows)
+            repair_log(
+                f"window cache loan-only batch {batch_no}/{app_batches} ids={len(batch_ids)} "
+                f"loans={len(loan_rows)} elapsed={time.time() - batch_t0:.1f}s"
+            )
+        repair_log(
+            f"window cache loan-only done loans={len(cache.loan_rows)} "
+            f"elapsed={time.time() - app_t0:.1f}s total_elapsed={time.time() - total_t0:.1f}s"
+        )
+        return cache
+
     cache.user_ids = source_user_ids_by_created_window(src, window)
     cache.bankcard_user_ids = source_bankcard_user_ids_by_window(src, window)
     cache.product_keys = source_user_product_keys_by_apply_date_window(src, window)
