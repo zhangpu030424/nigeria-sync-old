@@ -8,7 +8,7 @@ Old target rows typically use:
   loan.application_no          = market applicationNo
 
 New format (see ng_migration_run.format_*):
-  application_no = ng{appId:04d}-{core_sn}
+  application_no = ng{appId:04d}-{market applicationNo}
   loan_no        = ng-{core_sn}-01000
 
 Usage:
@@ -93,7 +93,7 @@ def fetch_mapping_for_old_nos(src, old_nos: List[str]) -> Dict[str, Tuple[str, s
             rows = list(cur.fetchall())
         for row in rows:
             old_no = str(row["old_no"])
-            new_app = mig.format_application_no(row.get("app_id"), row.get("core_sn"))
+            new_app = mig.format_application_no(row.get("app_id"), row.get("old_no"))
             new_loan = mig.format_loan_no(row.get("core_sn"), 1, 0)
             if new_app and new_loan:
                 out[old_no] = (new_app, new_loan)

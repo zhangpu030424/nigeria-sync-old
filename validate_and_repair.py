@@ -1626,10 +1626,15 @@ def _source_app_sn_rows(src, app_ids: Sequence[int]) -> List[dict]:
 
 
 def _target_sn_to_app_no(tgt, sn_rows: Sequence[dict]) -> Dict[str, str]:
-    """Build repay_plan.sn -> target application_no using target.application."""
+    """repay_plan.sn(core) -> target application_no; prefer market 长号后缀."""
     if not sn_rows:
         return {}
     core_sns = sorted({str(r.get("core_sn") or "").strip() for r in sn_rows if r.get("core_sn")})
+    market_by_core = {
+        str(r.get("core_sn") or "").strip(): str(r.get("market_no") or "").strip()
+        for r in sn_rows
+        if r.get("core_sn") and r.get("market_no")
+    }
     out: Dict[str, str] = {}
     for i in range(0, len(core_sns), 2000):
         part = core_sns[i:i + 2000]
@@ -1641,7 +1646,12 @@ def _target_sn_to_app_no(tgt, sn_rows: Sequence[dict]) -> Dict[str, str]:
         ):
             sn = str(row.get("sn") or "").strip()
             app_no = str(row.get("application_no") or "").strip()
-            if sn and app_no:
+            if not sn or not app_no:
+                continue
+            market_no = market_by_core.get(sn, "")
+            if market_no and app_no.endswith("-%s" % market_no):
+                out[sn] = app_no
+            elif sn not in out or len(app_no) > len(out[sn]):
                 out[sn] = app_no
     for row in sn_rows:
         core_sn = str(row.get("core_sn") or "").strip()

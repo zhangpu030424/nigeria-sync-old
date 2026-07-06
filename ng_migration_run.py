@@ -2018,15 +2018,20 @@ ID_MAPPING_COLS = ["id", "app_id", "mapping_id", "type", "event_time"]
 COUNTRY_CODE = "ng"
 
 
-def format_application_no(app_id: Any, sn: Any) -> str:
-    core_sn = str(sn or "").strip()
-    if not core_sn:
+def format_application_no(app_id: Any, suffix: Any) -> str:
+    """Target application_no: ng{appId:04d}-{market applicationNo}.
+
+    suffix 为目标单号后半段，一般为源库 market.applicationNo（如 178099546912018102），
+    不是 core.application.sn。
+    """
+    tail = str(suffix or "").strip()
+    if not tail:
         return ""
     try:
         app_id_int = int(app_id or 0)
     except (TypeError, ValueError):
         app_id_int = 0
-    return f"{COUNTRY_CODE}{app_id_int:04d}-{core_sn}"
+    return f"{COUNTRY_CODE}{app_id_int:04d}-{tail}"
 
 
 def format_loan_no(sn: Any, period: int = 1, roll_sequence: int = 0) -> str:
@@ -2037,7 +2042,8 @@ def format_loan_no(sn: Any, period: int = 1, roll_sequence: int = 0) -> str:
 
 
 def formatted_application_no_from_row(row: dict) -> str:
-    return format_application_no(row.get("app_id"), row.get("core_sn"))
+    market_no = str(row.get("application_no") or row.get("sn") or "").strip()
+    return format_application_no(row.get("app_id"), market_no)
 
 
 def source_app_ids_to_target_application_nos(src, ids: Sequence[int]) -> Dict[int, str]:
@@ -2045,16 +2051,15 @@ def source_app_ids_to_target_application_nos(src, ids: Sequence[int]) -> Dict[in
     out: Dict[int, str] = {}
     if not vals:
         return out
-    m, c = "ng_loan_market", "ng_loan_core"
+    m = "ng_loan_market"
     for i in range(0, len(vals), 5000):
         part = vals[i:i + 5000]
         ph = ",".join(["%s"] * len(part))
         with src.cursor() as cur:
             cur.execute(
                 f"""
-                SELECT a.id, a.`appId` AS app_id, ca.sn AS core_sn
+                SELECT a.id, a.`appId` AS app_id, a.applicationNo AS market_no
                 FROM {m}.application a
-                LEFT JOIN {c}.application ca ON ca.ext_sn = a.applicationNo
                 WHERE a.id IN ({ph})
                   AND a.applicationNo IS NOT NULL AND a.applicationNo <> ''
                 """,
@@ -2062,7 +2067,7 @@ def source_app_ids_to_target_application_nos(src, ids: Sequence[int]) -> Dict[in
             )
             rows = list(cur.fetchall())
         for row in rows:
-            app_no = format_application_no(row.get("app_id"), row.get("core_sn"))
+            app_no = format_application_no(row.get("app_id"), row.get("market_no"))
             if app_no:
                 out[int(row["id"])] = app_no
     return out
@@ -2277,10 +2282,11 @@ def _build_application_rows(
     for row in raw_rows:
         user_id = int(row["user_id"])
         market_sn = row.get("sn") or ""
+        market_no = str(row.get("application_no") or "").strip()
         core_sn = str(row.get("core_sn") or "").strip()
-        if not core_sn:
+        if not core_sn or not market_no:
             continue
-        application_no = format_application_no(row.get("app_id"), core_sn)
+        application_no = format_application_no(row.get("app_id"), market_no)
         if not application_no:
             continue
         apply_date = row.get("apply_date") or 0
