@@ -2,16 +2,14 @@
 # -*- coding: utf-8 -*-
 """将 application.status 与 loan.status 对齐（无大表 JOIN，避免 2013）。
 
-流程:
-  1. 分页扫 loan（due_date <= 截止日）→ 内存 application_no -> loan.status
-  2. 分批查 application.status（默认只取 status=20）
-  3. 内存比对，逐条 UPDATE application
+流程（默认从 application 出发，不扫全表 loan）:
+  1. 分页扫 application（默认 status=20）
+  2. 每批 application_no 查 loan.status（due_date <= 截止日）
+  3. 内存比对，逐条 UPDATE
 
 Usage:
   python3 sync_application_status_from_loan.py --env ./ng_migration.env --dry-run
   python3 sync_application_status_from_loan.py --env ./ng_migration.env --apply
-  python3 sync_application_status_from_loan.py --env ./ng_migration.env --apply \\
-    --due-before 2026-07-05 --app-status 20 --commit-every 50
 """
 import argparse
 import time
@@ -68,89 +66,101 @@ def _row_rank(row: dict) -> Tuple:
     )
 
 
-def load_loan_status_map(
-    tgt, due_before: str, scan_chunk: int, loan_statuses: Optional[Sequence[str]]
-) -> Dict[str, int]:
-    """分页扫 loan，同一 application_no 取 due_date/period/roll 最大的一行。"""
-    best: Dict[str, dict] = {}
-    after = ""
-    total_rows = 0
-    while True:
-        sql = """
-            SELECT loan_no, application_no, status, due_date, period, roll_sequence
-            FROM loan
-            WHERE due_date <= %s
-              AND application_no IS NOT NULL AND application_no <> ''
-              AND loan_no > %s
-            ORDER BY loan_no ASC
-            LIMIT %s
-        """
-        with tgt.cursor() as cur:
-            cur.execute(sql, (due_before, after, scan_chunk))
-            rows = list(cur.fetchall())
-        if not rows:
-            break
-        total_rows += len(rows)
-        after = str(rows[-1]["loan_no"])
-        for row in rows:
-            app_no = str(row["application_no"]).strip()
-            if not app_no:
-                continue
-            st = int(row["status"])
-            if loan_statuses and str(st) not in loan_statuses:
-                continue
-            prev = best.get(app_no)
-            if prev is None or _row_rank(row) >= _row_rank(prev):
-                best[app_no] = row
-        print(
-            "loan scan rows=%s apps=%s last=%s"
-            % (total_rows, len(best), after),
-            flush=True,
-        )
-        if len(rows) < scan_chunk:
-            break
-    return {k: int(v["status"]) for k, v in best.items()}
+def fetch_application_page(
+    tgt,
+    after: str,
+    limit: int,
+    app_status: Optional[str],
+) -> List[dict]:
+    sql = """
+        SELECT application_no, status
+        FROM application
+        WHERE application_no > %s
+    """
+    params: List = [after]
+    if app_status is not None:
+        sql += " AND status = %s"
+        params.append(int(app_status))
+    sql += " ORDER BY application_no ASC LIMIT %s"
+    params.append(limit)
+    with tgt.cursor() as cur:
+        cur.execute(sql, tuple(params))
+        return list(cur.fetchall())
 
 
-def fetch_application_status(
-    tgt, app_nos: Sequence[str]
+def fetch_loan_status_for_apps(
+    tgt,
+    app_nos: Sequence[str],
+    due_before: str,
+    loan_statuses: Optional[Sequence[str]],
 ) -> Dict[str, int]:
     if not app_nos:
         return {}
     ph = ",".join(["%s"] * len(app_nos))
+    params = tuple(app_nos) + (due_before,)
     with tgt.cursor() as cur:
         cur.execute(
-            "SELECT application_no, status FROM application WHERE application_no IN (%s)"
+            """
+            SELECT application_no, status, due_date, period, roll_sequence
+            FROM loan
+            WHERE application_no IN (%s)
+              AND due_date <= %%s
+              AND application_no IS NOT NULL AND application_no <> ''
+            """
             % ph,
-            tuple(app_nos),
+            params,
         )
-        return {
-            str(r["application_no"]): int(r["status"]) for r in cur.fetchall()
-        }
+        rows = list(cur.fetchall())
+    best: Dict[str, dict] = {}
+    for row in rows:
+        app_no = str(row["application_no"]).strip()
+        st = int(row["status"])
+        if loan_statuses and str(st) not in loan_statuses:
+            continue
+        prev = best.get(app_no)
+        if prev is None or _row_rank(row) >= _row_rank(prev):
+            best[app_no] = row
+    return {k: int(v["status"]) for k, v in best.items()}
 
 
 def build_plan(
     tgt,
-    loan_map: Dict[str, int],
+    due_before: str,
+    scan_chunk: int,
     app_status_filter: Optional[str],
-    lookup_chunk: int,
+    loan_statuses: Optional[Sequence[str]],
 ) -> Tuple[List[dict], Dict[int, int]]:
-    app_nos = sorted(loan_map.keys())
     plan: List[dict] = []
     by_loan: Dict[int, int] = defaultdict(int)
-    for i in range(0, len(app_nos), lookup_chunk):
-        part = app_nos[i : i + lookup_chunk]
-        app_status = exec_with_retry(
+    after = ""
+    total_apps = 0
+    no_loan = 0
+    while True:
+        apps = exec_with_retry(
             tgt,
-            lambda p=part: fetch_application_status(tgt, p),
-            "fetch application status",
+            lambda a=after: fetch_application_page(
+                tgt, a, scan_chunk, app_status_filter
+            ),
+            "scan application",
         )
-        for app_no in part:
-            loan_st = loan_map[app_no]
-            app_st = app_status.get(app_no)
-            if app_st is None:
-                continue
-            if app_status_filter is not None and str(app_st) != app_status_filter:
+        if not apps:
+            break
+        after = str(apps[-1]["application_no"])
+        total_apps += len(apps)
+        app_nos = [str(a["application_no"]) for a in apps]
+        loan_map = exec_with_retry(
+            tgt,
+            lambda nos=app_nos: fetch_loan_status_for_apps(
+                tgt, nos, due_before, loan_statuses
+            ),
+            "fetch loan status",
+        )
+        for app in apps:
+            app_no = str(app["application_no"])
+            app_st = int(app["status"])
+            loan_st = loan_map.get(app_no)
+            if loan_st is None:
+                no_loan += 1
                 continue
             if app_st == loan_st:
                 continue
@@ -163,10 +173,12 @@ def build_plan(
             )
             by_loan[loan_st] += 1
         print(
-            "lookup %s/%s plan=%s"
-            % (min(i + lookup_chunk, len(app_nos)), len(app_nos), len(plan)),
+            "app scan total=%s plan=%s no_loan_in_range=%s last=%s"
+            % (total_apps, len(plan), no_loan, after[:40]),
             flush=True,
         )
+        if len(apps) < scan_chunk:
+            break
     return plan, dict(by_loan)
 
 
@@ -217,15 +229,14 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument(
         "--app-status",
         default="20",
-        help="只处理 application 当前为该 status 的行；传空字符串=全部不一致",
+        help="只扫 application 中该 status；传空字符串=扫全表 application",
     )
     p.add_argument(
         "--loan-status",
         default="",
         help="只取这些 loan.status，逗号分隔，如 23,27；空=全部",
     )
-    p.add_argument("--scan-chunk", type=int, default=500, help="loan 分页大小")
-    p.add_argument("--lookup-chunk", type=int, default=100, help="application IN 批量")
+    p.add_argument("--scan-chunk", type=int, default=500, help="application 分页大小")
     p.add_argument("--commit-every", type=int, default=50)
     args = p.parse_args(argv)
     if args.apply and args.dry_run:
@@ -242,24 +253,20 @@ def main(argv: Optional[list] = None) -> int:
             "due_before=%s app_status=%s loan_status=%s dry_run=%s"
             % (
                 args.due_before,
-                app_status_filter or "ANY",
+                app_status_filter if app_status_filter is not None else "ANY",
                 loan_statuses or "ALL",
                 dry_run,
             ),
             flush=True,
         )
-        loan_map = exec_with_retry(
-            tgt,
-            lambda: load_loan_status_map(
-                tgt, args.due_before, args.scan_chunk, loan_statuses
-            ),
-            "scan loan",
-        )
-        print("loan_map apps=%s" % len(loan_map), flush=True)
         plan, by_loan = exec_with_retry(
             tgt,
             lambda: build_plan(
-                tgt, loan_map, app_status_filter, args.lookup_chunk
+                tgt,
+                args.due_before,
+                args.scan_chunk,
+                app_status_filter,
+                loan_statuses,
             ),
             "build plan",
         )
