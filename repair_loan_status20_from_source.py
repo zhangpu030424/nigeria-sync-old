@@ -2,22 +2,15 @@
 # -*- coding: utf-8 -*-
 """修复目标库中 due_date 已到期且 status=20、但 loan_no 中间段仍为 market 长号的 loan 行。
 
-范围（默认）:
-  due_date < 2026-07-01  AND  status = 20
-  loan_no 形如 ng-178178196712036899-01000（中间段 >= --min-sn-len）
-
-逻辑:
-  1. 分页扫目标库符合条件的 loan
-  2. 从 application_no 提取 market 号，批量查源库 repay_plan
-  3. 用源库拼出正确 loan_no / application_no 及 status 相关字段
-     源库无 repay_plan 时回退：目标 application.sn 仅修 loan_no（rekey_only）
-  4. 若正确 loan_no 已存在 → 用源数据 UPDATE 正确行，DELETE 长号行
-     否则 → UPDATE 长号行的 loan_no 及全部业务字段
+策略（默认 bulk）:
+  1. 一次查出目标库 due_date/status 符合条件的全部 loan
+  2. 内存中按 loan_no 中间段长度筛长号
+  3. 源库批量: ng_loan_core.application(ext_sn) + ng_loan_core.loan(sn)
+  4. 内存拼修复计划后批量写库
 
 Usage:
   python3 repair_loan_status20_from_source.py --env ./ng_migration.env --dry-run --plan-only
-  python3 repair_loan_status20_from_source.py --env ./ng_migration.env --dry-run --work-limit 10
-  python3 repair_loan_status20_from_source.py --env ./ng_migration.env --apply --commit-every 20
+  python3 repair_loan_status20_from_source.py --env ./ng_migration.env --apply --commit-every 50
 """
 import argparse
 import re
@@ -34,9 +27,9 @@ from repair_loan_no_from_audit import (
     CommitTracker,
     RepairAuditLog,
     RowChangeAuditLog,
+    cols_sql,
     exec_with_retry,
     fetch_loan_row,
-    loan_exists,
 )
 
 HERE = Path(__file__).resolve().parent
@@ -107,23 +100,184 @@ def is_long_loan_no(loan_no: str, min_sn_len: int) -> bool:
     return bool(parsed and parsed[1] >= min_sn_len)
 
 
-def scan_target_batch(
-    tgt,
-    due_before: str,
-    status: str,
-    after: str,
-    limit: int,
-) -> List[dict]:
+def load_all_target_loans(tgt, due_before: str, status: str) -> List[dict]:
+    """一次拉取目标库符合条件的全部 loan。"""
     sql = """
-        SELECT loan_no, application_no, due_date, status
+        SELECT %s
         FROM loan
-        WHERE due_date < %s AND status = %s AND loan_no > %s
+        WHERE due_date < %%s AND status = %%s
         ORDER BY loan_no ASC
-        LIMIT %s
-    """
+    """ % cols_sql(LOAN_COLS)
     with tgt.cursor() as cur:
-        cur.execute(sql, (due_before, status, after or "", limit))
+        cur.execute(sql, (due_before, status))
         return list(cur.fetchall())
+
+
+def filter_long_candidates(rows: List[dict], min_sn_len: int) -> List[dict]:
+    out = []
+    for row in rows:
+        if is_long_loan_no(str(row.get("loan_no") or ""), min_sn_len):
+            out.append(row)
+    return out
+
+
+def fetch_core_loans_by_sns(src, core_sns: List[str]) -> Dict[str, dict]:
+    """ng_loan_core.loan by sn -> repay_plan 同构字段 dict。"""
+    if not core_sns:
+        return {}
+    uniq = sorted({str(x).strip() for x in core_sns if x})
+    out: Dict[str, dict] = {}
+    c = "ng_loan_core"
+    for i in range(0, len(uniq), 2000):
+        part = uniq[i : i + 2000]
+        ph = ",".join(["%s"] * len(part))
+        with src.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT l.sn, l.start_date, l.due_date, l.prin_amt, l.interest,
+                       l.orig_fee, l.penalty, l.amt, l.`status`, l.repaid_amt,
+                       l.repay_last_time, l.settle_time, l.created_at
+                FROM {c}.loan l
+                WHERE l.sn IN ({ph})
+                """,
+                part,
+            )
+            for row in cur.fetchall():
+                sn = str(row.get("sn") or "").strip()
+                if sn:
+                    out[sn] = row
+    return out
+
+
+def fetch_core_application_by_ext_sn(
+    src, ext_sns: List[str]
+) -> Dict[str, str]:
+    """ext_sn(market applicationNo) -> core sn。"""
+    uniq = sorted({str(x).strip() for x in ext_sns if x})
+    out: Dict[str, str] = {}
+    if not uniq:
+        return out
+    c = "ng_loan_core"
+    for i in range(0, len(uniq), 2000):
+        part = uniq[i : i + 2000]
+        ph = ",".join(["%s"] * len(part))
+        with src.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT ext_sn, sn
+                FROM {c}.application
+                WHERE ext_sn IN ({ph})
+                  AND sn IS NOT NULL AND sn <> ''
+                """,
+                part,
+            )
+            for row in cur.fetchall():
+                ext = str(row.get("ext_sn") or "").strip()
+                sn = str(row.get("sn") or "").strip()
+                if ext and sn:
+                    out[ext] = sn
+    return out
+
+
+def fetch_source_loans_bulk(
+    src,
+    market_nos: List[str],
+    target_app_by_market: Optional[Dict[str, str]] = None,
+) -> Tuple[Dict[str, dict], Dict[str, str]]:
+    """market applicationNo -> 目标形态 loan 行；miss_reason。"""
+    if not market_nos:
+        return {}, {}
+    uniq = sorted({str(x).strip() for x in market_nos if x})
+    target_app_by_market = target_app_by_market or {}
+    meta = fetch_source_market_meta(src, uniq)
+    missing = [m for m in uniq if m not in meta]
+    if missing:
+        core_only = fetch_core_application_by_ext_sn(src, missing)
+        for ext_sn, core_sn in core_only.items():
+            meta[ext_sn] = (core_sn, target_app_by_market.get(ext_sn, ""))
+    core_loans = fetch_core_loans_by_sns(src, [v[0] for v in meta.values()])
+    by_market: Dict[str, dict] = {}
+    miss_reason: Dict[str, str] = {}
+    for market_no in uniq:
+        pair = meta.get(market_no)
+        if not pair:
+            miss_reason[market_no] = "no_core_application"
+            continue
+        core_sn, app_no = pair
+        if not app_no:
+            miss_reason[market_no] = "no_app_no"
+            continue
+        rp = core_loans.get(core_sn)
+        if not rp:
+            miss_reason[market_no] = "no_core_loan"
+            continue
+        by_market[market_no] = mig._build_loan_row(rp, app_no)
+    return by_market, miss_reason
+
+
+def build_rekey_row_from_before(
+    before: dict, application_no: str, core_sn: str
+) -> Optional[dict]:
+    correct = mig.format_loan_no(core_sn, 1, 0)
+    if not before or not correct:
+        return None
+    row = dict(before)
+    row["loan_no"] = correct
+    if application_no:
+        row["application_no"] = application_no
+    return row
+
+
+def build_plan_in_memory(
+    candidates: List[dict],
+    source_by_market: Dict[str, dict],
+    miss_reason: Dict[str, str],
+    target_sn_by_app: Dict[str, str],
+) -> List[dict]:
+    plan: List[dict] = []
+    for row in candidates:
+        wrong = str(row["loan_no"])
+        app_no = str(row.get("application_no") or "")
+        market_no = extract_market_no(app_no, wrong)
+        if not market_no:
+            print("skip no_market_no loan_no=%s" % wrong, flush=True)
+            continue
+
+        src_row = source_by_market.get(market_no)
+        mode = "source"
+        if not src_row:
+            core_sn = target_sn_by_app.get(app_no, "")
+            if core_sn:
+                src_row = build_rekey_row_from_before(row, app_no, core_sn)
+                mode = "rekey_only" if src_row else ""
+            if not src_row:
+                reason = miss_reason.get(market_no, "no_core_sn")
+                print(
+                    "skip no_source loan_no=%s market_no=%s reason=%s"
+                    % (wrong, market_no, reason),
+                    flush=True,
+                )
+                continue
+
+        correct = str(src_row["loan_no"])
+        if correct == wrong and mode == "source":
+            continue
+        plan.append(
+            {
+                "wrong_loan_no": wrong,
+                "correct_loan_no": correct,
+                "legacy_loan_no": "",
+                "application_no": str(src_row.get("application_no") or app_no),
+                "app_id": "",
+                "market_no": market_no,
+                "source_row": src_row,
+                "before_wrong": dict(row),
+                "sync_mode": mode,
+                "target_due_date": str(row.get("due_date") or ""),
+                "target_status": str(row.get("status") or ""),
+            }
+        )
+    return plan
 
 
 def fetch_target_sn_by_application_nos(
@@ -188,184 +342,6 @@ def fetch_source_market_meta(
     return out
 
 
-def fetch_source_loans_by_core_map(
-    src, sn_to_app_no: Dict[str, str]
-) -> Dict[str, dict]:
-    """core_sn -> 源库 loan 行。"""
-    if not sn_to_app_no:
-        return {}
-    loan_rows = mig._fetch_loan_rows_from_source(src, sn_to_app_no)
-    out: Dict[str, dict] = {}
-    for row in loan_rows:
-        app_no = str(row.get("application_no") or "")
-        m = APP_NO_RE.match(app_no)
-        if m:
-            out[m.group(1)] = row
-        loan_no = str(row.get("loan_no") or "")
-        parsed = parse_loan_middle(loan_no)
-        if parsed:
-            out.setdefault(parsed[0], row)
-    return out
-
-
-def fetch_source_loans_by_market_nos(
-    src, market_nos: List[str]
-) -> Tuple[Dict[str, dict], Dict[str, str]]:
-    """market applicationNo -> loan 行；以及未命中原因 market_no -> reason。"""
-    if not market_nos:
-        return {}, {}
-    uniq = sorted({str(x).strip() for x in market_nos if x})
-    meta = fetch_source_market_meta(src, uniq)
-    sn_to_app_no = {core: app for core, app in meta.values()}
-    by_market = fetch_source_loans_by_core_map(src, sn_to_app_no)
-    miss_reason: Dict[str, str] = {}
-    for market_no in uniq:
-        if market_no in by_market:
-            continue
-        if market_no not in meta:
-            miss_reason[market_no] = "no_market_app"
-        else:
-            miss_reason[market_no] = "no_repay_plan"
-    return by_market, miss_reason
-
-
-def build_rekey_row_from_target(
-    tgt, wrong_loan_no: str, application_no: str, core_sn: str
-) -> Optional[dict]:
-    """源库无 repay_plan 时：仅按目标行 + core_sn 拼正确 loan_no，status 等保持目标现状。"""
-    before = fetch_loan_row(tgt, wrong_loan_no)
-    if not before:
-        return None
-    correct = mig.format_loan_no(core_sn, 1, 0)
-    if not correct:
-        return None
-    row = dict(before)
-    row["loan_no"] = correct
-    if application_no:
-        row["application_no"] = application_no
-    return row
-
-
-def resolve_loan_row(
-    tgt,
-    src,
-    wrong_loan_no: str,
-    application_no: str,
-    market_no: str,
-    source_map: Dict[str, dict],
-    miss_reason: Dict[str, str],
-    target_sn_map: Dict[str, str],
-) -> Tuple[Optional[dict], str]:
-    src_row = source_map.get(market_no)
-    if src_row:
-        return src_row, "source"
-
-    app_no = str(application_no or "").strip()
-    core_sn = target_sn_map.get(app_no, "")
-    if not core_sn and app_no:
-        core_sn = fetch_target_sn_by_application_nos(tgt, [app_no]).get(app_no, "")
-        if core_sn:
-            target_sn_map[app_no] = core_sn
-
-    if core_sn and app_no:
-        src_by_core = fetch_source_loans_by_core_map(src, {core_sn: app_no})
-        src_row = src_by_core.get(market_no) or src_by_core.get(core_sn)
-        if src_row:
-            row = dict(src_row)
-            if row.get("application_no") != app_no:
-                row["application_no"] = app_no
-            return row, "source_via_target_sn"
-
-    if core_sn:
-        rekey = build_rekey_row_from_target(tgt, wrong_loan_no, app_no, core_sn)
-        if rekey:
-            return rekey, "rekey_only"
-
-    reason = miss_reason.get(market_no, "no_market_no")
-    return None, reason
-
-
-def build_plan(
-    tgt,
-    src,
-    due_before: str,
-    status: str,
-    min_sn_len: int,
-    scan_size: int,
-    work_limit: int,
-) -> List[dict]:
-    plan: List[dict] = []
-    after = ""
-    while True:
-        rows = scan_target_batch(tgt, due_before, status, after, scan_size)
-        if not rows:
-            break
-        after = str(rows[-1]["loan_no"])
-        candidates = [
-            r
-            for r in rows
-            if is_long_loan_no(str(r["loan_no"]), min_sn_len)
-        ]
-        if not candidates:
-            if len(rows) < scan_size:
-                break
-            continue
-        market_nos = [
-            extract_market_no(str(r["application_no"]), str(r["loan_no"]))
-            for r in candidates
-        ]
-        source_map, miss_reason = fetch_source_loans_by_market_nos(src, market_nos)
-        target_sn_map = fetch_target_sn_by_application_nos(
-            tgt, [str(r["application_no"]) for r in candidates]
-        )
-        for row, market_no in zip(candidates, market_nos):
-            wrong = str(row["loan_no"])
-            app_no = str(row["application_no"] or "")
-            if not market_no:
-                print("skip no_market_no loan_no=%s" % wrong, flush=True)
-                continue
-            src_row, mode = resolve_loan_row(
-                tgt,
-                src,
-                wrong,
-                app_no,
-                market_no,
-                source_map,
-                miss_reason,
-                target_sn_map,
-            )
-            if not src_row:
-                print(
-                    "skip no_source loan_no=%s market_no=%s reason=%s"
-                    % (wrong, market_no, mode),
-                    flush=True,
-                )
-                continue
-            correct = str(src_row["loan_no"])
-            if correct == wrong and mode == "source":
-                print("skip already_correct loan_no=%s" % wrong, flush=True)
-                continue
-            plan.append(
-                {
-                    "wrong_loan_no": wrong,
-                    "correct_loan_no": correct,
-                    "legacy_loan_no": "",
-                    "application_no": str(src_row.get("application_no") or app_no),
-                    "app_id": "",
-                    "market_no": market_no,
-                    "source_row": src_row,
-                    "sync_mode": mode,
-                    "target_due_date": str(row.get("due_date") or ""),
-                    "target_status": str(row.get("status") or ""),
-                }
-            )
-            if work_limit and len(plan) >= work_limit:
-                return plan
-        if len(rows) < scan_size:
-            break
-    return plan
-
-
 def _merge_source_row(before: dict, source_row: dict) -> dict:
     after = dict(before)
     for col in LOAN_COLS:
@@ -381,19 +357,23 @@ def sync_one_loan(
     audit: RepairAuditLog,
     row_audit: Optional[RowChangeAuditLog],
     tracker: Optional[CommitTracker],
+    loan_no_set: set,
+    loan_by_no: Dict[str, dict],
 ) -> str:
     wrong = plan_row["wrong_loan_no"]
     correct = plan_row["correct_loan_no"]
     source_row = plan_row["source_row"]
+    before_wrong = plan_row.get("before_wrong") or loan_by_no.get(wrong)
 
-    if not loan_exists(tgt, wrong):
-        if loan_exists(tgt, correct):
+    if wrong not in loan_no_set:
+        if correct in loan_no_set:
             audit.record("skip_done", plan_row, "wrong_missing_correct_exists")
             return "skip_done"
         audit.record("skip", plan_row, "wrong_missing")
         return "skip_missing"
 
-    before_wrong = fetch_loan_row(tgt, wrong)
+    if not before_wrong:
+        before_wrong = fetch_loan_row(tgt, wrong)
     if not before_wrong:
         audit.record("skip", plan_row, "fetch_wrong_missing")
         return "skip_missing"
@@ -402,8 +382,8 @@ def sync_one_loan(
     set_sql = ", ".join(set_parts)
     sync_vals = [source_row[c] for c in SYNC_COLS]
 
-    if loan_exists(tgt, correct) and correct != wrong:
-        before_correct = fetch_loan_row(tgt, correct)
+    if correct in loan_no_set and correct != wrong:
+        before_correct = loan_by_no.get(correct) or fetch_loan_row(tgt, correct)
         if dry_run:
             if before_correct and row_audit:
                 row_audit.record_modified(
@@ -416,7 +396,7 @@ def sync_one_loan(
             audit.record(
                 "would_sync_delete",
                 plan_row,
-                "update_correct_from_source+delete_wrong",
+                plan_row.get("sync_mode", "update_correct+delete_wrong"),
             )
             return "ok"
         if before_correct and row_audit:
@@ -437,19 +417,22 @@ def sync_one_loan(
             if not cur.rowcount:
                 audit.record("skip", plan_row, "delete_wrong_failed")
                 return "missing"
-        audit.record("sync_delete", plan_row, "update_correct+delete_wrong")
+        loan_no_set.discard(wrong)
+        loan_no_set.add(correct)
+        loan_by_no[correct] = _merge_source_row(before_correct or {}, source_row)
+        loan_by_no.pop(wrong, None)
+        audit.record("sync_delete", plan_row, plan_row.get("sync_mode", ""))
     else:
         if dry_run:
             after = _merge_source_row(before_wrong, source_row)
             if row_audit:
                 row_audit.record_modified("would_rekey_sync", before_wrong, after)
-            audit.record("would_rekey_sync", plan_row, "update_loan_no_and_fields")
+            audit.record("would_rekey_sync", plan_row, plan_row.get("sync_mode", ""))
             return "ok"
         after = _merge_source_row(before_wrong, source_row)
         with tgt.cursor() as cur:
             cur.execute(
-                "UPDATE loan SET loan_no=%%s, %s WHERE loan_no=%%s"
-                % set_sql,
+                "UPDATE loan SET loan_no=%%s, %s WHERE loan_no=%%s" % set_sql,
                 [correct] + sync_vals + [wrong],
             )
             if not cur.rowcount:
@@ -457,7 +440,11 @@ def sync_one_loan(
                 return "missing"
         if row_audit:
             row_audit.record_modified("rekey_sync", before_wrong, after)
-        audit.record("rekey_sync", plan_row, plan_row.get("sync_mode", "update_loan_no_and_fields"))
+        loan_no_set.discard(wrong)
+        loan_no_set.add(correct)
+        loan_by_no[correct] = after
+        loan_by_no.pop(wrong, None)
+        audit.record("rekey_sync", plan_row, plan_row.get("sync_mode", ""))
 
     if tracker:
         tracker.note_write()
@@ -476,8 +463,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--due-before", default="2026-07-01", help="due_date < 该日期")
     p.add_argument("--status", default="20", help="仅处理该 status")
     p.add_argument("--min-sn-len", type=int, default=15, help="loan_no 中间段最小长度")
-    p.add_argument("--scan-size", type=int, default=200)
-    p.add_argument("--commit-every", type=int, default=20)
+    p.add_argument("--commit-every", type=int, default=50)
     p.add_argument("--work-limit", type=int, default=0)
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--repair-log", default="")
@@ -489,33 +475,109 @@ def main(argv: Optional[List[str]] = None) -> int:
     dry_run = not args.apply
 
     cfg = load_env(Path(args.env))
+    repair_log = args.repair_log or (
+        "/tmp/repair_loan_status20_%s.csv"
+        % datetime.now().strftime("%Y%m%d_%H%M%S")
+    )
+    audit = RepairAuditLog(
+        repair_log if not args.no_repair_log else None,
+        enabled=not args.no_repair_log and not args.plan_only,
+    )
+    row_audit = RowChangeAuditLog(
+        repair_log, enabled=not args.no_repair_log and not args.plan_only
+    )
+
     tgt = connect_target(cfg)
     src = connect_source(cfg)
     try:
         print(
-            "scan due_before=%s status=%s min_sn_len=%s dry_run=%s"
-            % (args.due_before, args.status, args.min_sn_len, dry_run),
+            "start bulk due_before=%s status=%s min_sn_len=%s dry_run=%s plan_only=%s"
+            % (
+                args.due_before,
+                args.status,
+                args.min_sn_len,
+                dry_run,
+                args.plan_only,
+            ),
             flush=True,
         )
+        run_t0 = time.time()
+
+        print("load target loans ...", flush=True)
         t0 = time.time()
-        plan = build_plan(
+        all_loans = exec_with_retry(
             tgt,
-            src,
-            args.due_before,
-            args.status,
-            args.min_sn_len,
-            args.scan_size,
-            args.work_limit,
+            lambda: load_all_target_loans(tgt, args.due_before, args.status),
+            "load_all_target_loans",
+        )
+        loan_by_no = {str(r["loan_no"]): r for r in all_loans}
+        loan_no_set = set(loan_by_no.keys())
+        print(
+            "target_loans=%s elapsed=%.1fs"
+            % (len(all_loans), time.time() - t0),
+            flush=True,
+        )
+
+        candidates = filter_long_candidates(all_loans, args.min_sn_len)
+        print("long_loan_candidates=%s" % len(candidates), flush=True)
+        if not candidates:
+            print("no long loan_no rows", flush=True)
+            return 0
+
+        market_nos = sorted(
+            {
+                extract_market_no(
+                    str(r.get("application_no") or ""),
+                    str(r.get("loan_no") or ""),
+                )
+                for r in candidates
+            }
+            - {""}
+        )
+        target_app_by_market = {
+            extract_market_no(
+                str(r.get("application_no") or ""),
+                str(r.get("loan_no") or ""),
+            ): str(r.get("application_no") or "")
+            for r in candidates
+        }
+        target_app_by_market = {
+            k: v for k, v in target_app_by_market.items() if k and v
+        }
+        app_nos = sorted(
+            {str(r.get("application_no") or "").strip() for r in candidates} - {""}
+        )
+
+        print("load source core.loan market_nos=%s ..." % len(market_nos), flush=True)
+        t0 = time.time()
+        source_by_market, miss_reason = fetch_source_loans_bulk(
+            src, market_nos, target_app_by_market
         )
         print(
-            "repair_plan=%s elapsed=%.1fs"
-            % (len(plan), time.time() - t0),
+            "source_hits=%s miss=%s elapsed=%.1fs"
+            % (len(source_by_market), len(miss_reason), time.time() - t0),
             flush=True,
         )
+
+        print("load target application.sn app_nos=%s ..." % len(app_nos), flush=True)
+        t0 = time.time()
+        target_sn_by_app = fetch_target_sn_by_application_nos(tgt, app_nos)
+        print(
+            "target_sn_map=%s elapsed=%.1fs"
+            % (len(target_sn_by_app), time.time() - t0),
+            flush=True,
+        )
+
+        plan = build_plan_in_memory(
+            candidates, source_by_market, miss_reason, target_sn_by_app
+        )
+        if args.work_limit:
+            plan = plan[: args.work_limit]
+        print("repair_plan=%s" % len(plan), flush=True)
         for row in plan[:20]:
             src_row = row["source_row"]
             print(
-                "  %s -> %s mode=%s app=%s src_status=%s due=%s tgt_due=%s"
+                "  %s -> %s mode=%s app=%s src_status=%s due=%s"
                 % (
                     row["wrong_loan_no"],
                     row["correct_loan_no"],
@@ -523,7 +585,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                     row["application_no"],
                     src_row.get("status"),
                     src_row.get("due_date"),
-                    row.get("target_due_date"),
                 ),
                 flush=True,
             )
@@ -532,31 +593,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.plan_only:
             return 0 if plan else 1
         if not plan:
-            print("no matching loans to fix", flush=True)
             return 0
-    finally:
-        tgt.close()
-        src.close()
 
-    repair_log = args.repair_log or (
-        "/tmp/repair_loan_status20_%s.csv"
-        % datetime.now().strftime("%Y%m%d_%H%M%S")
-    )
-    audit = RepairAuditLog(
-        repair_log if not args.no_repair_log else None,
-        enabled=not args.no_repair_log,
-    )
-    row_audit = RowChangeAuditLog(repair_log, enabled=not args.no_repair_log)
-
-    tgt = connect_target(cfg)
-    try:
         ok = skip = 0
         tracker = CommitTracker(tgt, args.commit_every, dry_run)
         for i, row in enumerate(plan, 1):
             result = exec_with_retry(
                 tgt,
                 lambda r=row: sync_one_loan(
-                    tgt, r, dry_run, audit, row_audit, tracker
+                    tgt,
+                    r,
+                    dry_run,
+                    audit,
+                    row_audit,
+                    tracker,
+                    loan_no_set,
+                    loan_by_no,
                 ),
                 "sync %s" % row["wrong_loan_no"],
             )
@@ -566,13 +618,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                 skip += 1
             if i % max(1, args.log_every) == 0:
                 print(
-                    "progress ok=%s skip=%s last=%s"
-                    % (ok, skip, row["wrong_loan_no"]),
+                    "progress ok=%s skip=%s last=%s mode=%s"
+                    % (ok, skip, row["wrong_loan_no"], row.get("sync_mode", "")),
                     flush=True,
                 )
         tracker.flush()
         print(
-            "done ok=%s skip=%s repair_log=%s" % (ok, skip, repair_log),
+            "finished plan=%s ok=%s skip=%s elapsed=%.1fs repair_log=%s"
+            % (len(plan), ok, skip, time.time() - run_t0, repair_log),
             flush=True,
         )
         return 0
@@ -580,6 +633,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         audit.close()
         row_audit.close()
         tgt.close()
+        src.close()
 
 
 if __name__ == "__main__":
