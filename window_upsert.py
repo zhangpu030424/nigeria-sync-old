@@ -203,6 +203,7 @@ def load_window_upsert_cfg(env_path: str, args: argparse.Namespace) -> Dict[str,
     cfg["user_insert_batch"] = args.user_insert_batch
     cfg["app_insert_batch"] = args.app_insert_batch
     cfg["id_mapping_insert_batch"] = args.id_mapping_insert_batch
+    cfg["loan_only_batch"] = getattr(args, "loan_only_batch", 500)
     cfg["vt_preload"] = not args.no_vt_preload
     return cfg
 
@@ -225,6 +226,12 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--log-file", default="")
     p.add_argument("--reports-dir", default=str(REPORT_DIR))
     p.add_argument("--app-validate-batch", type=int, default=20000)
+    p.add_argument(
+        "--loan-only-batch",
+        type=int,
+        default=500,
+        help="--tables loan 时每批源端 app_id 数（默认 500，避免目标库大查询 2013）",
+    )
     p.add_argument("--user-insert-batch", type=int, default=5000)
     p.add_argument("--app-insert-batch", type=int, default=5000)
     p.add_argument("--id-mapping-insert-batch", type=int, default=10000)

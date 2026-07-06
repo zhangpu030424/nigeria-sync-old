@@ -1625,41 +1625,59 @@ def _source_app_sn_rows(src, app_ids: Sequence[int]) -> List[dict]:
     return out
 
 
-def _target_sn_to_app_no(tgt, sn_rows: Sequence[dict]) -> Dict[str, str]:
-    """repay_plan.sn(core) -> target application_no; prefer market 长号后缀."""
-    if not sn_rows:
-        return {}
-    core_sns = sorted({str(r.get("core_sn") or "").strip() for r in sn_rows if r.get("core_sn")})
-    market_by_core = {
-        str(r.get("core_sn") or "").strip(): str(r.get("market_no") or "").strip()
-        for r in sn_rows
-        if r.get("core_sn") and r.get("market_no")
-    }
+def _sn_to_app_no_from_source_rows(sn_rows: Sequence[dict]) -> Dict[str, str]:
+    """core_sn -> application_no，按 ng{appId}-{marketNo} 规则本地拼接（不查目标库）。"""
     out: Dict[str, str] = {}
-    for i in range(0, len(core_sns), 2000):
-        part = core_sns[i:i + 2000]
-        ph = ",".join(["%s"] * len(part))
-        for row in q_rows(
-            tgt,
-            f"SELECT sn, application_no FROM application WHERE sn IN ({ph})",
-            part,
-        ):
-            sn = str(row.get("sn") or "").strip()
-            app_no = str(row.get("application_no") or "").strip()
-            if not sn or not app_no:
-                continue
-            market_no = market_by_core.get(sn, "")
-            if market_no and app_no.endswith("-%s" % market_no):
-                out[sn] = app_no
-            elif sn not in out or len(app_no) > len(out[sn]):
-                out[sn] = app_no
+    for row in sn_rows:
+        core_sn = str(row.get("core_sn") or "").strip()
+        market_no = str(row.get("market_no") or "").strip()
+        app_id = row.get("app_id")
+        if not core_sn or not market_no or app_id is None:
+            continue
+        app_no = mig.format_application_no(app_id, market_no)
+        if app_no:
+            out[core_sn] = app_no
+    return out
+
+
+def _q_rows_target_retry(cfg: Dict[str, Any], conn, sql: str, params: Sequence[Any] = ()) -> Tuple[Any, List[dict]]:
+    last_exc: Optional[BaseException] = None
+    for attempt in range(5):
+        try:
+            rows = q_rows(conn, sql, params)
+            return conn, rows
+        except Exception as exc:
+            last_exc = exc
+            repair_log(
+                f"target query retry attempt={attempt + 1}/5 {type(exc).__name__}: {exc}"
+            )
+            if attempt >= 4:
+                raise
+            try:
+                conn = _refresh_target_conn(cfg, conn)
+            except Exception:
+                pass
+            time.sleep(2 * (attempt + 1))
+    raise last_exc  # type: ignore[misc]
+
+
+def _target_sn_to_app_no_fallback(
+    cfg: Dict[str, Any],
+    tgt,
+    sn_rows: Sequence[dict],
+    existing: Dict[str, str],
+) -> Dict[str, str]:
+    """仅对源行缺字段的少量条目，按 market_no 小查询补映射。"""
+    out = dict(existing)
+    conn = tgt
     for row in sn_rows:
         core_sn = str(row.get("core_sn") or "").strip()
         market_no = str(row.get("market_no") or "").strip()
         if not core_sn or core_sn in out or not market_no:
             continue
-        hits = q_rows(
-            tgt,
+        conn, hits = _q_rows_target_retry(
+            cfg,
+            conn,
             """
             SELECT sn, application_no FROM application
             WHERE application_no = %s OR application_no LIKE %s
@@ -1667,11 +1685,26 @@ def _target_sn_to_app_no(tgt, sn_rows: Sequence[dict]) -> Dict[str, str]:
             """,
             (market_no, "ng____-%s" % market_no),
         )
+        tgt = conn
         for hit in hits:
             sn = str(hit.get("sn") or "").strip()
             app_no = str(hit.get("application_no") or "").strip()
             if sn and app_no:
                 out[sn] = app_no
+    return out
+
+
+def _target_sn_to_app_no(
+    cfg: Dict[str, Any],
+    tgt,
+    sn_rows: Sequence[dict],
+) -> Dict[str, str]:
+    """repay_plan.sn(core) -> target application_no; 优先源数据拼接，避免大 IN 查询 2013。"""
+    if not sn_rows:
+        return {}
+    out = _sn_to_app_no_from_source_rows(sn_rows)
+    if len(out) < len({str(r.get("core_sn") or "").strip() for r in sn_rows if r.get("core_sn")}):
+        out = _target_sn_to_app_no_fallback(cfg, tgt, sn_rows, out)
     return out
 
 
@@ -1682,7 +1715,7 @@ def _load_loan_only_batch(
     app_ids: Sequence[int],
 ) -> List[dict]:
     sn_rows = _source_app_sn_rows(src, app_ids)
-    sn_to_app_no = _target_sn_to_app_no(tgt, sn_rows)
+    sn_to_app_no = _target_sn_to_app_no(cfg, tgt, sn_rows)
     if not sn_to_app_no:
         repair_log(
             f"loan-only batch ids={len(set(app_ids))} sn_rows={len(sn_rows)} "
@@ -1724,6 +1757,10 @@ def load_window_source_cache(
         )
         if tgt is None:
             raise ValueError("loan-only window cache requires target connection (tgt)")
+        loan_batch = max(1, int(cfg.get("loan_only_batch", 500)))
+        if batch_size > loan_batch:
+            repair_log(f"loan-only batch_size capped {batch_size} -> {loan_batch}")
+            batch_size = loan_batch
         app_batches = max(1, (len(cache.all_app_ids) + batch_size - 1) // batch_size) if cache.all_app_ids else 0
         app_t0 = time.time()
         for batch_no, i in enumerate(range(0, len(cache.all_app_ids), batch_size), start=1):
