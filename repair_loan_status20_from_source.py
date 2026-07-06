@@ -638,6 +638,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "repair_plan=%s modes=%s"
             % (len(plan), modes),
             flush=True,
+        )
         for row in plan[:20]:
             src_row = row["source_row"]
             print(
