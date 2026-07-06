@@ -6,12 +6,15 @@
   1. ext_sn = loan_no 中间段 或 application_no 后缀
   2. 源库: SELECT sn FROM ng_loan_core.application WHERE ext_sn = ?
   3. 源库: SELECT * FROM ng_loan_core.repay_plan WHERE sn = ?（max plan_sn）
-  4. 原地 UPDATE loan_no = ng-{core_sn}-01000 + 同步字段；correct 已存在或 1062 则 skip
+  4. 原地 UPDATE loan_no = ng-{core_sn}-01000；若短号行已存在则删长号行并同步短号行
 
 短号 loan_no（中间段为 core sn）:
   1. core_sn = loan_no 中间段
   2. 源库: SELECT * FROM ng_loan_core.repay_plan WHERE sn = ?
   3. 仅 UPDATE status/金额/日期等，不改 loan_no；失败则 skip
+
+同一 loan_no 重复行（application_no 后缀误用 core sn）:
+  删除 ng0564-{core_sn} 行，保留 ng{appId}-{market 长号} 行（按主键删，不限 status）
 
 Usage:
   python3 repair_loan_status20_from_source.py --env ./ng_migration.env --dry-run --plan-only
@@ -22,6 +25,7 @@ import hashlib
 import multiprocessing
 import re
 import time
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -36,6 +40,7 @@ from repair_loan_no_from_audit import (
     RowChangeAuditLog,
     cols_sql,
     exec_with_retry,
+    fetch_loan_row,
     loan_exists,
 )
 
@@ -120,6 +125,93 @@ def is_plausible_core_sn(sn: str, market_no: str = "", min_sn_len: int = 15) -> 
     return len(s) < min_sn_len
 
 
+def is_wrong_application_no(
+    application_no: str, loan_no: str, min_sn_len: int
+) -> bool:
+    """application_no 后缀误用 core sn（如 ng0564-217819556201），应为 market 长号。"""
+    m = APP_NO_RE.match(str(application_no or "").strip())
+    if not m:
+        return False
+    suffix = m.group(1).strip()
+    parsed = parse_loan_middle(loan_no)
+    if not parsed:
+        return False
+    core_sn = parsed[0]
+    return suffix == core_sn and len(suffix) < min_sn_len
+
+
+def load_loans_for_dup_check(tgt, due_before: str) -> List[dict]:
+    """due_date 范围内全部 loan（不限 status），用于查重复 loan_no。"""
+    sql = """
+        SELECT %s FROM loan WHERE due_date < %%s ORDER BY loan_no ASC
+    """ % cols_sql(LOAN_COLS)
+    with tgt.cursor() as cur:
+        cur.execute(sql, (due_before,))
+        return list(cur.fetchall())
+
+
+def group_dup_loan_nos(rows: List[dict]) -> Dict[str, List[dict]]:
+    grouped: Dict[str, List[dict]] = defaultdict(list)
+    for row in rows:
+        ln = str(row.get("loan_no") or "").strip()
+        if ln:
+            grouped[ln].append(row)
+    return {k: v for k, v in grouped.items() if len(v) > 1}
+
+
+def build_dup_app_no_plan(
+    dup_groups: Dict[str, List[dict]], min_sn_len: int
+) -> Tuple[List[dict], Dict[str, int]]:
+    """同一 loan_no 多行：删 application_no 后缀为 core sn 的错行。"""
+    plan: List[dict] = []
+    stats: Dict[str, int] = {}
+    seen_pk = set()
+    for loan_no, rows in sorted(dup_groups.items()):
+        wrong_rows = [
+            r for r in rows
+            if is_wrong_application_no(str(r.get("application_no") or ""), loan_no, min_sn_len)
+        ]
+        good_rows = [
+            r for r in rows
+            if not is_wrong_application_no(str(r.get("application_no") or ""), loan_no, min_sn_len)
+        ]
+        if not wrong_rows or not good_rows:
+            stats["skip_dup_no_pattern"] = stats.get("skip_dup_no_pattern", 0) + len(rows)
+            continue
+        keep = good_rows[0]
+        for w in wrong_rows:
+            pk = (
+                str(w.get("application_no") or ""),
+                w.get("period", 1),
+                w.get("roll_sequence", 0),
+            )
+            if pk in seen_pk:
+                continue
+            seen_pk.add(pk)
+            plan.append(
+                {
+                    "loan_no": loan_no,
+                    "correct_loan_no": loan_no,
+                    "application_no": pk[0],
+                    "source_row": {},
+                    "before": dict(w),
+                    "mode": "drop_wrong_app_no",
+                    "update_cols": [],
+                    "keep_application_no": str(keep.get("application_no") or ""),
+                }
+            )
+            stats["drop_wrong_app_no"] = stats.get("drop_wrong_app_no", 0) + 1
+    return plan, stats
+
+
+def row_pk(row: dict) -> Tuple[str, object, object]:
+    return (
+        str(row.get("application_no") or ""),
+        row.get("period", 1),
+        row.get("roll_sequence", 0),
+    )
+
+
 def load_all_target_loans(tgt, due_before: str, status: str) -> List[dict]:
     sql = """
         SELECT %s
@@ -171,6 +263,58 @@ def fetch_repay_plan_by_sns(src, core_sns: List[str]) -> Dict[str, dict]:
     return out
 
 
+def fetch_market_app_no_by_ext_sn(src, ext_sns: List[str]) -> Dict[str, str]:
+    """ext_sn(market applicationNo) -> 目标 application_no。"""
+    uniq = sorted({str(x).strip() for x in ext_sns if x})
+    out: Dict[str, str] = {}
+    if not uniq:
+        return out
+    m = "ng_loan_market"
+    for i in range(0, len(uniq), 2000):
+        part = uniq[i : i + 2000]
+        ph = ",".join(["%s"] * len(part))
+        with src.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT applicationNo AS ext_sn, `appId` AS app_id
+                FROM {m}.application
+                WHERE applicationNo IN ({ph})
+                """,
+                part,
+            )
+            for row in cur.fetchall():
+                ext = str(row.get("ext_sn") or "").strip()
+                app_no = mig.format_application_no(row.get("app_id"), ext)
+                if ext and app_no:
+                    out[ext] = app_no
+    return out
+
+
+def fetch_short_loan_by_app_nos(
+    tgt, app_nos: List[str], min_sn_len: int
+) -> Dict[str, str]:
+    """application_no -> 短号 loan_no（目标库已有行，不限 status）。"""
+    uniq = sorted({str(x).strip() for x in app_nos if x})
+    out: Dict[str, str] = {}
+    if not uniq:
+        return out
+    for i in range(0, len(uniq), 2000):
+        part = uniq[i : i + 2000]
+        ph = ",".join(["%s"] * len(part))
+        with tgt.cursor() as cur:
+            cur.execute(
+                f"SELECT loan_no, application_no FROM loan WHERE application_no IN ({ph})",
+                part,
+            )
+            for row in cur.fetchall():
+                app_no = str(row.get("application_no") or "").strip()
+                ln = str(row.get("loan_no") or "").strip()
+                parsed = parse_loan_middle(ln)
+                if app_no and parsed and parsed[1] < min_sn_len:
+                    out[app_no] = ln
+    return out
+
+
 def fetch_core_application_by_ext_sn(src, ext_sns: List[str]) -> Dict[str, str]:
     uniq = sorted({str(x).strip() for x in ext_sns if x})
     out: Dict[str, str] = {}
@@ -202,29 +346,38 @@ def fetch_source_for_long(
     src,
     ext_sns: List[str],
     target_app_by_ext: Dict[str, str],
+    market_app_by_ext: Dict[str, str],
     min_sn_len: int,
-) -> Dict[str, dict]:
+) -> Tuple[Dict[str, dict], Dict[str, int]]:
     """ext_sn -> 目标形态 loan 行（application + repay_plan）。"""
     uniq = sorted({str(x).strip() for x in ext_sns if x})
+    stats: Dict[str, int] = {"ext_sn": len(uniq)}
     core_by_ext = fetch_core_application_by_ext_sn(src, uniq)
-    core_sns = []
+    stats["core_hit"] = len(core_by_ext)
+    core_sns: List[str] = []
     ext_to_pair: Dict[str, Tuple[str, str]] = {}
     for ext_sn in uniq:
         core_sn = core_by_ext.get(ext_sn, "")
-        app_no = target_app_by_ext.get(ext_sn, "")
         if not core_sn or not is_plausible_core_sn(core_sn, ext_sn, min_sn_len):
+            stats["skip_no_core"] = stats.get("skip_no_core", 0) + 1
             continue
+        app_no = target_app_by_ext.get(ext_sn, "") or market_app_by_ext.get(ext_sn, "")
         if not app_no:
+            stats["skip_no_app_no"] = stats.get("skip_no_app_no", 0) + 1
             continue
         ext_to_pair[ext_sn] = (core_sn, app_no)
         core_sns.append(core_sn)
     repay_plans = fetch_repay_plan_by_sns(src, core_sns)
+    stats["repay_hit"] = len(repay_plans)
     out: Dict[str, dict] = {}
     for ext_sn, (core_sn, app_no) in ext_to_pair.items():
         rp = repay_plans.get(core_sn)
-        if rp:
-            out[ext_sn] = mig._build_loan_row(rp, app_no)
-    return out
+        if not rp:
+            stats["skip_no_repay"] = stats.get("skip_no_repay", 0) + 1
+            continue
+        out[ext_sn] = mig._build_loan_row(rp, app_no)
+    stats["source_hit"] = len(out)
+    return out, stats
 
 
 def diff_update_cols(before: dict, source: dict) -> List[str]:
@@ -265,6 +418,8 @@ def build_plan(
     candidates: List[dict],
     source_by_ext: Dict[str, dict],
     repay_by_core_sn: Dict[str, dict],
+    short_loan_by_app: Dict[str, str],
+    target_app_by_ext: Dict[str, str],
     min_sn_len: int,
 ) -> Tuple[List[dict], Dict[str, int]]:
     plan: List[dict] = []
@@ -280,7 +435,28 @@ def build_plan(
                 continue
             src_row = source_by_ext.get(ext_sn)
             if not src_row:
-                stats["skip_no_source_long"] = stats.get("skip_no_source_long", 0) + 1
+                # 源库无 repay_plan：若目标库已有短号行，仅删长号残留
+                app_key = (
+                    str(row.get("application_no") or "").strip()
+                    or target_app_by_ext.get(ext_sn, "")
+                )
+                correct = short_loan_by_app.get(app_key, "") if app_key else ""
+                if correct and correct != loan_no:
+                    plan.append(
+                        {
+                            "loan_no": loan_no,
+                            "correct_loan_no": correct,
+                            "application_no": app_key,
+                            "source_row": {},
+                            "before": dict(row),
+                            "mode": "drop_long_only",
+                            "update_cols": [],
+                            "ext_sn": ext_sn,
+                        }
+                    )
+                    stats["drop_long_only"] = stats.get("drop_long_only", 0) + 1
+                else:
+                    stats["skip_no_source_long"] = stats.get("skip_no_source_long", 0) + 1
                 continue
             correct = str(src_row["loan_no"])
             update_cols = diff_update_cols(row, src_row)
@@ -347,6 +523,46 @@ def _sync_update(tgt, loan_no: str, source_row: dict, cols: List[str]) -> int:
         return cur.rowcount
 
 
+def _delete_loan_row(tgt, row: dict) -> int:
+    """按主键 (application_no, period, roll_sequence) 删除单行。"""
+    with tgt.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM loan
+            WHERE application_no=%s AND period=%s AND roll_sequence=%s
+            """,
+            (
+                row["application_no"],
+                row.get("period", 1),
+                row.get("roll_sequence", 0),
+            ),
+        )
+        return cur.rowcount
+
+
+def _loan_row_exists(tgt, row: dict) -> bool:
+    with tgt.cursor() as cur:
+        cur.execute(
+            """
+            SELECT 1 FROM loan
+            WHERE application_no=%s AND period=%s AND roll_sequence=%s
+            LIMIT 1
+            """,
+            (
+                row["application_no"],
+                row.get("period", 1),
+                row.get("roll_sequence", 0),
+            ),
+        )
+        return cur.fetchone() is not None
+
+
+def _delete_loan(tgt, loan_no: str) -> int:
+    with tgt.cursor() as cur:
+        cur.execute("DELETE FROM loan WHERE loan_no=%s", (loan_no,))
+        return cur.rowcount
+
+
 def _rekey_update(
     tgt, loan_no: str, correct: str, source_row: dict, cols: List[str]
 ) -> int:
@@ -375,32 +591,110 @@ def apply_one_loan(
     source_row = plan_row["source_row"]
     correct = plan_row["correct_loan_no"]
     before = plan_row["before"]
-    update_cols = diff_update_cols(before, source_row)
+    update_cols = diff_update_cols(before, source_row) if source_row else []
     audit_row = _plan_audit_row(plan_row)
-    cols_hint = ",".join(update_cols) if update_cols else "loan_no"
+    cols_hint = ",".join(update_cols) if update_cols else "-"
 
-    if mode == "rekey_long":
-        if loan_exists(tgt, correct) and correct != loan_no:
-            audit.record("skip", audit_row, "correct_loan_no_exists")
-            return "skip"
-        after = _build_after(before, source_row, update_cols, correct)
+    if mode == "drop_wrong_app_no":
+        keep = plan_row.get("keep_application_no") or ""
         if dry_run:
             if row_audit:
-                row_audit.record_modified("would_rekey_long", before, after)
-            audit.record("would_rekey_long", audit_row, "rekey_long:%s" % cols_hint)
+                row_audit.record_deleted("would_delete_wrong_app_no", before)
+            audit.record(
+                "would_drop_wrong_app_no",
+                audit_row,
+                "keep=%s" % keep,
+            )
             return "ok"
         try:
-            if not _rekey_update(tgt, loan_no, correct, source_row, update_cols):
+            if not _delete_loan_row(tgt, before):
                 tgt.rollback()
-                audit.record("skip", audit_row, "rekey_no_row")
+                audit.record("skip", audit_row, "delete_wrong_app_no_failed")
                 return "skip"
+            if row_audit:
+                row_audit.record_deleted("delete_wrong_app_no", before)
         except pymysql.err.IntegrityError as exc:
             tgt.rollback()
-            audit.record("skip", audit_row, "rekey_duplicate:%s" % exc)
+            audit.record("skip", audit_row, "drop_wrong_app_no:%s" % exc)
             return "skip"
-        if row_audit:
-            row_audit.record_modified("rekey_long", before, after)
-        audit.record("rekey_long", audit_row, "rekey_long:%s" % cols_hint)
+        audit.record("drop_wrong_app_no", audit_row, "keep=%s" % keep)
+    elif mode == "drop_long_only":
+        if dry_run:
+            if row_audit:
+                row_audit.record_deleted("would_delete_long", before)
+            audit.record("would_drop_long_only", audit_row, "drop_long_only")
+            return "ok"
+        try:
+            if not _delete_loan_row(tgt, before):
+                tgt.rollback()
+                audit.record("skip", audit_row, "delete_long_failed")
+                return "skip"
+            if row_audit:
+                row_audit.record_deleted("delete_long", before)
+        except pymysql.err.IntegrityError as exc:
+            tgt.rollback()
+            audit.record("skip", audit_row, "drop_long_only:%s" % exc)
+            return "skip"
+        audit.record("drop_long_only", audit_row, "drop_long_only")
+    elif mode == "rekey_long":
+        if loan_exists(tgt, correct) and correct != loan_no:
+            before_correct = fetch_loan_row(tgt, correct) or {}
+            cols_on_correct = diff_update_cols(before_correct, source_row)
+            hint = ",".join(cols_on_correct) if cols_on_correct else "-"
+            if dry_run:
+                if row_audit:
+                    row_audit.record_deleted("would_delete_long", before)
+                    if cols_on_correct:
+                        row_audit.record_modified(
+                            "would_sync_correct",
+                            before_correct,
+                            _build_after(before_correct, source_row, cols_on_correct, correct),
+                        )
+                audit.record("would_drop_long", audit_row, "drop_long:%s" % hint)
+                return "ok"
+            try:
+                if _loan_row_exists(tgt, before):
+                    if not _delete_loan_row(tgt, before):
+                        tgt.rollback()
+                        audit.record("skip", audit_row, "delete_long_failed")
+                        return "skip"
+                    if row_audit:
+                        row_audit.record_deleted("delete_long", before)
+                if cols_on_correct:
+                    if not _sync_update(tgt, correct, source_row, cols_on_correct):
+                        tgt.rollback()
+                        audit.record("skip", audit_row, "sync_correct_no_row")
+                        return "skip"
+                    if row_audit:
+                        row_audit.record_modified(
+                            "sync_correct",
+                            before_correct,
+                            _build_after(before_correct, source_row, cols_on_correct, correct),
+                        )
+            except pymysql.err.IntegrityError as exc:
+                tgt.rollback()
+                audit.record("skip", audit_row, "drop_long_duplicate:%s" % exc)
+                return "skip"
+            audit.record("drop_long", audit_row, "drop_long:%s" % hint)
+        else:
+            after = _build_after(before, source_row, update_cols, correct)
+            if dry_run:
+                if row_audit:
+                    row_audit.record_modified("would_rekey_long", before, after)
+                audit.record("would_rekey_long", audit_row, "rekey_long:%s" % cols_hint)
+                return "ok"
+            try:
+                if not _rekey_update(tgt, loan_no, correct, source_row, update_cols):
+                    tgt.rollback()
+                    audit.record("skip", audit_row, "rekey_no_row")
+                    return "skip"
+            except pymysql.err.IntegrityError as exc:
+                tgt.rollback()
+                audit.record("skip", audit_row, "rekey_duplicate:%s" % exc)
+                return "skip"
+            if row_audit:
+                row_audit.record_modified("rekey_long", before, after)
+            audit.record("rekey_long", audit_row, "rekey_long:%s" % cols_hint)
     else:
         if not update_cols:
             audit.record("skip", audit_row, "already_ok")
@@ -592,6 +886,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--repair-log", default="")
     p.add_argument("--no-repair-log", action="store_true")
     p.add_argument("--long-only", action="store_true")
+    p.add_argument(
+        "--no-fix-dup-app-no",
+        action="store_true",
+        help="不删重复 loan_no 下 application_no 后缀为 core sn 的错行",
+    )
     p.add_argument("--plan-only", action="store_true")
     args = p.parse_args(argv)
     if args.apply and args.dry_run:
@@ -621,13 +920,42 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         run_t0 = time.time()
 
+        dup_plan: List[dict] = []
+        dup_stats: Dict[str, int] = {}
+        dup_skip_pks = set()
+        if not args.no_fix_dup_app_no:
+            dup_rows = exec_with_retry(
+                tgt,
+                lambda: load_loans_for_dup_check(tgt, args.due_before),
+                "load dup check",
+            )
+            dup_plan, dup_stats = build_dup_app_no_plan(
+                group_dup_loan_nos(dup_rows), args.min_sn_len
+            )
+            dup_skip_pks = {row_pk(p["before"]) for p in dup_plan}
+            print(
+                "dup_plan=%s dup_stats=%s (due_before only, all status)"
+                % (len(dup_plan), dup_stats),
+                flush=True,
+            )
+            for row in dup_plan[:10]:
+                print(
+                    "  dup %s drop_app=%s keep_app=%s"
+                    % (
+                        row["loan_no"],
+                        row["before"].get("application_no"),
+                        row.get("keep_application_no"),
+                    ),
+                    flush=True,
+                )
+
         all_loans = exec_with_retry(
             tgt,
             lambda: load_all_target_loans(tgt, args.due_before, args.status),
             "load loans",
         )
-        print("target_loans=%s" % len(all_loans), flush=True)
-        if not all_loans:
+        print("target_loans=%s status=%s" % (len(all_loans), args.status), flush=True)
+        if not all_loans and not dup_plan:
             return 0
 
         candidates = (
@@ -635,6 +963,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             if args.long_only
             else all_loans
         )
+        if dup_skip_pks:
+            candidates = [r for r in candidates if row_pk(r) not in dup_skip_pks]
         long_n = sum(
             1 for r in candidates
             if is_long_loan_no(str(r.get("loan_no") or ""), args.min_sn_len)
@@ -648,35 +978,57 @@ def main(argv: Optional[List[str]] = None) -> int:
         ext_sns: List[str] = []
         core_sns: List[str] = []
         target_app_by_ext: Dict[str, str] = {}
+        long_app_nos: List[str] = []
         for r in candidates:
             loan_no = str(r.get("loan_no") or "")
-            app_no = str(r.get("application_no") or "")
+            app_no = str(r.get("application_no") or "").strip()
             if is_long_loan_no(loan_no, args.min_sn_len):
                 ext = extract_market_no(app_no, loan_no)
                 if ext:
                     ext_sns.append(ext)
                     if app_no:
                         target_app_by_ext[ext] = app_no
+                        long_app_nos.append(app_no)
             else:
                 parsed = parse_loan_middle(loan_no)
                 if parsed and is_plausible_core_sn(parsed[0], "", args.min_sn_len):
                     core_sns.append(parsed[0])
 
-        print("load source long ext_sn=%s short core_sn=%s ..." % (len(set(ext_sns)), len(set(core_sns))), flush=True)
+        uniq_ext = sorted(set(ext_sns))
+        print(
+            "load source long ext_sn=%s short core_sn=%s ..."
+            % (len(uniq_ext), len(set(core_sns))),
+            flush=True,
+        )
         t0 = time.time()
-        source_by_ext = fetch_source_for_long(
-            src, sorted(set(ext_sns)), target_app_by_ext, args.min_sn_len
+        market_app_by_ext = fetch_market_app_no_by_ext_sn(src, uniq_ext)
+        for ext, app_no in market_app_by_ext.items():
+            target_app_by_ext.setdefault(ext, app_no)
+        source_by_ext, source_stats = fetch_source_for_long(
+            src, uniq_ext, target_app_by_ext, market_app_by_ext, args.min_sn_len
         )
         repay_by_core_sn = fetch_repay_plan_by_sns(src, sorted(set(core_sns)))
+        short_loan_by_app = fetch_short_loan_by_app_nos(
+            tgt, list(set(long_app_nos) | set(target_app_by_ext.values())), args.min_sn_len
+        )
         print(
-            "source long_hits=%s short_repay_hits=%s elapsed=%.1fs"
-            % (len(source_by_ext), len(repay_by_core_sn), time.time() - t0),
+            "source_stats=%s short_in_target=%s short_repay_hits=%s elapsed=%.1fs"
+            % (source_stats, len(short_loan_by_app), len(repay_by_core_sn), time.time() - t0),
             flush=True,
         )
 
         plan, plan_stats = build_plan(
-            candidates, source_by_ext, repay_by_core_sn, args.min_sn_len
+            candidates,
+            source_by_ext,
+            repay_by_core_sn,
+            short_loan_by_app,
+            target_app_by_ext,
+            args.min_sn_len,
         )
+        if dup_plan:
+            plan = dup_plan + plan
+            for k, v in dup_stats.items():
+                plan_stats[k] = plan_stats.get(k, 0) + v
         if args.work_limit:
             plan = plan[: args.work_limit]
         print("repair_plan=%s plan_stats=%s" % (len(plan), plan_stats), flush=True)
@@ -688,7 +1040,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     row["mode"],
                     ",".join(row.get("update_cols") or []) or "-",
                     row["before"].get("status"),
-                    row["source_row"].get("status"),
+                    (row.get("source_row") or {}).get("status"),
                 ),
                 flush=True,
             )
