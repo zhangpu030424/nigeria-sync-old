@@ -15,6 +15,7 @@
 
 同一 loan_no 重复行（application_no 后缀误用 core sn）:
   删除 ng0564-{core_sn} 行，保留 ng{appId}-{market 长号} 行（按主键删，不限 status）
+  若同一 market 长号多行（如 ng0562-178... vs ng20572350-178...）：以源库 market 为准，否则留更长 application_no
 
 Usage:
   python3 repair_loan_status20_from_source.py --env ./ng_migration.env --dry-run --plan-only
@@ -53,7 +54,12 @@ UPDATE_COLS = [
     c for c in SYNC_COLS if c not in ("application_no", "period", "roll_sequence")
 ]
 LOAN_NO_RE = re.compile(r"^[Nn][Gg]-(\d+)-(\d{5})$")
-APP_NO_RE = re.compile(r"^ng\d{4}-(.+)$", re.I)
+APP_NO_RE = re.compile(r"^ng\d+-(.+)$", re.I)
+
+
+def app_no_market_suffix(application_no: str) -> str:
+    m = APP_NO_RE.match(str(application_no or "").strip())
+    return m.group(1).strip() if m else ""
 
 
 def load_env(path: Path) -> Dict[str, str]:
@@ -160,10 +166,71 @@ def group_dup_loan_nos(rows: List[dict]) -> Dict[str, List[dict]]:
     return {k: v for k, v in grouped.items() if len(v) > 1}
 
 
-def report_dup_loan_nos(
+def collect_ext_sns_from_dup_groups(
     dup_groups: Dict[str, List[dict]], min_sn_len: int
+) -> List[str]:
+    ext_sns = set()
+    for rows in dup_groups.values():
+        for r in rows:
+            suffix = app_no_market_suffix(str(r.get("application_no") or ""))
+            if suffix and len(suffix) >= min_sn_len:
+                ext_sns.add(suffix)
+    return sorted(ext_sns)
+
+
+def resolve_dup_keep_and_drop(
+    loan_no: str,
+    rows: List[dict],
+    market_app_by_ext: Dict[str, str],
+    min_sn_len: int,
+) -> Tuple[List[dict], Optional[dict], str]:
+    """判定重复 loan_no 下删哪些、留哪行。返回 (drop_rows, keep_row, reason)。"""
+    wrong_core = [
+        r for r in rows
+        if is_wrong_application_no(str(r.get("application_no") or ""), loan_no, min_sn_len)
+    ]
+    good_core = [
+        r for r in rows
+        if not is_wrong_application_no(str(r.get("application_no") or ""), loan_no, min_sn_len)
+    ]
+    if wrong_core and good_core:
+        return wrong_core, good_core[0], "core_sn_suffix"
+
+    suffixes = [app_no_market_suffix(str(r.get("application_no") or "")) for r in rows]
+    uniq_suffix = {s for s in suffixes if s}
+    if len(uniq_suffix) == 1 and len(rows) > 1:
+        ext_sn = next(iter(uniq_suffix))
+        canonical = str(market_app_by_ext.get(ext_sn) or "").strip()
+        if canonical:
+            keep = None
+            drop = []
+            for r in rows:
+                if str(r.get("application_no") or "").strip() == canonical:
+                    keep = r
+                else:
+                    drop.append(r)
+            if keep and drop:
+                return drop, keep, "market_canonical"
+
+        # 同源 market 长号、不同 appId 前缀：保留更长/更完整 application_no
+        keep = max(
+            rows,
+            key=lambda r: len(str(r.get("application_no") or "")),
+        )
+        drop = [r for r in rows if row_pk(r) != row_pk(keep)]
+        if drop:
+            return drop, keep, "same_ext_keep_longest_app_no"
+
+    return [], None, ""
+
+
+def report_dup_loan_nos(
+    dup_groups: Dict[str, List[dict]],
+    min_sn_len: int,
+    market_app_by_ext: Optional[Dict[str, str]] = None,
 ) -> Dict[str, int]:
     """打印同一 loan_no 多行明细，返回统计。"""
+    market_app_by_ext = market_app_by_ext or {}
     stats = {
         "dup_loan_no_count": len(dup_groups),
         "dup_row_count": sum(len(v) for v in dup_groups.values()),
@@ -177,49 +244,49 @@ def report_dup_loan_nos(
         flush=True,
     )
     for loan_no, rows in sorted(dup_groups.items()):
-        wrong_rows = [
-            r for r in rows
-            if is_wrong_application_no(str(r.get("application_no") or ""), loan_no, min_sn_len)
-        ]
-        good_rows = [
-            r for r in rows
-            if not is_wrong_application_no(str(r.get("application_no") or ""), loan_no, min_sn_len)
-        ]
-        if wrong_rows and good_rows:
+        drop_rows, keep, reason = resolve_dup_keep_and_drop(
+            loan_no, rows, market_app_by_ext, min_sn_len
+        )
+        if drop_rows and keep:
             tag = "auto_fixable"
             stats["auto_fixable"] += 1
         else:
             tag = "need_manual"
             stats["need_manual"] += 1
-        stats["wrong_app_rows"] += len(wrong_rows)
+        wrong_core_n = sum(
+            1 for r in rows
+            if is_wrong_application_no(str(r.get("application_no") or ""), loan_no, min_sn_len)
+        )
+        stats["wrong_app_rows"] += wrong_core_n
         print(
-            "\nloan_no=%s rows=%s pattern=%s"
-            % (loan_no, len(rows), tag),
+            "\nloan_no=%s rows=%s pattern=%s reason=%s"
+            % (loan_no, len(rows), tag, reason or "-"),
             flush=True,
         )
         for r in rows:
             app_no = str(r.get("application_no") or "")
             if is_wrong_application_no(app_no, loan_no, min_sn_len):
                 row_tag = "wrong_core_sn_suffix"
+            elif keep and row_pk(r) == row_pk(keep):
+                row_tag = "keep"
+            elif r in drop_rows:
+                row_tag = "drop"
             else:
-                row_tag = "ok_market_suffix"
+                row_tag = "other"
             print(
-                "  [%s] application_no=%s status=%s due=%s principal=%s"
-                % (
-                    row_tag,
-                    app_no,
-                    r.get("status"),
-                    r.get("due_date"),
-                    r.get("principal"),
-                ),
+                "  [%s] application_no=%s status=%s due=%s"
+                % (row_tag, app_no, r.get("status"), r.get("due_date")),
                 flush=True,
             )
-        if wrong_rows and good_rows:
+        if drop_rows and keep:
+            ext_sn = app_no_market_suffix(str(keep.get("application_no") or ""))
+            canonical = market_app_by_ext.get(ext_sn, "")
             print(
-                "  => suggest: DELETE %s KEEP %s"
+                "  => DELETE %s KEEP %s canonical=%s"
                 % (
-                    [str(w.get("application_no")) for w in wrong_rows],
-                    str(good_rows[0].get("application_no")),
+                    [str(w.get("application_no")) for w in drop_rows],
+                    str(keep.get("application_no")),
+                    canonical or "-",
                 ),
                 flush=True,
             )
@@ -232,31 +299,24 @@ def report_dup_loan_nos(
 
 
 def build_dup_app_no_plan(
-    dup_groups: Dict[str, List[dict]], min_sn_len: int
+    dup_groups: Dict[str, List[dict]],
+    min_sn_len: int,
+    market_app_by_ext: Optional[Dict[str, str]] = None,
 ) -> Tuple[List[dict], Dict[str, int]]:
-    """同一 loan_no 多行：删 application_no 后缀为 core sn 的错行。"""
+    """同一 loan_no 多行：删错 application_no，保留 market canonical 行。"""
+    market_app_by_ext = market_app_by_ext or {}
     plan: List[dict] = []
     stats: Dict[str, int] = {}
     seen_pk = set()
     for loan_no, rows in sorted(dup_groups.items()):
-        wrong_rows = [
-            r for r in rows
-            if is_wrong_application_no(str(r.get("application_no") or ""), loan_no, min_sn_len)
-        ]
-        good_rows = [
-            r for r in rows
-            if not is_wrong_application_no(str(r.get("application_no") or ""), loan_no, min_sn_len)
-        ]
-        if not wrong_rows or not good_rows:
+        drop_rows, keep, reason = resolve_dup_keep_and_drop(
+            loan_no, rows, market_app_by_ext, min_sn_len
+        )
+        if not drop_rows or not keep:
             stats["skip_dup_no_pattern"] = stats.get("skip_dup_no_pattern", 0) + len(rows)
             continue
-        keep = good_rows[0]
-        for w in wrong_rows:
-            pk = (
-                str(w.get("application_no") or ""),
-                w.get("period", 1),
-                w.get("roll_sequence", 0),
-            )
+        for w in drop_rows:
+            pk = row_pk(w)
             if pk in seen_pk:
                 continue
             seen_pk.add(pk)
@@ -270,8 +330,11 @@ def build_dup_app_no_plan(
                     "mode": "drop_wrong_app_no",
                     "update_cols": [],
                     "keep_application_no": str(keep.get("application_no") or ""),
+                    "dup_reason": reason,
                 }
             )
+            key = "drop_%s" % reason
+            stats[key] = stats.get(key, 0) + 1
             stats["drop_wrong_app_no"] = stats.get("drop_wrong_app_no", 0) + 1
     return plan, stats
 
@@ -980,6 +1043,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.list_dup:
         tgt = connect_target(cfg)
+        src = connect_source(cfg)
         try:
             print("list-dup due_before=%s (all status)" % args.due_before, flush=True)
             rows = exec_with_retry(
@@ -991,10 +1055,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             if not dup_groups:
                 print("no duplicate loan_no found", flush=True)
                 return 0
-            report_dup_loan_nos(dup_groups, args.min_sn_len)
+            dup_ext_sns = collect_ext_sns_from_dup_groups(dup_groups, args.min_sn_len)
+            market = fetch_market_app_no_by_ext_sn(src, dup_ext_sns)
+            print("market_canonical_hits=%s" % len(market), flush=True)
+            report_dup_loan_nos(dup_groups, args.min_sn_len, market)
             return 0
         finally:
             tgt.close()
+            src.close()
 
     env_path = str(Path(args.env).resolve())
     repair_log = args.repair_log or (
@@ -1027,8 +1095,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                 lambda: load_loans_for_dup_check(tgt, args.due_before),
                 "load dup check",
             )
+            dup_groups = group_dup_loan_nos(dup_rows)
+            dup_ext_sns = collect_ext_sns_from_dup_groups(dup_groups, args.min_sn_len)
+            dup_market = fetch_market_app_no_by_ext_sn(src, dup_ext_sns)
             dup_plan, dup_stats = build_dup_app_no_plan(
-                group_dup_loan_nos(dup_rows), args.min_sn_len
+                dup_groups, args.min_sn_len, dup_market
             )
             dup_skip_pks = {row_pk(p["before"]) for p in dup_plan}
             print(
