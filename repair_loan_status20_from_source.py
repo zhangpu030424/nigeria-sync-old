@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""修复目标库中 due_date 已到期且 status=20、但 loan_no 中间段仍为 market 长号的 loan 行。
+"""修复目标库 due_date/status 条件下 loan_no 中间段为 market 长号的行。
 
-策略（默认 bulk）:
-  1. 一次查出目标库 due_date/status 符合条件的全部 loan
-  2. 内存中按 loan_no 中间段长度筛长号
-  3. 源库批量: ng_loan_core.application(ext_sn) + ng_loan_core.repay_plan(sn)
-  4. 内存拼修复计划后批量写库
+查询链路（与手工 SQL 一致）:
+  1. 目标: SELECT * FROM loan WHERE due_date < ? AND status = ?
+  2. 内存筛 loan_no 中间段 >= 15 位（长号）
+  3. ext_sn = application_no 后缀（如 166487616812019719）
+  4. 源库: SELECT sn FROM ng_loan_core.application WHERE ext_sn = ?
+  5. 源库: SELECT * FROM ng_loan_core.repay_plan WHERE sn = ?（取 max plan_sn）
+  6. 正确 loan_no = ng-{core_sn}-01000，并同步 repay_plan 状态字段
 
 Usage:
   python3 repair_loan_status20_from_source.py --env ./ng_migration.env --dry-run --plan-only
@@ -184,47 +186,80 @@ def fetch_core_application_by_ext_sn(
     return out
 
 
+def is_plausible_core_sn(
+    sn: str, market_no: str = "", min_sn_len: int = 15
+) -> bool:
+    """core sn 约 12 位；market 号 15~18 位，不能当 core sn 用。"""
+    s = str(sn or "").strip()
+    if not s or not s.isdigit():
+        return False
+    if market_no and s == str(market_no).strip():
+        return False
+    return len(s) < min_sn_len
+
+
+def build_meta_from_ext_sn(
+    src,
+    ext_sns: List[str],
+    target_app_by_ext: Dict[str, str],
+    min_sn_len: int,
+) -> Dict[str, Tuple[str, str]]:
+    """ext_sn -> (core_sn, target application_no)。仅查 ng_loan_core.application。"""
+    uniq = sorted({str(x).strip() for x in ext_sns if x})
+    core_by_ext = fetch_core_application_by_ext_sn(src, uniq)
+    meta: Dict[str, Tuple[str, str]] = {}
+    for ext_sn in uniq:
+        core_sn = core_by_ext.get(ext_sn, "")
+        app_no = target_app_by_ext.get(ext_sn, "")
+        if not core_sn or not is_plausible_core_sn(core_sn, ext_sn, min_sn_len):
+            continue
+        if not app_no:
+            continue
+        meta[ext_sn] = (core_sn, app_no)
+    return meta
+
+
 def fetch_source_loans_bulk(
     src,
-    market_nos: List[str],
-    target_app_by_market: Optional[Dict[str, str]] = None,
+    ext_sns: List[str],
+    target_app_by_ext: Dict[str, str],
+    min_sn_len: int = 15,
 ) -> Tuple[Dict[str, dict], Dict[str, str], Dict[str, Tuple[str, str]]]:
-    """market applicationNo -> loan 行；miss_reason；meta(ext_sn->core_sn,app_no)。"""
-    if not market_nos:
+    """ext_sn -> 目标形态 loan 行；miss_reason；meta。"""
+    if not ext_sns:
         return {}, {}, {}
-    uniq = sorted({str(x).strip() for x in market_nos if x})
-    target_app_by_market = target_app_by_market or {}
-    meta = fetch_source_market_meta(src, uniq)
-    missing = [m for m in uniq if m not in meta]
-    if missing:
-        core_only = fetch_core_application_by_ext_sn(src, missing)
-        for ext_sn, core_sn in core_only.items():
-            meta[ext_sn] = (core_sn, target_app_by_market.get(ext_sn, ""))
+    uniq = sorted({str(x).strip() for x in ext_sns if x})
+    meta = build_meta_from_ext_sn(src, uniq, target_app_by_ext, min_sn_len)
     repay_plans = fetch_repay_plan_by_sns(src, [v[0] for v in meta.values()])
-    by_market: Dict[str, dict] = {}
+    by_ext: Dict[str, dict] = {}
     miss_reason: Dict[str, str] = {}
-    for market_no in uniq:
-        pair = meta.get(market_no)
+    for ext_sn in uniq:
+        pair = meta.get(ext_sn)
         if not pair:
-            miss_reason[market_no] = "no_core_application"
+            miss_reason[ext_sn] = "no_core_application"
             continue
         core_sn, app_no = pair
-        if not app_no:
-            miss_reason[market_no] = "no_app_no"
-            continue
         rp = repay_plans.get(core_sn)
         if not rp:
-            miss_reason[market_no] = "no_repay_plan"
+            miss_reason[ext_sn] = "no_repay_plan"
             continue
-        by_market[market_no] = mig._build_loan_row(rp, app_no)
-    return by_market, miss_reason, meta
+        by_ext[ext_sn] = mig._build_loan_row(rp, app_no)
+    return by_ext, miss_reason, meta
 
 
 def build_rekey_row_from_before(
-    before: dict, application_no: str, core_sn: str
+    before: dict,
+    application_no: str,
+    core_sn: str,
+    market_no: str = "",
+    min_sn_len: int = 15,
 ) -> Optional[dict]:
+    if not is_plausible_core_sn(core_sn, market_no, min_sn_len):
+        return None
     correct = mig.format_loan_no(core_sn, 1, 0)
     if not before or not correct:
+        return None
+    if correct == str(before.get("loan_no") or ""):
         return None
     row = dict(before)
     row["loan_no"] = correct
@@ -235,43 +270,36 @@ def build_rekey_row_from_before(
 
 def build_plan_in_memory(
     candidates: List[dict],
-    source_by_market: Dict[str, dict],
+    source_by_ext: Dict[str, dict],
     miss_reason: Dict[str, str],
-    target_sn_by_app: Dict[str, str],
-    meta_by_market: Dict[str, Tuple[str, str]],
+    meta_by_ext: Dict[str, Tuple[str, str]],
+    min_sn_len: int = 15,
 ) -> List[dict]:
     plan: List[dict] = []
+    skip_n = 0
     for row in candidates:
         wrong = str(row["loan_no"])
         app_no = str(row.get("application_no") or "")
-        market_no = extract_market_no(app_no, wrong)
-        if not market_no:
-            print("skip no_market_no loan_no=%s" % wrong, flush=True)
+        ext_sn = extract_market_no(app_no, wrong)
+        if not ext_sn:
+            skip_n += 1
             continue
 
-        src_row = source_by_market.get(market_no)
+        src_row = source_by_ext.get(ext_sn)
         mode = "source"
         if not src_row:
-            core_sn = ""
-            pair = meta_by_market.get(market_no)
-            if pair:
-                core_sn = pair[0]
-            if not core_sn:
-                core_sn = target_sn_by_app.get(app_no, "")
-            if core_sn:
-                src_row = build_rekey_row_from_before(row, app_no, core_sn)
+            pair = meta_by_ext.get(ext_sn)
+            if pair and miss_reason.get(ext_sn) == "no_repay_plan":
+                src_row = build_rekey_row_from_before(
+                    row, app_no, pair[0], ext_sn, min_sn_len
+                )
                 mode = "rekey_only" if src_row else ""
             if not src_row:
-                reason = miss_reason.get(market_no, "no_core_sn")
-                print(
-                    "skip no_source loan_no=%s market_no=%s reason=%s"
-                    % (wrong, market_no, reason),
-                    flush=True,
-                )
+                skip_n += 1
                 continue
 
         correct = str(src_row["loan_no"])
-        if correct == wrong and mode == "source":
+        if correct == wrong:
             continue
         plan.append(
             {
@@ -280,7 +308,7 @@ def build_plan_in_memory(
                 "legacy_loan_no": "",
                 "application_no": str(src_row.get("application_no") or app_no),
                 "app_id": "",
-                "market_no": market_no,
+                "market_no": ext_sn,
                 "source_row": src_row,
                 "before_wrong": dict(row),
                 "sync_mode": mode,
@@ -288,86 +316,9 @@ def build_plan_in_memory(
                 "target_status": str(row.get("status") or ""),
             }
         )
+    if skip_n:
+        print("plan_skip=%s (no ext_sn / no core.application / no repay_plan)" % skip_n, flush=True)
     return plan
-
-
-def fetch_target_sn_by_application_nos(
-    tgt, application_nos: List[str], label: str = "target_sn"
-) -> Dict[str, str]:
-    """application_no -> core sn（目标库 application 表）。"""
-    uniq = sorted({str(x).strip() for x in application_nos if x})
-    out: Dict[str, str] = {}
-    if not uniq:
-        return out
-    batch_size = 200
-    batches = (len(uniq) + batch_size - 1) // batch_size
-    for bi, i in enumerate(range(0, len(uniq), batch_size), start=1):
-        part = uniq[i : i + batch_size]
-        ph = ",".join(["%s"] * len(part))
-        t0 = time.time()
-        rows = exec_with_retry(
-            tgt,
-            lambda p=part: _query_target_sn_batch(tgt, ph, p),
-            "%s batch=%s" % (label, bi),
-        )
-        for row in rows:
-            app_no = str(row["application_no"]).strip()
-            sn = str(row["sn"]).strip()
-            if app_no and sn:
-                out[app_no] = sn
-        print(
-            "%s batch=%s/%s part=%s map=%s elapsed=%.1fs"
-            % (label, bi, batches, len(part), len(out), time.time() - t0),
-            flush=True,
-        )
-    return out
-
-
-def _query_target_sn_batch(tgt, ph: str, part: List[str]) -> List[dict]:
-    with tgt.cursor() as cur:
-        cur.execute(
-            """
-            SELECT application_no, sn
-            FROM application
-            WHERE application_no IN (%s)
-              AND sn IS NOT NULL AND sn <> ''
-            """ % ph,
-            part,
-        )
-        return list(cur.fetchall())
-
-
-def fetch_source_market_meta(
-    src, market_nos: List[str]
-) -> Dict[str, Tuple[str, str]]:
-    """market applicationNo -> (core_sn, application_no)。"""
-    if not market_nos:
-        return {}
-    uniq = sorted({str(x).strip() for x in market_nos if x})
-    out: Dict[str, Tuple[str, str]] = {}
-    m, c = "ng_loan_market", "ng_loan_core"
-    for i in range(0, len(uniq), 500):
-        part = uniq[i : i + 500]
-        ph = ",".join(["%s"] * len(part))
-        with src.cursor() as cur:
-            cur.execute(
-                f"""
-                SELECT a.applicationNo AS market_no, a.`appId` AS app_id, ca.sn AS core_sn
-                FROM {m}.application a
-                INNER JOIN {c}.application ca ON ca.ext_sn = a.applicationNo
-                WHERE a.applicationNo IN ({ph})
-                  AND ca.sn IS NOT NULL AND ca.sn <> ''
-                """,
-                part,
-            )
-            rows = list(cur.fetchall())
-        for row in rows:
-            market_no = str(row["market_no"]).strip()
-            core_sn = str(row["core_sn"]).strip()
-            app_no = mig.format_application_no(row.get("app_id"), market_no)
-            if market_no and core_sn and app_no:
-                out[market_no] = (core_sn, app_no)
-    return out
 
 
 def _merge_source_row(before: dict, source_row: dict) -> dict:
@@ -552,7 +503,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("no long loan_no rows", flush=True)
             return 0
 
-        market_nos = sorted(
+        ext_sns = sorted(
             {
                 extract_market_no(
                     str(r.get("application_no") or ""),
@@ -562,71 +513,40 @@ def main(argv: Optional[List[str]] = None) -> int:
             }
             - {""}
         )
-        target_app_by_market = {
+        target_app_by_ext = {
             extract_market_no(
                 str(r.get("application_no") or ""),
                 str(r.get("loan_no") or ""),
             ): str(r.get("application_no") or "")
             for r in candidates
         }
-        target_app_by_market = {
-            k: v for k, v in target_app_by_market.items() if k and v
-        }
+        target_app_by_ext = {k: v for k, v in target_app_by_ext.items() if k and v}
 
-        print("load source repay_plan market_nos=%s ..." % len(market_nos), flush=True)
+        print(
+            "load source core.application ext_sn=%s ..." % len(ext_sns),
+            flush=True,
+        )
         t0 = time.time()
-        source_by_market, miss_reason, meta_by_market = fetch_source_loans_bulk(
-            src, market_nos, target_app_by_market
+        source_by_ext, miss_reason, meta_by_ext = fetch_source_loans_bulk(
+            src, ext_sns, target_app_by_ext, args.min_sn_len
         )
         print(
-            "source_hits=%s miss=%s meta=%s elapsed=%.1fs"
+            "core_application=%s repay_plan_hits=%s miss=%s elapsed=%.1fs"
             % (
-                len(source_by_market),
+                len(meta_by_ext),
+                len(source_by_ext),
                 len(miss_reason),
-                len(meta_by_market),
                 time.time() - t0,
             ),
             flush=True,
         )
 
-        app_nos_need_target_sn = sorted(
-            {
-                str(r.get("application_no") or "").strip()
-                for r in candidates
-                if extract_market_no(
-                    str(r.get("application_no") or ""),
-                    str(r.get("loan_no") or ""),
-                )
-                not in meta_by_market
-            }
-            - {""}
-        )
-
-        target_sn_by_app: Dict[str, str] = {}
-        if app_nos_need_target_sn:
-            print(
-                "load target application.sn fallback app_nos=%s (skip %s already in source meta) ..."
-                % (len(app_nos_need_target_sn), len(candidates) - len(app_nos_need_target_sn)),
-                flush=True,
-            )
-            t0 = time.time()
-            target_sn_by_app = fetch_target_sn_by_application_nos(
-                tgt, app_nos_need_target_sn, label="target_sn"
-            )
-            print(
-                "target_sn_map=%s elapsed=%.1fs"
-                % (len(target_sn_by_app), time.time() - t0),
-                flush=True,
-            )
-        else:
-            print("skip target application.sn (all covered by source meta)", flush=True)
-
         plan = build_plan_in_memory(
             candidates,
-            source_by_market,
+            source_by_ext,
             miss_reason,
-            target_sn_by_app,
-            meta_by_market,
+            meta_by_ext,
+            args.min_sn_len,
         )
         if args.work_limit:
             plan = plan[: args.work_limit]
