@@ -2,6 +2,8 @@
 # -*- coding: utf-8 -*-
 """合并 /tmp 下分散的 repair/backfill 审计 CSV（含 worker 分片）。
 
+只读源文件，写入 {output_dir}。默认保留源文件；加 --delete-source 在合并成功后删除已合并的源 CSV。
+
 按「族」+「类型」合并:
   - main:     *.csv（不含 .deleted / .modified）
   - deleted:  *.deleted.csv
@@ -13,6 +15,7 @@
 Usage:
   python3 merge_audit_csv.py --dir /tmp --output-dir /tmp/merged --dry-run
   python3 merge_audit_csv.py --dir /tmp --output-dir /tmp/merged
+  python3 merge_audit_csv.py --dir /tmp --output-dir /tmp/merged --delete-source
 
   python3 merge_audit_csv.py --dir /tmp --families repair_loan_status20 --dry-run
 """
@@ -172,6 +175,42 @@ def write_merged(
     return total, dup
 
 
+def delete_source_files(
+    files: List[Path], root: Path, out_dir: Path, dry_run: bool
+) -> Tuple[int, int]:
+    """删除已合并的源文件；不删 output_dir 内文件。"""
+    root = root.resolve()
+    out_dir = out_dir.resolve()
+    deleted = failed = 0
+    for fp in files:
+        try:
+            resolved = fp.resolve()
+        except OSError:
+            failed += 1
+            continue
+        if not resolved.is_file():
+            continue
+        if out_dir in resolved.parents or resolved.parent == out_dir:
+            print("skip delete (under output-dir) %s" % fp.name, flush=True)
+            continue
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            print("skip delete (outside --dir) %s" % fp, flush=True)
+            continue
+        if dry_run:
+            print("  would_delete %s" % fp.name, flush=True)
+            deleted += 1
+            continue
+        try:
+            resolved.unlink()
+            deleted += 1
+        except OSError as exc:
+            print("delete failed %s: %s" % (fp, exc), flush=True)
+            failed += 1
+    return deleted, failed
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description="Merge scattered audit CSV files in /tmp")
     p.add_argument("--dir", default="/tmp", help="扫描目录")
@@ -181,9 +220,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         default="",
         help="逗号分隔族名，空=全部已知族",
     )
-    p.add_argument("--dry-run", action="store_true", help="只统计不写文件")
+    p.add_argument("--dry-run", action="store_true", help="只统计不写文件、不删源文件")
     p.add_argument("--no-dedupe", action="store_true", help="不去重（默认按整行去重）")
+    p.add_argument(
+        "--delete-source",
+        action="store_true",
+        help="合并成功后删除已并入的源 CSV（不可与 --dry-run 同用）",
+    )
     args = p.parse_args(argv)
+    if args.delete_source and args.dry_run:
+        p.error("--delete-source 不能与 --dry-run 同时使用")
 
     root = Path(args.dir)
     if not root.is_dir():
@@ -202,6 +248,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("scan dir=%s families=%s groups=%s" % (root, fam_filter or "ALL", len(groups)), flush=True)
     out_dir = Path(args.output_dir)
     grand_lines = 0
+    total_deleted = 0
+    total_delete_failed = 0
 
     for (fam, kind) in sorted(groups.keys()):
         files = groups[(fam, kind)]
@@ -248,7 +296,23 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("  wrote lines=%s dup_skipped=%s" % (n, dup), flush=True)
             grand_lines += n
 
-    print("done groups=%s total_data_lines=%s out=%s" % (len(groups), grand_lines, out_dir), flush=True)
+        if args.delete_source and not args.dry_run:
+            d, f = delete_source_files(files, root, out_dir, dry_run=False)
+            total_deleted += d
+            total_delete_failed += f
+            print("  deleted_sources=%s failed=%s" % (d, f), flush=True)
+
+    tail = "source files kept"
+    if args.delete_source:
+        tail = "deleted_sources=%s delete_failed=%s" % (
+            total_deleted,
+            total_delete_failed,
+        )
+    print(
+        "done groups=%s total_data_lines=%s out=%s (%s)"
+        % (len(groups), grand_lines, out_dir, tail),
+        flush=True,
+    )
     return 0
 
 
