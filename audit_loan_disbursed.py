@@ -36,8 +36,6 @@ Usage:
   python3 audit_loan_disbursed.py --env ./ng_migration.env \\
     --plan-file /tmp/loan_audit_plan.json --sql-out /tmp/loan_audit_fix.sql
 """
-from __future__ import annotations
-
 import argparse
 import csv
 import hashlib
