@@ -20,6 +20,10 @@ Usage:
 
   python3 repair_missing_loan_from_audit.py --env ./ng_migration.env --apply-only \\
     --plan-file /tmp/repair_missing_loan_plan.json
+
+  # 只分析：哪些 missing_loan 其实是 loan 挂错 application_no（导出 CSV）
+  python3 repair_missing_loan_from_audit.py --env ./ng_migration.env \\
+    --issues-csv /tmp/loan_audit_issues_after_repair.csv --analyze
 """
 import argparse
 import csv
@@ -33,7 +37,7 @@ import pymysql
 from pymysql.cursors import DictCursor
 
 import ng_migration_run as mig
-from repair_loan_no_from_audit import CommitTracker, exec_with_retry, loan_exists
+from repair_loan_no_from_audit import CommitTracker, exec_with_retry
 
 HERE = Path(__file__).resolve().parent
 APP_SUFFIX_RE = re.compile(r"^ng\d+-(.+)$", re.I)
@@ -137,82 +141,141 @@ def fetch_loan_rows_for_jobs(src, jobs: List[dict]) -> Dict[str, dict]:
     return out
 
 
-def application_has_loan(tgt, application_no: str) -> bool:
-    with tgt.cursor() as cur:
-        cur.execute(
-            "SELECT 1 FROM loan WHERE application_no=%s LIMIT 1",
-            (application_no,),
-        )
-        return cur.fetchone() is not None
+def _chunks(items: List[str], size: int):
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
 
 
-def application_exists(tgt, application_no: str) -> bool:
-    with tgt.cursor() as cur:
-        cur.execute(
-            "SELECT 1 FROM application WHERE application_no=%s LIMIT 1",
-            (application_no,),
-        )
-        return cur.fetchone() is not None
+def _ping_tgt(tgt):
+    try:
+        tgt.ping(reconnect=True)
+    except Exception:
+        pass
 
 
-def find_mislinked_loan(tgt, job: dict) -> Optional[dict]:
-    """loan 存在但 application_no 挂错（delete_dup / 错前缀遗留）。"""
+def batch_query_in(
+    tgt, table: str, col: str, values: List[str], chunk: int = 500
+) -> Set[str]:
+    """SELECT col FROM table WHERE col IN (...)，返回存在的值集合。"""
+    uniq = sorted({str(v).strip() for v in values if v})
+    found: Set[str] = set()
+    if not uniq:
+        return found
+    total = (len(uniq) + chunk - 1) // chunk
+    for i, part in enumerate(_chunks(uniq, chunk), 1):
+        _ping_tgt(tgt)
+        ph = ",".join(["%s"] * len(part))
+        sql = "SELECT `%s` AS v FROM `%s` WHERE `%s` IN (%s)" % (col, table, col, ph)
+        with tgt.cursor() as cur:
+            cur.execute(sql, part)
+            for row in cur.fetchall():
+                found.add(str(row["v"]).strip())
+        if i == 1 or i % 10 == 0 or i == total:
+            print(
+                "  batch_query %s.%s %s/%s hits=%s"
+                % (table, col, i, total, len(found)),
+                flush=True,
+            )
+    return found
+
+
+def preload_loan_indexes(
+    tgt, jobs: List[dict], chunk: int = 500
+) -> Tuple[Dict[str, dict], Dict[str, List[dict]]]:
+    """预加载 loan_no -> row；market_suffix -> 错挂候选行列表。"""
+    loan_nos = sorted(
+        {str(j.get("expected_loan_no") or "").strip() for j in jobs if j.get("expected_loan_no")}
+    )
+    suffixes = sorted({str(j.get("market_suffix") or "").strip() for j in jobs if j.get("market_suffix")})
+    by_loan_no: Dict[str, dict] = {}
+    by_suffix: Dict[str, List[dict]] = {}
+
+    total_ln = (len(loan_nos) + chunk - 1) // chunk if loan_nos else 0
+    for i, part in enumerate(_chunks(loan_nos, chunk), 1):
+        _ping_tgt(tgt)
+        ph = ",".join(["%s"] * len(part))
+        with tgt.cursor() as cur:
+            cur.execute(
+                "SELECT loan_no, application_no FROM loan WHERE loan_no IN (%s)" % ph,
+                part,
+            )
+            for row in cur.fetchall():
+                ln = str(row.get("loan_no") or "").strip()
+                if ln:
+                    by_loan_no[ln] = row
+        if total_ln and (i == 1 or i % 10 == 0 or i == total_ln):
+            print(
+                "  preload loan_no %s/%s hits=%s" % (i, total_ln, len(by_loan_no)),
+                flush=True,
+            )
+
+    total_sfx = (len(suffixes) + chunk - 1) // chunk if suffixes else 0
+    for i, part in enumerate(_chunks(suffixes, chunk), 1):
+        _ping_tgt(tgt)
+        ph = ",".join(["%s"] * len(part))
+        with tgt.cursor() as cur:
+            cur.execute(
+                """
+                SELECT loan_no, application_no,
+                       SUBSTRING_INDEX(application_no, '-', -1) AS sfx
+                FROM loan
+                WHERE SUBSTRING_INDEX(application_no, '-', -1) IN (%s)
+                """ % ph,
+                part,
+            )
+            for row in cur.fetchall():
+                sfx = str(row.get("sfx") or "").strip()
+                if sfx:
+                    by_suffix.setdefault(sfx, []).append(row)
+        if total_sfx and (i == 1 or i % 10 == 0 or i == total_sfx):
+            n = sum(len(v) for v in by_suffix.values())
+            print(
+                "  preload suffix %s/%s rows=%s" % (i, total_sfx, n),
+                flush=True,
+            )
+    return by_loan_no, by_suffix
+
+
+def find_mislinked_in_memory(job: dict, by_loan_no: Dict[str, dict], by_suffix: Dict[str, List[dict]]) -> Optional[dict]:
+    """loan 存在但 application_no 挂错（内存索引）。"""
     good_app = job["application_no"]
     exp_ln = str(job.get("expected_loan_no") or "").strip()
     suffix = str(job.get("market_suffix") or "").strip()
 
-    if exp_ln:
-        with tgt.cursor() as cur:
-            cur.execute(
-                "SELECT loan_no, application_no FROM loan WHERE loan_no=%s LIMIT 1",
-                (exp_ln,),
-            )
-            row = cur.fetchone()
-            if row:
-                bad_app = str(row.get("application_no") or "").strip()
-                if bad_app and bad_app != good_app:
-                    return {
-                        "action": "relink",
-                        "loan_no": exp_ln,
-                        "good_application_no": good_app,
-                        "bad_application_no": bad_app,
-                        "reason": "loan_no_match",
-                    }
-
-    if suffix:
-        with tgt.cursor() as cur:
-            cur.execute(
-                """
-                SELECT loan_no, application_no FROM loan
-                WHERE application_no LIKE %s AND application_no <> %s
-                ORDER BY loan_no ASC
-                LIMIT 10
-                """,
-                ("%%-%s" % suffix, good_app),
-            )
-            rows = list(cur.fetchall())
-        if not rows:
-            return None
-        if exp_ln:
-            for row in rows:
-                if str(row.get("loan_no") or "").strip() == exp_ln:
-                    bad_app = str(row.get("application_no") or "").strip()
-                    return {
-                        "action": "relink",
-                        "loan_no": exp_ln,
-                        "good_application_no": good_app,
-                        "bad_application_no": bad_app,
-                        "reason": "suffix_and_loan_no",
-                    }
-        if len(rows) == 1:
-            row = rows[0]
+    if exp_ln and exp_ln in by_loan_no:
+        row = by_loan_no[exp_ln]
+        bad_app = str(row.get("application_no") or "").strip()
+        if bad_app and bad_app != good_app:
             return {
                 "action": "relink",
-                "loan_no": str(row.get("loan_no") or "").strip(),
+                "loan_no": exp_ln,
                 "good_application_no": good_app,
-                "bad_application_no": str(row.get("application_no") or "").strip(),
-                "reason": "suffix_unique",
+                "bad_application_no": bad_app,
+                "reason": "loan_no_match",
             }
+
+    rows = [r for r in by_suffix.get(suffix, []) if str(r.get("application_no") or "").strip() != good_app]
+    if not rows:
+        return None
+    if exp_ln:
+        for row in rows:
+            if str(row.get("loan_no") or "").strip() == exp_ln:
+                return {
+                    "action": "relink",
+                    "loan_no": exp_ln,
+                    "good_application_no": good_app,
+                    "bad_application_no": str(row.get("application_no") or "").strip(),
+                    "reason": "suffix_and_loan_no",
+                }
+    if len(rows) == 1:
+        row = rows[0]
+        return {
+            "action": "relink",
+            "loan_no": str(row.get("loan_no") or "").strip(),
+            "good_application_no": good_app,
+            "bad_application_no": str(row.get("application_no") or "").strip(),
+            "reason": "suffix_unique",
+        }
     return None
 
 
@@ -264,17 +327,24 @@ def build_plan(
     insert_plan: List[dict] = []
     skipped: Dict[str, int] = {}
 
+    app_nos = [j["application_no"] for j in jobs]
+    print("preload target indexes ...", flush=True)
+    existing_apps = batch_query_in(tgt, "application", "application_no", app_nos)
+    apps_with_loan = batch_query_in(tgt, "loan", "application_no", app_nos)
+    by_loan_no, by_suffix = preload_loan_indexes(tgt, jobs)
+    existing_loan_nos = set(by_loan_no.keys())
+
     for job in jobs:
         app_no = job["application_no"]
         sn = job["core_sn"]
-        if not application_exists(tgt, app_no):
+        if app_no not in existing_apps:
             skipped["no_application"] = skipped.get("no_application", 0) + 1
             continue
-        if application_has_loan(tgt, app_no):
+        if app_no in apps_with_loan:
             skipped["loan_exists"] = skipped.get("loan_exists", 0) + 1
             continue
 
-        mislinked = find_mislinked_loan(tgt, job)
+        mislinked = find_mislinked_in_memory(job, by_loan_no, by_suffix)
         if mislinked:
             relink_plan.append(mislinked)
             continue
@@ -287,12 +357,103 @@ def build_plan(
         if not loan_no:
             skipped["empty_loan_no"] = skipped.get("empty_loan_no", 0) + 1
             continue
-        if loan_exists(tgt, loan_no):
+        if loan_no in existing_loan_nos:
             skipped["loan_no_orphan"] = skipped.get("loan_no_orphan", 0) + 1
             continue
         insert_plan.append(row)
 
     return relink_plan, insert_plan, skipped
+
+
+def write_relink_csv(path: Path, rows: List[dict]) -> None:
+    cols = [
+        "good_application_no",
+        "bad_application_no",
+        "loan_no",
+        "reason",
+        "core_sn",
+        "market_suffix",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as fp:
+        w = csv.DictWriter(fp, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        for row in rows:
+            w.writerow(row)
+
+
+def write_insert_csv(path: Path, rows: List[dict]) -> None:
+    cols = ["application_no", "loan_no", "period", "roll_sequence"]
+    with path.open("w", encoding="utf-8", newline="") as fp:
+        w = csv.DictWriter(fp, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        for row in rows:
+            w.writerow(
+                {
+                    "application_no": row.get("application_no"),
+                    "loan_no": row.get("loan_no"),
+                    "period": row.get("period"),
+                    "roll_sequence": row.get("roll_sequence"),
+                }
+            )
+
+
+def enrich_relink_rows(relink_plan: List[dict], jobs: List[dict]) -> List[dict]:
+    job_by_app = {j["application_no"]: j for j in jobs}
+    out: List[dict] = []
+    for row in relink_plan:
+        job = job_by_app.get(row.get("good_application_no") or "")
+        out.append(
+            {
+                **row,
+                "core_sn": (job or {}).get("core_sn", ""),
+                "market_suffix": (job or {}).get("market_suffix", ""),
+            }
+        )
+    return out
+
+
+def print_analyze_summary(
+    relink_plan: List[dict],
+    insert_plan: List[dict],
+    skipped: Dict[str, int],
+    relink_csv: Path,
+    insert_csv: Path,
+) -> None:
+    print("=" * 60, flush=True)
+    print("missing_loan analyze summary", flush=True)
+    print("  relink (loan存在, application挂错): %s" % len(relink_plan), flush=True)
+    print("  insert (确实无loan行):             %s" % len(insert_plan), flush=True)
+    if skipped:
+        print(
+            "  skipped: %s"
+            % " ".join("%s=%s" % (k, v) for k, v in sorted(skipped.items())),
+            flush=True,
+        )
+    print("  relink_csv:  %s" % relink_csv, flush=True)
+    print("  insert_csv:  %s" % insert_csv, flush=True)
+    print("-" * 60, flush=True)
+    by_reason: Dict[str, int] = {}
+    for row in relink_plan:
+        r = str(row.get("reason") or "unknown")
+        by_reason[r] = by_reason.get(r, 0) + 1
+    if by_reason:
+        print("relink by reason:", flush=True)
+        for k, v in sorted(by_reason.items(), key=lambda x: -x[1]):
+            print("  %s: %s" % (k, v), flush=True)
+    print("-" * 60, flush=True)
+    print("relink samples (first 20):", flush=True)
+    for row in relink_plan[:20]:
+        print(
+            "  loan=%s | bad_app=%s -> good_app=%s (%s)"
+            % (
+                row.get("loan_no"),
+                row.get("bad_application_no"),
+                row.get("good_application_no"),
+                row.get("reason"),
+            ),
+            flush=True,
+        )
+    print("=" * 60, flush=True)
 
 
 def apply_relink_batch(tgt, rows: List[dict], dry_run: bool) -> int:
@@ -410,10 +571,26 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--dry-run", action="store_true")
     p.add_argument(
         "--issues-csv",
-        default="/tmp/loan_audit_issues_after_repair.csv",
+        default="/tmp/loan_audit_issues.csv",
+        help="audit 输出的 issues CSV（自动筛 issue=missing_loan）",
     )
     p.add_argument("--plan-file", default="", help="写出/读取 plan json")
     p.add_argument("--preview", type=int, default=0, metavar="N")
+    p.add_argument(
+        "--analyze",
+        action="store_true",
+        help="只分析：导出 relink（loan在但application挂错）与 insert 清单，不写库",
+    )
+    p.add_argument(
+        "--relink-csv",
+        default="/tmp/missing_loan_relink.csv",
+        help="--analyze 时写出挂错 application 的 loan 清单",
+    )
+    p.add_argument(
+        "--insert-csv",
+        default="/tmp/missing_loan_insert.csv",
+        help="--analyze 时写出需 INSERT 的清单",
+    )
     p.add_argument("--work-limit", type=int, default=0)
     p.add_argument("--batch-size", type=int, default=100)
     p.add_argument("--commit-every", type=int, default=20)
@@ -421,6 +598,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.apply and args.dry_run:
         p.error("use either --apply or --dry-run")
+    if args.analyze:
+        args.dry_run = True
     if args.apply_only:
         args.apply = True
     dry_run = not args.apply
@@ -436,11 +615,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         jobs = jobs[: args.work_limit]
 
     plan_path = Path(args.plan_file) if args.plan_file.strip() else None
-    if not plan_path and (args.apply_only or args.dry_run or args.apply):
+    if not plan_path and (args.apply_only or args.dry_run or args.apply or args.analyze):
         plan_path = Path("/tmp/repair_missing_loan_plan.json")
 
     relink_plan: List[dict] = []
     insert_plan: List[dict] = []
+    skipped: Dict[str, int] = {}
 
     if args.apply_only and plan_path and plan_path.exists():
         loaded = json.loads(plan_path.read_text(encoding="utf-8"))
@@ -477,12 +657,29 @@ def main(argv: Optional[List[str]] = None) -> int:
             if args.preview > 0:
                 print_preview(jobs, loan_by_sn, relink_plan, insert_plan, args.preview)
                 return 0
+            relink_plan = enrich_relink_rows(relink_plan, jobs)
+            if args.analyze:
+                relink_csv = Path(args.relink_csv)
+                insert_csv = Path(args.insert_csv)
+                write_relink_csv(relink_csv, relink_plan)
+                write_insert_csv(insert_csv, insert_plan)
+                if plan_path:
+                    payload = {"relink": relink_plan, "insert": insert_plan}
+                    plan_path.write_text(
+                        json.dumps(payload, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                print_analyze_summary(
+                    relink_plan, insert_plan, skipped, relink_csv, insert_csv
+                )
+                return 0
         finally:
             src.close()
             tgt.close()
 
-        if plan_path:
-            payload = {"relink": relink_plan, "insert": insert_plan}
+        if plan_path and not args.analyze:
+            payload = {"relink": enrich_relink_rows(relink_plan, jobs), "insert": insert_plan}
+            relink_plan = payload["relink"]
             plan_path.write_text(
                 json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
             )
