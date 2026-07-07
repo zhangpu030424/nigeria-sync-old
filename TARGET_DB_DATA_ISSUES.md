@@ -549,8 +549,8 @@ INNER JOIN (
 ) pick ON rp.sn = pick.sn AND rp.plan_sn = pick.max_plan_sn
 WHERE ca.ext_sn = '177702748012033909';
 
--- loan_no = ng-{loan_sn}-01000  （period=01, roll=000 → 后缀 01000）
--- 手工规则常用 plan_sn；ng_migration_run 入库用的是 rp.sn(core)，可用 --loan-no-sn 切换对比
+-- loan_no = ng-{plan_sn}-01000  （period=01, roll=000 → 后缀 01000）
+-- **已确认：中间段必须用 repay_plan.plan_sn**（非 core application.sn）
 ```
 
 **脚本:** `audit_loan_disbursed.py`
@@ -562,10 +562,7 @@ python3 audit_loan_disbursed.py --env ./ng_migration.env
 # 抽样 1 万
 python3 audit_loan_disbursed.py --env ./ng_migration.env --work-limit 10000
 
-# 与迁移脚本一致用 core sn 比 loan_no
-python3 audit_loan_disbursed.py --env ./ng_migration.env --loan-no-sn core
-
-# 导出可自动修的 loan_no UPDATE
+# 导出可自动修的 loan_no UPDATE（按 plan_sn 拼期望 loan_no）
 python3 audit_loan_disbursed.py --env ./ng_migration.env \\
   --plan-file /tmp/loan_audit_fix_plan.json --sql-out /tmp/loan_audit_fix.sql
 ```

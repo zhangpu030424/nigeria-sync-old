@@ -64,7 +64,6 @@ ISSUE_WRONG_LOAN_APP = "wrong_loan_application_no"
 ISSUE_NO_MARKET_SUFFIX = "no_market_suffix"
 ISSUE_NO_CORE_SN = "no_core_sn"
 ISSUE_NO_REPAY_PLAN = "no_repay_plan"
-ISSUE_SN_PLAN_MISMATCH = "migration_core_sn_loan_no"  # 当前 loan_no 按 core sn 拼的，与 plan_sn 不符
 
 
 def load_env(path: Path) -> Dict[str, str]:
@@ -365,8 +364,6 @@ def reconcile_one(
         issues.append({**row, "issue": ISSUE_WRONG_LOAN_APP})
     if act_ln != exp_ln:
         issues.append({**row, "issue": ISSUE_WRONG_LOAN_NO})
-    elif exp_ln_core and act_ln == exp_ln_core and act_ln != exp_ln:
-        issues.append({**row, "issue": ISSUE_SN_PLAN_MISMATCH})
 
     return issues
 
@@ -482,7 +479,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--skip-orphan", action="store_true", help="不扫 orphan loan")
     args = p.parse_args(argv)
 
-    loan_no_sn_field = "plan_sn"  # 已确认 canonical
     exclude_ids = parse_exclude_ids(args.exclude_app_ids)
     t0 = time.time()
 
@@ -526,7 +522,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 loans_by_app.get(app_no, []),
                 meta,
                 core_only,
-                default_period,
+                args.default_period,
                 args.default_roll,
             )
         )
@@ -555,13 +551,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         write_sql_fix(Path(args.sql_out), fix_plan, args.sql_batch)
         print("wrote sql_out=%s" % args.sql_out, flush=True)
 
-    # 干净单：无 issue 或仅有 sn_plan_sn_differ 告警
+    # 干净单：无任何 issue 行
     bad_apps = {
         str(r["application_no"])
         for r in issues
-        if r.get("issue")
-        not in (ISSUE_SN_PLAN_MISMATCH,)  # 信息性
-        and r.get("application_no")
+        if r.get("application_no")
     }
     print(
         "summary applications=%s ok_or_warn_only=%s problem_apps=%s elapsed=%.1fs"
