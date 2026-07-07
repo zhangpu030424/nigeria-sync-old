@@ -49,7 +49,12 @@ from pathlib import Path
 from typing import Any, DefaultDict, Dict, List, Optional, Set, Tuple
 
 import pymysql
-from pymysql.cursors import DictCursor, SSCursor
+from pymysql.cursors import DictCursor
+
+try:
+    from pymysql.cursors import SSDictCursor as _StreamCursor
+except ImportError:
+    _StreamCursor = DictCursor  # 老 pymysql 无 SSDictCursor 时退化（占内存更多）
 
 import ng_migration_run as mig
 from repair_loan_no_from_audit import exec_with_retry
@@ -138,6 +143,8 @@ def load_disbursed_applications(
     tgt, exclude_app_ids: Tuple[int, ...], work_limit: int
 ) -> List[dict]:
     """目标库：老系统已放款单 application_no 列表。"""
+    print("phase1: SELECT application (disbursed) ...", flush=True)
+    t_load = time.time()
     ph = ",".join(["%s"] * len(exclude_app_ids))
     sql = f"""
         SELECT application_no, app_id, sn
@@ -150,12 +157,36 @@ def load_disbursed_applications(
     if work_limit > 0:
         sql += " LIMIT %s"
         params: Tuple[Any, ...] = tuple(exclude_app_ids) + (work_limit,)
-    else:
-        params = tuple(exclude_app_ids)
-    with tgt.cursor() as cur:
+        with tgt.cursor() as cur:
+            cur.execute(sql, params)
+            rows = list(cur.fetchall())
+        print(
+            "loaded applications=%s elapsed=%.1fs"
+            % (len(rows), time.time() - t_load),
+            flush=True,
+        )
+        return rows
+
+    params = tuple(exclude_app_ids)
+    rows: List[dict] = []
+    with tgt.cursor(_StreamCursor) as cur:
         cur.execute(sql, params)
-        rows = list(cur.fetchall())
-    print("loaded applications=%s" % len(rows), flush=True)
+        while True:
+            batch = cur.fetchmany(50000)
+            if not batch:
+                break
+            rows.extend(batch)
+            if len(rows) == len(batch) or len(rows) % 100000 == 0:
+                print(
+                    "  applications loaded=%s elapsed=%.1fs"
+                    % (len(rows), time.time() - t_load),
+                    flush=True,
+                )
+    print(
+        "loaded applications=%s elapsed=%.1fs"
+        % (len(rows), time.time() - t_load),
+        flush=True,
+    )
     return rows
 
 
@@ -171,6 +202,8 @@ def load_all_loans(
     by_loan_no: Dict[str, dict] = {}
     exclude_set = set(int(x) for x in exclude_created_ms)
     apps_touched_excluded: Set[str] = set()
+    print("phase2: stream loan table into memory ...", flush=True)
+    t_load = time.time()
     sql = """
         SELECT loan_no, application_no, period, roll_sequence,
                status, due_date, created_time
@@ -178,7 +211,7 @@ def load_all_loans(
         WHERE application_no IS NOT NULL AND application_no <> ''
     """
     n = skip = 0
-    with tgt.cursor(SSCursor) as cur:
+    with tgt.cursor(_StreamCursor) as cur:
         cur.execute(sql)
         while True:
             batch = cur.fetchmany(50000)
@@ -204,13 +237,17 @@ def load_all_loans(
                 by_app[app_no].append(item)
                 by_loan_no[ln] = item
                 n += 1
-            if n % 200000 == 0:
-                print("  loan rows loaded=%s skipped=%s" % (n, skip), flush=True)
+            if n > 0 and (n <= 50000 or n % 100000 == 0):
+                print(
+                    "  loan rows loaded=%s skipped=%s elapsed=%.1fs"
+                    % (n, skip, time.time() - t_load),
+                    flush=True,
+                )
     excluded_only_apps = apps_touched_excluded - set(by_app.keys())
     print(
         "loaded loan rows=%s skipped_created_time=%s unique_app=%s "
-        "excluded_only_apps=%s"
-        % (n, skip, len(by_app), len(excluded_only_apps)),
+        "excluded_only_apps=%s elapsed=%.1fs"
+        % (n, skip, len(by_app), len(excluded_only_apps), time.time() - t_load),
         flush=True,
     )
     return by_app, by_loan_no, excluded_only_apps
@@ -225,7 +262,10 @@ def fetch_source_repay_by_ext_sn(
     if not uniq:
         return out
     c = "ng_loan_core"
+    total_batches = (len(uniq) + 1999) // 2000
+    t0 = time.time()
     for i in range(0, len(uniq), 2000):
+        bno = i // 2000 + 1
         part = uniq[i : i + 2000]
         ph = ",".join(["%s"] * len(part))
         sql = f"""
@@ -253,6 +293,12 @@ def fetch_source_repay_by_ext_sn(
                         "plan_sn": str(row.get("plan_sn") or "").strip(),
                         "rp_sn": str(row.get("rp_sn") or "").strip(),
                     }
+        if bno == 1 or bno % 20 == 0 or bno == total_batches:
+            print(
+                "  source_repay batch %s/%s hits=%s elapsed=%.1fs"
+                % (bno, total_batches, len(out), time.time() - t0),
+                flush=True,
+            )
     return out
 
 
@@ -518,11 +564,18 @@ def run_parallel_reconcile(
             }
         )
     print(
-        "parallel_reconcile workers=%s apps=%s" % (len(specs), len(apps)),
+        "parallel_reconcile workers=%s apps=%s (building specs ...)"
+        % (len(specs), len(apps)),
         flush=True,
     )
+    t_spawn = time.time()
     ctx = multiprocessing.get_context("spawn")
     with ctx.Pool(processes=len(specs)) as pool:
+        print(
+            "parallel_reconcile pool started elapsed=%.1fs"
+            % (time.time() - t_spawn),
+            flush=True,
+        )
         results = pool.map(_worker_reconcile, specs)
     issues: List[dict] = []
     skipped = 0
@@ -742,7 +795,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     exclude_created_ms = parse_exclude_created_ms(args.exclude_loan_created_ms)
     t0 = time.time()
 
+    print(
+        "audit_loan_disbursed start workers=%s source_workers=%s work_limit=%s"
+        % (args.workers, source_workers, args.work_limit or "all"),
+        flush=True,
+    )
+
     cfg = load_env(Path(args.env))
+    print("connecting target %s ..." % cfg.get("TARGET_HOST"), flush=True)
     tgt = connect_target(cfg)
     try:
         apps = load_disbursed_applications(tgt, exclude_ids, args.work_limit)
@@ -760,10 +820,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
 
     app_set = {str(a["application_no"]).strip() for a in apps}
+    print("phase3: build market suffix list ...", flush=True)
+    t_suf = time.time()
     suffixes = sorted({market_suffix(str(a["application_no"])) for a in apps})
     suffixes = [s for s in suffixes if s]
-    print("unique_market_suffix=%s" % len(suffixes), flush=True)
+    print(
+        "unique_market_suffix=%s elapsed=%.1fs"
+        % (len(suffixes), time.time() - t_suf),
+        flush=True,
+    )
 
+    print("phase3: fetch source repay_plan (may take long) ...", flush=True)
     t1 = time.time()
     repay_meta = fetch_source_repay_parallel(cfg, suffixes, source_workers)
     print(
@@ -779,6 +846,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     print("source_core_only=%s" % len(core_only_map), flush=True)
 
+    print("phase4: reconcile in memory ...", flush=True)
     if args.workers > 1:
         issues, skipped_apps = run_parallel_reconcile(
             apps,
