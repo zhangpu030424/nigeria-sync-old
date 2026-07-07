@@ -13,7 +13,9 @@
 
 Usage:
   python3 restore_loan_from_market_delete_dup.py --env ./ng_migration.env \\
-    --repair-log /tmp/repair_loan_app_no_market_20260707_035300.csv --dry-run
+    --repair-log '/tmp/repair_loan_app_no_market*.csv' --dry-run
+
+  # 不传 --repair-log 时自动在 /tmp 找最新 repair_loan_app_no_market*.csv
 
   python3 restore_loan_from_market_delete_dup.py --env ./ng_migration.env \\
     --repair-log /tmp/repair_loan_app_no_market_20260707_035300.csv \\
@@ -24,6 +26,7 @@ Usage:
 """
 import argparse
 import csv
+import glob
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -68,16 +71,79 @@ def _sql_escape(s: str) -> str:
     return str(s).replace("\\", "\\\\").replace("'", "''")
 
 
-def discover_repair_logs(repair_log: str) -> List[str]:
-    p = Path(repair_log)
+def discover_repair_logs(repair_log: str, auto_find: bool = True) -> List[str]:
+    """解析 repair 日志路径；支持 glob、worker 分片、目录自动查找。"""
+    seen: set = set()
     out: List[str] = []
+
+    def add(path: Path) -> None:
+        if not path.is_file():
+            return
+        s = str(path.resolve())
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+
+    def add_worker_siblings(main: Path) -> None:
+        suffix = main.suffix or ".csv"
+        for f in sorted(main.parent.glob("%s.w*%s" % (main.stem, suffix))):
+            if WORKER_REPAIR_RE.search(f.name):
+                add(f)
+
+    raw = (repair_log or "").strip()
+    if not raw:
+        raw = "/tmp/repair_loan_app_no_market*.csv"
+
+    # glob：/tmp/repair_loan_app_no_market*.csv
+    if any(ch in raw for ch in "*?[]"):
+        for hit in sorted(glob.glob(raw)):
+            p = Path(hit)
+            add(p)
+            add_worker_siblings(p)
+        return sorted(out)
+
+    p = Path(raw)
     if p.is_file():
-        out.append(str(p))
-    suffix = p.suffix or ".csv"
-    for f in sorted(p.parent.glob("%s.w*%s" % (p.stem, suffix))):
-        if WORKER_REPAIR_RE.search(f.name):
-            out.append(str(f))
-    return out
+        add(p)
+        add_worker_siblings(p)
+        return sorted(out)
+
+    # 精确路径不存在：尝试同 stem 的 worker 文件（主文件可能没写入）
+    if p.parent.is_dir():
+        suffix = p.suffix or ".csv"
+        for f in sorted(p.parent.glob("%s.w*%s" % (p.stem, suffix))):
+            if WORKER_REPAIR_RE.search(f.name):
+                add(f)
+        if out:
+            return sorted(out)
+
+    if auto_find:
+        search_dirs = [p.parent if p.parent.is_dir() else None, Path("/tmp"), HERE]
+        for d in search_dirs:
+            if d is None or not d.is_dir():
+                continue
+            candidates = sorted(
+                d.glob("repair_loan_app_no_market*.csv"),
+                key=lambda x: x.stat().st_mtime,
+                reverse=True,
+            )
+            for c in candidates:
+                add(c)
+                add_worker_siblings(c)
+            if out:
+                break
+
+    return sorted(out)
+
+
+def list_repair_log_candidates() -> List[str]:
+    found: List[str] = []
+    for d in (Path("/tmp"), HERE):
+        if not d.is_dir():
+            continue
+        for f in sorted(d.glob("repair_loan_app_no_market*.csv")):
+            found.append(str(f))
+    return found
 
 
 def parse_market_repair_line(line: str) -> Optional[dict]:
@@ -290,7 +356,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         description="Restore loan rows wrongly deleted by repair_loan_app_no_market delete_dup"
     )
     p.add_argument("--env", default=str(HERE / "ng_migration.env"))
-    p.add_argument("--repair-log", required=True, help="repair_loan_app_no_market REPAIR csv")
+    p.add_argument(
+        "--repair-log",
+        default="",
+        help="REPAIR csv 路径或 glob；多 worker 时是 .w0.csv。默认自动找 /tmp",
+    )
+    p.add_argument(
+        "--no-auto-find",
+        action="store_true",
+        help="精确路径不存在时不自动搜索 /tmp",
+    )
     p.add_argument("--apply", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--sql-out", default="", help="导出 SQL 到文件（IDEA 执行）")
@@ -300,9 +375,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         p.error("use either --apply or --dry-run")
     dry_run = not args.apply
 
-    paths = discover_repair_logs(args.repair_log)
+    paths = discover_repair_logs(args.repair_log, auto_find=not args.no_auto_find)
     if not paths:
-        print("no repair log files found for %s" % args.repair_log, flush=True)
+        print("no repair log files found for %r" % (args.repair_log or "(auto)"), flush=True)
+        cands = list_repair_log_candidates()
+        if cands:
+            print("candidates on disk:", flush=True)
+            for c in cands[:20]:
+                print("  %s" % c, flush=True)
+        else:
+            print(
+                "hint: logs are only written on --apply (not dry-run). "
+                "multi-worker writes .w0.csv .w1.csv ...\n"
+                "  ls -la /tmp/repair_loan_app_no_market*.csv\n"
+                "  # or save terminal REPAIR lines to a file and pass that path",
+                flush=True,
+            )
         return 1
     print("repair_logs=%s" % paths, flush=True)
 
