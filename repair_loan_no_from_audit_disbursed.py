@@ -517,6 +517,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.apply and args.dry_run:
         p.error("use either --apply or --dry-run, not both")
+    if args.apply_only:
+        args.apply = True
     dry_run = not args.apply
 
     raw_rows: List[dict] = []
@@ -570,8 +572,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             "%Y%m%d_%H%M%S"
         )
     print(
-        "start dry_run=%s workers=%s batch_size=%s repair_log=%s"
-        % (dry_run, args.workers, args.batch_size, repair_log or "(off)"),
+        "start mode=%s workers=%s batch_size=%s repair_log=%s"
+        % (
+            "DRY_RUN" if dry_run else "APPLY",
+            args.workers,
+            args.batch_size,
+            repair_log or "(off)",
+        ),
         flush=True,
     )
     if args.workers > 1:
