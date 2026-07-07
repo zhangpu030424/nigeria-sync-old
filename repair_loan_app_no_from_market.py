@@ -8,6 +8,8 @@
   → SELECT appId FROM ng_loan_market.application WHERE applicationNo='178072863512023153'
   → 更新为 ng{appId:04d}-178072863512023153
 
+  主键冲突时只 skip，不 DELETE 任何 loan 行（需人工处理重复）。
+
 Usage:
   python3 repair_loan_app_no_from_market.py --env ./ng_migration.env --dry-run
   python3 repair_loan_app_no_from_market.py --env ./ng_migration.env --dry-run \\
@@ -122,6 +124,21 @@ def market_suffix(application_no: str) -> str:
 def is_short_loan_no(loan_no: str, max_core_len: int = 14) -> bool:
     m = LOAN_NO_RE.match(str(loan_no or "").strip())
     return bool(m and len(m.group(1)) <= max_core_len)
+
+
+def fetch_pk_conflict_row(
+    tgt, app_no: str, period, roll_sequence, exclude_loan_no: str
+) -> Optional[dict]:
+    with tgt.cursor() as cur:
+        cur.execute(
+            """
+            SELECT loan_no, application_no FROM loan
+            WHERE application_no=%s AND period=%s AND roll_sequence=%s
+              AND loan_no <> %s LIMIT 1
+            """,
+            (app_no, period, roll_sequence, exclude_loan_no),
+        )
+        return cur.fetchone()
 
 
 def load_all_bad_loans(tgt, min_market_len: int) -> List[dict]:
@@ -265,18 +282,6 @@ class RepairLog(object):
             self._fp.flush()
 
 
-def pk_row_exists(tgt, app_no: str, period, roll_sequence, exclude_loan_no: str) -> bool:
-    with tgt.cursor() as cur:
-        cur.execute(
-            """
-            SELECT loan_no FROM loan
-            WHERE application_no=%s AND period=%s AND roll_sequence=%s
-              AND loan_no <> %s LIMIT 1
-            """,
-            (app_no, period, roll_sequence, exclude_loan_no),
-        )
-        return cur.fetchone() is not None
-
 
 def apply_one(
     tgt, row: dict, dry_run: bool, tracker: Optional[CommitTracker], log: Optional[RepairLog]
@@ -306,34 +311,31 @@ def apply_one(
             log.record("skip", row, "app_changed:%s" % current)
         return "skip_changed"
 
-    action = "update"
-    if pk_row_exists(tgt, good, period, roll, loan_no):
-        action = "delete_dup"
+    conflict = fetch_pk_conflict_row(tgt, good, period, roll, loan_no)
+    if conflict:
+        conflict_ln = str(conflict["loan_no"])
+        if log:
+            log.record(
+                "skip",
+                row,
+                "pk_conflict:good_app_taken_by:%s" % conflict_ln,
+            )
+        return "skip_pk_conflict"
 
     if dry_run:
         if log:
-            log.record("would_" + action, row, action)
+            log.record("would_update", row, "update")
         return "ok"
 
     try:
         with tgt.cursor() as cur:
-            if action == "delete_dup":
-                cur.execute(
-                    """
-                    DELETE FROM loan
-                    WHERE loan_no=%s AND application_no=%s
-                      AND period=%s AND roll_sequence=%s
-                    """,
-                    (loan_no, bad, period, roll),
-                )
-            else:
-                cur.execute(
-                    """
-                    UPDATE loan SET application_no=%s
-                    WHERE loan_no=%s AND application_no=%s
-                    """,
-                    (good, loan_no, bad),
-                )
+            cur.execute(
+                """
+                UPDATE loan SET application_no=%s
+                WHERE loan_no=%s AND application_no=%s
+                """,
+                (good, loan_no, bad),
+            )
             if not cur.rowcount:
                 if log:
                     log.record("skip", row, "no_row")
@@ -346,7 +348,7 @@ def apply_one(
         return "skip_integrity"
 
     if log:
-        log.record(action, row, "ok")
+        log.record("update", row, "ok")
     if tracker:
         tracker.note_write()
     else:
