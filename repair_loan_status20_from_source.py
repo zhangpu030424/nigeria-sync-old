@@ -55,6 +55,14 @@ from repair_loan_no_from_audit import (
 
 HERE = Path(__file__).resolve().parent
 LOAN_COLS = mig.LOAN_INSERT_COLS
+DUP_LIST_COLS = [
+    "loan_no",
+    "application_no",
+    "period",
+    "roll_sequence",
+    "status",
+    "due_date",
+]
 SYNC_COLS = [c for c in LOAN_COLS if c != "loan_no"]
 # 更新时不改 application_no/period/roll_sequence，避免主键冲突
 UPDATE_COLS = [
@@ -154,19 +162,109 @@ def is_wrong_application_no(
     return suffix == core_sn and len(suffix) < min_sn_len
 
 
-def load_loans_for_dup_check(tgt, due_before: Optional[str] = None) -> List[dict]:
-    """查重复 loan_no；due_before 为空则扫全表（不限 status / due_date）。"""
+def find_duplicate_loan_nos(tgt, due_before: Optional[str] = None) -> List[str]:
+    """SQL 直接找重复 loan_no，避免全表拉内存。"""
     if due_before:
         sql = """
-            SELECT %s FROM loan WHERE due_date < %%s ORDER BY loan_no ASC
-        """ % cols_sql(LOAN_COLS)
+            SELECT loan_no
+            FROM loan
+            WHERE due_date < %s
+              AND loan_no IS NOT NULL AND loan_no <> ''
+            GROUP BY loan_no
+            HAVING COUNT(*) > 1
+            ORDER BY loan_no
+        """
         args = (due_before,)
     else:
-        sql = "SELECT %s FROM loan ORDER BY loan_no ASC" % cols_sql(LOAN_COLS)
+        sql = """
+            SELECT loan_no
+            FROM loan
+            WHERE loan_no IS NOT NULL AND loan_no <> ''
+            GROUP BY loan_no
+            HAVING COUNT(*) > 1
+            ORDER BY loan_no
+        """
         args = ()
     with tgt.cursor() as cur:
         cur.execute(sql, args)
-        return list(cur.fetchall())
+        return [str(r["loan_no"]).strip() for r in cur.fetchall() if r.get("loan_no")]
+
+
+def _chunks_str(items: List[str], size: int):
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+def load_loan_rows_by_nos(
+    tgt,
+    loan_nos: List[str],
+    cols: List[str],
+    due_before: Optional[str] = None,
+    chunk: int = 500,
+) -> List[dict]:
+    uniq = sorted({str(x).strip() for x in loan_nos if x})
+    if not uniq:
+        return []
+    out: List[dict] = []
+    total = (len(uniq) + chunk - 1) // chunk
+    col_sql = cols_sql(cols)
+    for i, part in enumerate(_chunks_str(uniq, chunk), 1):
+        ph = ",".join(["%s"] * len(part))
+        if due_before:
+            sql = (
+                "SELECT %s FROM loan WHERE loan_no IN (%s) AND due_date < %%s"
+                % (col_sql, ph)
+            )
+            args: Tuple = tuple(part) + (due_before,)
+        else:
+            sql = "SELECT %s FROM loan WHERE loan_no IN (%s)" % (col_sql, ph)
+            args = tuple(part)
+        with tgt.cursor() as cur:
+            cur.execute(sql, args)
+            out.extend(cur.fetchall())
+        if i == 1 or i % 20 == 0 or i == total:
+            print(
+                "  load_dup_rows %s/%s cumulative=%s"
+                % (i, total, len(out)),
+                flush=True,
+            )
+    return out
+
+
+def load_dup_groups(
+    tgt,
+    due_before: Optional[str] = None,
+    full_rows: bool = False,
+    chunk: int = 500,
+) -> Dict[str, List[dict]]:
+    """先 SQL 找重复 loan_no，再只拉这些 key 的行（快）。"""
+    t0 = time.time()
+    print("find duplicate loan_no via SQL ...", flush=True)
+    dup_nos = find_duplicate_loan_nos(tgt, due_before)
+    print(
+        "dup_loan_no_keys=%s find_elapsed=%.1fs"
+        % (len(dup_nos), time.time() - t0),
+        flush=True,
+    )
+    if not dup_nos:
+        return {}
+    cols = LOAN_COLS if full_rows else DUP_LIST_COLS
+    rows = load_loan_rows_by_nos(tgt, dup_nos, cols, due_before, chunk)
+    print(
+        "dup_rows_loaded=%s total_elapsed=%.1fs"
+        % (len(rows), time.time() - t0),
+        flush=True,
+    )
+    return group_dup_loan_nos(rows)
+
+
+def load_loans_for_dup_check(tgt, due_before: Optional[str] = None) -> List[dict]:
+    """兼容旧接口：返回所有重复 loan_no 下的行。"""
+    groups = load_dup_groups(tgt, due_before, full_rows=True)
+    rows: List[dict] = []
+    for part in groups.values():
+        rows.extend(part)
+    return rows
 
 
 def group_dup_loan_nos(rows: List[dict]) -> Dict[str, List[dict]]:
@@ -1113,11 +1211,11 @@ def run_dup_only(cfg: Dict[str, str], args, dry_run: bool) -> int:
     try:
         dup_rows = exec_with_retry(
             tgt,
-            lambda: load_loans_for_dup_check(tgt, dup_due_before),
-            "load dup check",
+            lambda: load_dup_groups(tgt, dup_due_before, full_rows=True),
+            "load dup groups",
         )
-        print("dup_scan_rows=%s" % len(dup_rows), flush=True)
-        dup_groups = group_dup_loan_nos(dup_rows)
+        print("dup_scan_groups=%s" % len(dup_rows), flush=True)
+        dup_groups = dup_rows
         if not dup_groups:
             print("no duplicate loan_no found", flush=True)
             return 0
@@ -1235,12 +1333,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         try:
             scope = dup_due_before or "ALL"
             print("list-dup scope=%s (all status)" % scope, flush=True)
-            rows = exec_with_retry(
+            dup_groups = exec_with_retry(
                 tgt,
-                lambda: load_loans_for_dup_check(tgt, dup_due_before),
-                "load dup check",
+                lambda: load_dup_groups(tgt, dup_due_before, full_rows=False),
+                "load dup groups",
             )
-            dup_groups = group_dup_loan_nos(rows)
             if not dup_groups:
                 print("no duplicate loan_no found", flush=True)
                 return 0
@@ -1285,13 +1382,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         dup_stats: Dict[str, int] = {}
         dup_skip_pks = set()
         if not args.no_fix_dup_app_no:
-            dup_rows = exec_with_retry(
+            dup_groups = exec_with_retry(
                 tgt,
-                lambda: load_loans_for_dup_check(tgt, dup_due_before),
-                "load dup check",
+                lambda: load_dup_groups(tgt, dup_due_before, full_rows=True),
+                "load dup groups",
             )
-            print("dup_scan_rows=%s" % len(dup_rows), flush=True)
-            dup_groups = group_dup_loan_nos(dup_rows)
+            print("dup_scan_groups=%s" % len(dup_groups), flush=True)
             dup_ext_sns = collect_ext_sns_from_dup_groups(dup_groups, args.min_sn_len)
             dup_market = fetch_market_app_no_by_ext_sn(src, dup_ext_sns)
             dup_plan, dup_stats = build_dup_app_no_plan(
