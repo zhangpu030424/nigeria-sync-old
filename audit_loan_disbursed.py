@@ -10,22 +10,18 @@
 
 每个 application_no 在 loan 表应 **有且仅有 1 条** 对应行。
 
-期望 loan_no（源库 canonical，由 --loan-no-sn 选择中间段）:
-  1. 从 application_no 取 market 后缀，如 ng0562-177702748012033909 → 177702748012033909
-  2. 源库查 ext_sn = market_suffix:
-     plan_sn（默认）: repay_plan 最大 plan_sn 那条
-     core_sn: SELECT sn FROM ng_loan_core.application WHERE ext_sn = '{market_suffix}'
+期望 loan_no（与 ng_migration_run / window_upsert 一致）:
+  1. 从 application_no 取 market 后缀（ext_sn）
+  2. 源库: SELECT sn FROM ng_loan_core.application WHERE ext_sn = '{market_suffix}'
+     （= repay_plan.sn，不是 plan_sn，不是 market 长号）
   3. loan_no = ng-{sn}-{period:02d}{roll_sequence:03d}
-     例 plan_sn: ng-217770275191-01000
-     例 core_sn: ng-178126532212019674-01000（与 ng_migration_run 入库逻辑一致）
 
 Usage:
-  # 全量核对（默认 plan_sn 中间段）
+  # 全量核对（默认 sn = core application.sn）
   python3 audit_loan_disbursed.py --env ./ng_migration.env --workers 8
 
-  # 用 core application.sn 作为 loan_no 中间段（对齐迁移入库）
-  python3 audit_loan_disbursed.py --env ./ng_migration.env --workers 16 \\
-    --loan-no-sn core_sn --issues-csv /tmp/loan_audit_issues_core_sn.csv
+  # 历史对比：按 plan_sn 对账
+  python3 audit_loan_disbursed.py --env ./ng_migration.env --loan-no-sn plan_sn
 
   # 抽样
   python3 audit_loan_disbursed.py --env ./ng_migration.env --work-limit 10000
@@ -371,10 +367,20 @@ def fetch_core_sn_only(src, ext_sns: List[str]) -> Dict[str, str]:
     return out
 
 
+def normalize_loan_no_sn_mode(mode: str) -> str:
+    """sn / core_sn → core_sn；plan_sn 保留用于历史对比。"""
+    m = str(mode or "sn").strip().lower()
+    if m in ("sn", "core_sn"):
+        return "core_sn"
+    if m == "plan_sn":
+        return "plan_sn"
+    raise ValueError("loan_no_sn must be sn, core_sn, or plan_sn: %r" % mode)
+
+
 def expected_loan_no(
-    plan_sn: str, period: int = 1, roll_sequence: int = 0
+    sn: str, period: int = 1, roll_sequence: int = 0
 ) -> str:
-    return mig.format_loan_no(plan_sn, period, roll_sequence)
+    return mig.format_loan_no(sn, period, roll_sequence)
 
 
 def reconcile_one(
@@ -384,7 +390,7 @@ def reconcile_one(
     core_only: str,
     default_period: int,
     default_roll: int,
-    loan_no_sn: str = "plan_sn",
+    loan_no_sn: str = "core_sn",
 ) -> List[dict]:
     """返回该 application 的所有 issue 行（0~n）。"""
     app_no = str(app["application_no"]).strip()
@@ -510,7 +516,7 @@ def reconcile_apps(
     default_roll: int,
     log_every: int = 200000,
     prefix: str = "",
-    loan_no_sn: str = "plan_sn",
+    loan_no_sn: str = "core_sn",
 ) -> Tuple[List[dict], int]:
     issues: List[dict] = []
     skipped = 0
@@ -566,7 +572,7 @@ def _worker_reconcile(spec: dict) -> Tuple[List[dict], int]:
         spec["default_roll"],
         spec.get("log_every", 200000),
         label,
-        spec.get("loan_no_sn", "plan_sn"),
+        spec.get("loan_no_sn", "core_sn"),
     )
     print(
         "%sdone issues=%s skipped=%s" % (label, len(issues), skipped),
@@ -585,7 +591,7 @@ def run_parallel_reconcile(
     default_period: int,
     default_roll: int,
     log_every: int,
-    loan_no_sn: str = "plan_sn",
+    loan_no_sn: str = "core_sn",
 ) -> Tuple[List[dict], int]:
     workers = min(max(1, int(workers)), 32)
     chunks = split_chunks(apps, workers)
@@ -846,12 +852,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     p.add_argument(
         "--loan-no-sn",
-        choices=("plan_sn", "core_sn"),
-        default="plan_sn",
-        help="期望 loan_no 中间段：plan_sn=repay_plan 最大 plan_sn；"
-        "core_sn=ng_loan_core.application.sn（ext_sn 查，对齐迁移入库）",
+        choices=("sn", "core_sn", "plan_sn"),
+        default="sn",
+        help="期望 loan_no 中间段：sn/core_sn=ng_loan_core.application.sn（=repay_plan.sn，"
+        "与迁移/upsert 一致）；plan_sn=仅历史对比",
     )
     args = p.parse_args(argv)
+    args.loan_no_sn = normalize_loan_no_sn_mode(args.loan_no_sn)
 
     source_workers = args.source_workers or args.workers
 
@@ -860,8 +867,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     t0 = time.time()
 
     issues_csv = args.issues_csv
-    if issues_csv == "/tmp/loan_audit_issues.csv" and args.loan_no_sn == "core_sn":
-        issues_csv = "/tmp/loan_audit_issues_core_sn.csv"
+    if issues_csv == "/tmp/loan_audit_issues.csv" and args.loan_no_sn == "plan_sn":
+        issues_csv = "/tmp/loan_audit_issues_plan_sn.csv"
 
     print(
         "audit_loan_disbursed start workers=%s source_workers=%s work_limit=%s "

@@ -2034,7 +2034,16 @@ def format_application_no(app_id: Any, suffix: Any) -> str:
     return f"{COUNTRY_CODE}{app_id_int:04d}-{tail}"
 
 
+def loan_sn_from_repay_plan(rp: dict) -> str:
+    """loan_no 中间段 canonical：repay_plan.sn（= ng_loan_core.application.sn）。
+
+    勿用 plan_sn，勿用 market applicationNo / ext_sn。
+    """
+    return str(rp.get("sn") or "").strip()
+
+
 def format_loan_no(sn: Any, period: int = 1, roll_sequence: int = 0) -> str:
+    """ng-{sn}-{period:02d}{roll_sequence:03d}；sn 为 repay_plan.sn / core application.sn。"""
     core_sn = str(sn or "").strip()
     if not core_sn:
         return ""
@@ -2411,7 +2420,7 @@ def _build_loan_row(rp: dict, application_no: str) -> dict:
     paid_time_ms = _to_epoch_ms(repay_last) if repay_last > 0 else 0
     period = 1
     roll_sequence = 0
-    loan_sn = str(rp.get("sn") or "").strip()
+    loan_sn = loan_sn_from_repay_plan(rp)
     return {
         "loan_no": format_loan_no(loan_sn, period, roll_sequence),
         "application_no": application_no,

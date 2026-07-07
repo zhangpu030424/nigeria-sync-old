@@ -4,7 +4,7 @@
 
 Old target rows typically use:
   application.application_no = market applicationNo (e.g. 178225557412028023)
-  loan.loan_no                 = NG-{plan_sn}
+  loan.loan_no                 = ng-{core_sn}-01000  (repay_plan.sn / application.sn)
   loan.application_no          = market applicationNo
 
 New format (see ng_migration_run.format_*):
