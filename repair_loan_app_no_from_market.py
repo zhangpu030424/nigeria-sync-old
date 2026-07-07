@@ -14,7 +14,7 @@ Usage:
     --plan-file /tmp/fix_app_no_market_plan.json
 
   python3 repair_loan_app_no_from_market.py --env ./ng_migration.env --apply-only \\
-    --plan-file /tmp/fix_app_no_market_plan.json --batch-size 200
+    --plan-file /tmp/fix_app_no_market_plan.json --batch-size 200 --workers 4
 """
 import argparse
 import csv
@@ -408,19 +408,20 @@ def _apply_with_retry(
     return "skip_no_row", conn
 
 
-def run_apply_batch(
+def run_apply_batch_chunk(
     cfg: Dict[str, str],
     plan: List[dict],
     batch_size: int,
     dry_run: bool,
-    repair_log: str,
+    repair_log: str = "",
+    prefix: str = "",
 ) -> Tuple[int, int]:
     if batch_size <= 0:
         batch_size = 200
     tgt = connect_target(cfg, for_apply=True)
     log = RepairLog(repair_log if not dry_run else None)
     ok = skip = 0
-    total_batches = (len(plan) + batch_size - 1) // batch_size
+    total_batches = (len(plan) + batch_size - 1) // batch_size if plan else 0
     try:
         for bi in range(0, len(plan), batch_size):
             part = plan[bi : bi + batch_size]
@@ -428,8 +429,8 @@ def run_apply_batch(
             if dry_run:
                 ok += len(part)
                 print(
-                    "batch %s/%s would_update=%s"
-                    % (bno, total_batches, len(part)),
+                    "%sbatch %s/%s would_update=%s"
+                    % (prefix, bno, total_batches, len(part)),
                     flush=True,
                 )
                 continue
@@ -437,21 +438,21 @@ def run_apply_batch(
                 n = exec_with_retry(
                     tgt,
                     lambda p=part: apply_batch_update(tgt, p),
-                    "batch update %s" % bno,
+                    "%sbatch update %s" % (prefix, bno),
                 )
                 tgt.commit()
                 ok += n
                 skip += len(part) - n
                 print(
-                    "batch %s/%s updated=%s batch_rows=%s total_ok=%s"
-                    % (bno, total_batches, n, len(part), ok),
+                    "%sbatch %s/%s updated=%s batch_rows=%s total_ok=%s"
+                    % (prefix, bno, total_batches, n, len(part), ok),
                     flush=True,
                 )
             except pymysql.err.IntegrityError:
                 tgt.rollback()
                 print(
-                    "batch %s/%s integrity_error fallback row-by-row"
-                    % (bno, total_batches),
+                    "%sbatch %s/%s integrity_error fallback row-by-row"
+                    % (prefix, bno, total_batches),
                     flush=True,
                 )
                 for row in part:
@@ -466,6 +467,81 @@ def run_apply_batch(
     finally:
         log.close()
         tgt.close()
+    return ok, skip
+
+
+def run_apply_batch(
+    cfg: Dict[str, str],
+    plan: List[dict],
+    batch_size: int,
+    dry_run: bool,
+    repair_log: str,
+) -> Tuple[int, int]:
+    return run_apply_batch_chunk(
+        cfg, plan, batch_size, dry_run, repair_log=repair_log
+    )
+
+
+def batch_worker_run(spec: dict) -> Tuple[int, int]:
+    label = "[%s/%s] " % (spec["worker_id"], spec["workers"])
+    chunk = spec.get("plan_chunk") or []
+    if not chunk:
+        return 0, 0
+    cfg = load_env(Path(spec["env"]))
+    print(
+        "%sstart rows=%s batch_size=%s"
+        % (label, len(chunk), spec["batch_size"]),
+        flush=True,
+    )
+    ok, skip = run_apply_batch_chunk(
+        cfg,
+        chunk,
+        spec["batch_size"],
+        spec["dry_run"],
+        spec.get("repair_log") or "",
+        label,
+    )
+    print("%sdone ok=%s skip=%s" % (label, ok, skip), flush=True)
+    return ok, skip
+
+
+def run_parallel_batch(
+    plan: List[dict],
+    workers: int,
+    env_path: str,
+    batch_size: int,
+    dry_run: bool,
+    repair_log: str,
+) -> Tuple[int, int]:
+    workers = min(max(1, int(workers)), 16)
+    chunks = split_chunks(plan, workers)
+    specs = []
+    for i, chunk in enumerate(chunks):
+        if not chunk:
+            continue
+        wlog = _worker_log_path(repair_log, i) if repair_log else ""
+        specs.append(
+            {
+                "worker_id": i,
+                "workers": workers,
+                "env": env_path,
+                "dry_run": dry_run,
+                "batch_size": batch_size,
+                "plan_chunk": chunk,
+                "repair_log": wlog,
+            }
+        )
+    print(
+        "parallel_batch workers=%s rows=%s batch_size=%s"
+        % (len(specs), len(plan), batch_size),
+        flush=True,
+    )
+    ctx = multiprocessing.get_context("spawn")
+    with ctx.Pool(processes=len(specs)) as pool:
+        results = pool.map(batch_worker_run, specs)
+    ok = sum(r[0] for r in results)
+    skip = sum(r[1] for r in results)
+    print("parallel_batch done ok=%s skip=%s" % (ok, skip), flush=True)
     return ok, skip
 
 
@@ -648,7 +724,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--min-market-len", type=int, default=15)
-    p.add_argument("--workers", type=int, default=1, help="逐条模式并发进程数")
+    p.add_argument("--workers", type=int, default=4, help="批/逐条模式并发进程数")
     p.add_argument("--batch-size", type=int, default=200, help="批更新每批行数，0=逐条")
     p.add_argument(
         "--row-by-row",
@@ -748,14 +824,29 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     env_path = str(Path(args.env).resolve())
     if args.batch_size > 0:
-        print(
-            "apply batch_mode batch_size=%s rows=%s"
-            % (args.batch_size, len(plan)),
-            flush=True,
-        )
-        ok, skip = run_apply_batch(
-            cfg, plan, args.batch_size, dry_run, repair_log
-        )
+        if args.workers > 1:
+            print(
+                "apply parallel_batch workers=%s batch_size=%s rows=%s"
+                % (args.workers, args.batch_size, len(plan)),
+                flush=True,
+            )
+            ok, skip = run_parallel_batch(
+                plan,
+                args.workers,
+                env_path,
+                args.batch_size,
+                dry_run,
+                repair_log if not dry_run else "",
+            )
+        else:
+            print(
+                "apply batch_mode batch_size=%s rows=%s"
+                % (args.batch_size, len(plan)),
+                flush=True,
+            )
+            ok, skip = run_apply_batch(
+                cfg, plan, args.batch_size, dry_run, repair_log
+            )
     elif args.workers > 1:
         ok, skip = run_parallel(
             plan,
