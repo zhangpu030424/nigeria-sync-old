@@ -115,13 +115,14 @@ def _grep_missing_loan_lines(path: Path) -> Iterable[str]:
     """大 CSV 用 grep 先筛 missing_loan 行，避免解析 250 万行。"""
     proc = subprocess.run(
         ["grep", "-F", "missing_loan", str(path)],
-        capture_output=True,
-        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
         check=False,
     )
     if proc.returncode not in (0, 1):
         raise RuntimeError("grep failed: %s" % (proc.stderr or proc.stdout))
-    for line in proc.stdout.splitlines():
+    for line in (proc.stdout or "").splitlines():
         if line.strip():
             yield line
 
