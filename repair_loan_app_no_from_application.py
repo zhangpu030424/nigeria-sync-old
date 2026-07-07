@@ -19,7 +19,9 @@ Usage:
     --plan-file /tmp/fix_app_no_plan.json --sql-out /tmp/fix_app_no.sql
 
   python3 repair_loan_app_no_from_application.py --env ./ng_migration.env --apply-only \\
-    --plan-file /tmp/fix_app_no_plan.json --workers 4 --commit-every 20
+    --plan-file /tmp/fix_app_no_plan.json --batch-size 200
+
+  # 内存批更新（默认）：plan 已在 json，每批一条 JOIN UPDATE，约 24 次 SQL
 """
 import argparse
 import hashlib
@@ -141,6 +143,40 @@ def scan_mismatch_batch(
         return list(cur.fetchall())
 
 
+def fetch_all_mismatch(tgt, bad_prefix_only: bool) -> List[dict]:
+    """一次查询拉全量到内存（约几千行）。"""
+    sql = """
+        SELECT
+            l.loan_no,
+            l.application_no AS bad_application_no,
+            a.application_no AS good_application_no
+        FROM loan l
+        INNER JOIN application a
+          ON a.sn = SUBSTRING_INDEX(SUBSTRING_INDEX(l.loan_no, '-', 2), '-', -1)
+        WHERE l.application_no <> a.application_no
+          AND l.loan_no REGEXP '^[Nn][Gg]-[0-9]+-[0-9]{5}$'
+    """
+    if bad_prefix_only:
+        sql += " AND l.application_no REGEXP '^ng[0-9]{5,}-'"
+    sql += " ORDER BY l.loan_no ASC"
+    with tgt.cursor() as cur:
+        cur.execute(sql)
+        rows = list(cur.fetchall())
+    plan: List[dict] = []
+    for row in rows:
+        bad = str(row["bad_application_no"] or "").strip()
+        good = str(row["good_application_no"] or "").strip()
+        if good and bad != good:
+            plan.append(
+                {
+                    "loan_no": str(row["loan_no"]),
+                    "bad_application_no": bad,
+                    "good_application_no": good,
+                }
+            )
+    return plan
+
+
 def build_plan(
     tgt, scan_size: int, work_limit: int, bad_prefix_only: bool
 ) -> Tuple[List[dict], Dict[str, int]]:
@@ -209,27 +245,119 @@ def loan_pk_exists(tgt, app_no: str, loan_no: str) -> bool:
         return cur.fetchone() is not None
 
 
+def apply_batch_update(tgt, rows: List[dict]) -> int:
+    """一批行合成一条 UPDATE … JOIN (UNION ALL …)。"""
+    if not rows:
+        return 0
+    parts: List[str] = []
+    params: List = []
+    for r in rows:
+        parts.append("SELECT %s AS loan_no, %s AS bad_app, %s AS good_app")
+        params.extend(
+            [r["loan_no"], r["bad_application_no"], r["good_application_no"]]
+        )
+    sql = (
+        """
+        UPDATE loan l
+        INNER JOIN (
+        """
+        + " UNION ALL ".join(parts)
+        + """
+        ) x ON l.loan_no = x.loan_no AND l.application_no = x.bad_app
+        SET l.application_no = x.good_app
+        """
+    )
+    with tgt.cursor() as cur:
+        cur.execute(sql, tuple(params))
+        return int(cur.rowcount or 0)
+
+
+def run_apply_batch(
+    cfg: Dict[str, str],
+    plan: List[dict],
+    batch_size: int,
+    dry_run: bool,
+) -> Tuple[int, int]:
+    """内存 plan 按批 UPDATE，单连接顺序提交。"""
+    if batch_size <= 0:
+        batch_size = 200
+    tgt = connect_target(cfg, for_apply=True)
+    ok = skip = 0
+    total_batches = (len(plan) + batch_size - 1) // batch_size
+    try:
+        for bi in range(0, len(plan), batch_size):
+            part = plan[bi : bi + batch_size]
+            bno = bi // batch_size + 1
+            if dry_run:
+                ok += len(part)
+                print(
+                    "batch %s/%s would_update=%s"
+                    % (bno, total_batches, len(part)),
+                    flush=True,
+                )
+                continue
+            try:
+                n = exec_with_retry(
+                    tgt,
+                    lambda p=part: apply_batch_update(tgt, p),
+                    "batch update %s" % bno,
+                )
+                tgt.commit()
+                ok += n
+                skip += len(part) - n
+                print(
+                    "batch %s/%s updated=%s batch_rows=%s total_ok=%s"
+                    % (bno, total_batches, n, len(part), ok),
+                    flush=True,
+                )
+            except pymysql.err.IntegrityError:
+                tgt.rollback()
+                print(
+                    "batch %s/%s integrity_error fallback row-by-row"
+                    % (bno, total_batches),
+                    flush=True,
+                )
+                for row in part:
+                    st, tgt = _apply_with_retry(
+                        tgt, cfg, row, False, None, False
+                    )
+                    if st == "ok":
+                        ok += 1
+                    else:
+                        skip += 1
+                tgt.commit()
+    finally:
+        tgt.close()
+    return ok, skip
+
+
 def apply_one(
-    tgt, row: dict, dry_run: bool, tracker: Optional[CommitTracker]
+    tgt, row: dict, dry_run: bool, tracker: Optional[CommitTracker], check_pk: bool
 ) -> str:
     loan_no = row["loan_no"]
     good = row["good_application_no"]
     bad = row["bad_application_no"]
-    if loan_pk_exists(tgt, good, loan_no):
-        print("skip pk_conflict loan_no=%s want=%s" % (loan_no, good), flush=True)
+    if check_pk and loan_pk_exists(tgt, good, loan_no):
         return "skip_pk"
     if dry_run:
         return "ok"
-    with tgt.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE loan SET application_no=%s
-            WHERE loan_no=%s AND application_no=%s
-            """,
-            (good, loan_no, bad),
-        )
-        if not cur.rowcount:
-            return "skip_no_row"
+    try:
+        with tgt.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE loan SET application_no=%s
+                WHERE loan_no=%s AND application_no=%s
+                """,
+                (good, loan_no, bad),
+            )
+            if not cur.rowcount:
+                return "skip_no_row"
+    except pymysql.err.IntegrityError:
+        try:
+            tgt.rollback()
+        except Exception:
+            pass
+        return "skip_pk"
     if tracker:
         tracker.note_write()
     else:
@@ -237,30 +365,62 @@ def apply_one(
     return "ok"
 
 
+def _apply_with_retry(
+    tgt,
+    cfg: Dict[str, str],
+    row: dict,
+    dry_run: bool,
+    tracker: Optional[CommitTracker],
+    check_pk: bool,
+) -> Tuple[str, object]:
+    conn = tgt
+    for attempt in range(4):
+        try:
+            return apply_one(conn, row, dry_run, tracker, check_pk), conn
+        except pymysql.Error:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+            if attempt >= 3:
+                raise
+            time.sleep(1 + attempt)
+            conn = connect_target(cfg, for_apply=True)
+    return "skip_no_row", conn
+
+
 def run_apply_chunk(
     tgt,
     chunk: List[dict],
+    cfg: Dict[str, str],
     dry_run: bool,
     commit_every: int,
     log_every: int,
     sleep_ms: int = 0,
+    check_pk: bool = False,
     prefix: str = "",
 ) -> Tuple[int, int]:
     ok = skip = 0
     tracker = CommitTracker(tgt, commit_every, dry_run)
+    conn = tgt
     for i, row in enumerate(chunk, 1):
-        st = exec_with_retry(
-            tgt,
-            lambda r=row: apply_one(tgt, r, dry_run, tracker),
-            "%sfix %s" % (prefix, row["loan_no"]),
+        st, new_conn = _apply_with_retry(
+            conn, cfg, row, dry_run, tracker, check_pk
         )
+        if new_conn is not conn:
+            conn = new_conn
+            tracker.conn = conn
         if st == "ok":
             ok += 1
         else:
             skip += 1
         if sleep_ms > 0:
             time.sleep(sleep_ms / 1000.0)
-        if i <= 3 or i % max(1, log_every) == 0:
+        if i % max(1, log_every) == 0 or i == len(chunk):
             print(
                 "%sprogress ok=%s skip=%s done=%s/%s last=%s"
                 % (prefix, ok, skip, i, len(chunk), row["loan_no"]),
@@ -285,22 +445,19 @@ def worker_run(spec: dict) -> Tuple[int, int]:
     chunk = spec.get("plan_chunk") or []
     if not chunk:
         return 0, 0
-    time.sleep(spec["worker_id"] * 2)
     cfg = load_env(Path(spec["env"]))
     tgt = connect_target(cfg, for_apply=True)
     try:
-        print(
-            "%sstart rows=%s first=%s last=%s"
-            % (label, len(chunk), chunk[0]["loan_no"], chunk[-1]["loan_no"]),
-            flush=True,
-        )
+        print("%sstart rows=%s" % (label, len(chunk)), flush=True)
         ok, skip = run_apply_chunk(
             tgt,
             chunk,
+            cfg,
             spec["dry_run"],
             spec["commit_every"],
             spec["log_every"],
             spec.get("sleep_ms", 0),
+            spec.get("check_pk", False),
             label,
         )
         print("%sdone ok=%s skip=%s" % (label, ok, skip), flush=True)
@@ -317,8 +474,9 @@ def run_parallel(
     commit_every: int,
     log_every: int,
     sleep_ms: int,
+    check_pk: bool,
 ) -> Tuple[int, int]:
-    workers = min(max(1, int(workers)), 8)
+    workers = min(max(1, int(workers)), 16)
     chunks = split_chunks(plan, workers)
     specs = []
     for i, chunk in enumerate(chunks):
@@ -333,6 +491,7 @@ def run_parallel(
                 "commit_every": commit_every,
                 "log_every": log_every,
                 "sleep_ms": sleep_ms,
+                "check_pk": check_pk,
                 "plan_chunk": chunk,
             }
         )
@@ -365,10 +524,31 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     p.add_argument("--scan-size", type=int, default=500)
     p.add_argument("--work-limit", type=int, default=0)
-    p.add_argument("--workers", type=int, default=4, help="并发进程数，建议 2~4")
-    p.add_argument("--commit-every", type=int, default=20)
-    p.add_argument("--log-every", type=int, default=100)
-    p.add_argument("--sleep-ms", type=int, default=20, help="每条 UPDATE 后休眠毫秒")
+    p.add_argument("--workers", type=int, default=1, help="逐条模式并发进程数")
+    p.add_argument("--batch-size", type=int, default=200, help="批更新每批行数，0=逐条")
+    p.add_argument(
+        "--row-by-row",
+        action="store_true",
+        help="逐条 UPDATE（慢），不用批 JOIN",
+    )
+    p.add_argument(
+        "--load-all",
+        action="store_true",
+        help="扫 plan 时用一条大 SELECT 拉全量到内存",
+    )
+    p.add_argument("--commit-every", type=int, default=200)
+    p.add_argument("--log-every", type=int, default=500)
+    p.add_argument("--sleep-ms", type=int, default=0, help="每条 UPDATE 后休眠毫秒，0=不休眠")
+    p.add_argument(
+        "--check-pk",
+        action="store_true",
+        help="UPDATE 前查主键冲突（慢，默认关闭，冲突时靠 IntegrityError skip）",
+    )
+    p.add_argument(
+        "--fast",
+        action="store_true",
+        help="batch-size>=500，批模式",
+    )
     p.add_argument("--plan-file", default="", help="保存/读取 plan json")
     p.add_argument("--rebuild-plan", action="store_true")
     p.add_argument("--sql-out", default="", help="导出逐条 UPDATE SQL（IDEA 分批执行）")
@@ -380,6 +560,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         p.error("--apply-only requires --plan-file")
     if args.apply_only:
         args.apply = True
+    if args.fast:
+        args.batch_size = max(args.batch_size, 500)
+        args.workers = 1
+    if args.row_by_row:
+        args.batch_size = 0
     dry_run = not args.apply
     bad_prefix_only = not args.all_mismatch
     plan_path = Path(args.plan_file) if args.plan_file.strip() else None
@@ -406,16 +591,25 @@ def main(argv: Optional[List[str]] = None) -> int:
                     flush=True,
                 )
             else:
-                cnt = count_mismatch(tgt, bad_prefix_only)
-                print(
-                    "mismatch_count=%s bad_prefix_only=%s dry_run=%s"
-                    % (cnt, bad_prefix_only, dry_run),
-                    flush=True,
-                )
-                stats: Dict[str, int] = {}
-                plan, stats = build_plan(
-                    tgt, args.scan_size, args.work_limit, bad_prefix_only
-                )
+                if args.load_all:
+                    print("load-all: one query fetch mismatch ...", flush=True)
+                    plan = exec_with_retry(
+                        tgt,
+                        lambda: fetch_all_mismatch(tgt, bad_prefix_only),
+                        "fetch all mismatch",
+                    )
+                    stats = {"batches": 1, "load_all": len(plan)}
+                else:
+                    cnt = count_mismatch(tgt, bad_prefix_only)
+                    print(
+                        "mismatch_count=%s bad_prefix_only=%s dry_run=%s"
+                        % (cnt, bad_prefix_only, dry_run),
+                        flush=True,
+                    )
+                    stats = {}
+                    plan, stats = build_plan(
+                        tgt, args.scan_size, args.work_limit, bad_prefix_only
+                    )
                 print("scan_stats=%s plan=%s" % (stats, len(plan)), flush=True)
                 if plan_path is not None:
                     save_plan(plan_path, plan)
@@ -457,34 +651,45 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     env_path = str(Path(args.env).resolve())
-    print(
-        "apply workers=%s rows=%s commit_every=%s sleep_ms=%s"
-        % (args.workers, len(plan), args.commit_every, args.sleep_ms),
-        flush=True,
-    )
-    if args.workers > 1:
-        ok, skip = run_parallel(
-            plan,
-            args.workers,
-            env_path,
-            dry_run,
-            args.commit_every,
-            args.log_every,
-            args.sleep_ms,
+    if args.batch_size > 0:
+        print(
+            "apply batch_mode batch_size=%s rows=%s"
+            % (args.batch_size, len(plan)),
+            flush=True,
         )
+        ok, skip = run_apply_batch(cfg, plan, args.batch_size, dry_run)
     else:
-        tgt = connect_target(cfg, for_apply=True)
-        try:
-            ok, skip = run_apply_chunk(
-                tgt,
+        print(
+            "apply row_mode workers=%s rows=%s commit_every=%s"
+            % (args.workers, len(plan), args.commit_every),
+            flush=True,
+        )
+        if args.workers > 1:
+            ok, skip = run_parallel(
                 plan,
+                args.workers,
+                env_path,
                 dry_run,
                 args.commit_every,
                 args.log_every,
                 args.sleep_ms,
+                args.check_pk,
             )
-        finally:
-            tgt.close()
+        else:
+            tgt = connect_target(cfg, for_apply=True)
+            try:
+                ok, skip = run_apply_chunk(
+                    tgt,
+                    plan,
+                    cfg,
+                    dry_run,
+                    args.commit_every,
+                    args.log_every,
+                    args.sleep_ms,
+                    args.check_pk,
+                )
+            finally:
+                tgt.close()
     print("done ok=%s skip=%s" % (ok, skip), flush=True)
     return 0
 
