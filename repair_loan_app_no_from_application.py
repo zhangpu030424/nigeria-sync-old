@@ -18,13 +18,15 @@ Usage:
   python3 repair_loan_app_no_from_application.py --env ./ng_migration.env --dry-run \\
     --plan-file /tmp/fix_app_no_plan.json --sql-out /tmp/fix_app_no.sql
 
-  # IDEA 里打开 fix_app_no.sql，每段 START TRANSACTION...COMMIT 逐段执行
+  python3 repair_loan_app_no_from_application.py --env ./ng_migration.env --apply-only \\
+    --plan-file /tmp/fix_app_no_plan.json --workers 4 --commit-every 20
 """
 import argparse
 import hashlib
 import json
 import multiprocessing
 import re
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -80,7 +82,7 @@ def load_env(path: Path) -> Dict[str, str]:
     return cfg
 
 
-def connect_target(cfg: Dict[str, str]):
+def connect_target(cfg: Dict[str, str], for_apply: bool = False):
     return pymysql.connect(
         host=cfg["TARGET_HOST"],
         port=int(cfg.get("TARGET_PORT", "3306")),
@@ -89,8 +91,9 @@ def connect_target(cfg: Dict[str, str]):
         database=cfg.get("TARGET_DB", "ng"),
         charset="utf8mb4",
         cursorclass=DictCursor,
-        read_timeout=3600,
-        write_timeout=3600,
+        connect_timeout=10,
+        read_timeout=120 if for_apply else 3600,
+        write_timeout=120 if for_apply else 3600,
         autocommit=False,
     )
 
@@ -240,6 +243,7 @@ def run_apply_chunk(
     dry_run: bool,
     commit_every: int,
     log_every: int,
+    sleep_ms: int = 0,
     prefix: str = "",
 ) -> Tuple[int, int]:
     ok = skip = 0
@@ -254,10 +258,12 @@ def run_apply_chunk(
             ok += 1
         else:
             skip += 1
-        if i % max(1, log_every) == 0:
+        if sleep_ms > 0:
+            time.sleep(sleep_ms / 1000.0)
+        if i <= 3 or i % max(1, log_every) == 0:
             print(
-                "%sprogress ok=%s skip=%s last=%s"
-                % (prefix, ok, skip, row["loan_no"]),
+                "%sprogress ok=%s skip=%s done=%s/%s last=%s"
+                % (prefix, ok, skip, i, len(chunk), row["loan_no"]),
                 flush=True,
             )
     tracker.flush()
@@ -279,8 +285,9 @@ def worker_run(spec: dict) -> Tuple[int, int]:
     chunk = spec.get("plan_chunk") or []
     if not chunk:
         return 0, 0
+    time.sleep(spec["worker_id"] * 2)
     cfg = load_env(Path(spec["env"]))
-    tgt = connect_target(cfg)
+    tgt = connect_target(cfg, for_apply=True)
     try:
         print(
             "%sstart rows=%s first=%s last=%s"
@@ -293,6 +300,7 @@ def worker_run(spec: dict) -> Tuple[int, int]:
             spec["dry_run"],
             spec["commit_every"],
             spec["log_every"],
+            spec.get("sleep_ms", 0),
             label,
         )
         print("%sdone ok=%s skip=%s" % (label, ok, skip), flush=True)
@@ -308,7 +316,9 @@ def run_parallel(
     dry_run: bool,
     commit_every: int,
     log_every: int,
+    sleep_ms: int,
 ) -> Tuple[int, int]:
+    workers = min(max(1, int(workers)), 8)
     chunks = split_chunks(plan, workers)
     specs = []
     for i, chunk in enumerate(chunks):
@@ -322,6 +332,7 @@ def run_parallel(
                 "dry_run": dry_run,
                 "commit_every": commit_every,
                 "log_every": log_every,
+                "sleep_ms": sleep_ms,
                 "plan_chunk": chunk,
             }
         )
@@ -341,6 +352,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     p.add_argument("--env", default=str(HERE / "ng_migration.env"))
     p.add_argument("--apply", action="store_true")
+    p.add_argument(
+        "--apply-only",
+        action="store_true",
+        help="只读 plan-file 并并发 UPDATE，不再扫库",
+    )
     p.add_argument("--dry-run", action="store_true")
     p.add_argument(
         "--all-mismatch",
@@ -349,9 +365,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     p.add_argument("--scan-size", type=int, default=500)
     p.add_argument("--work-limit", type=int, default=0)
-    p.add_argument("--workers", type=int, default=1)
-    p.add_argument("--commit-every", type=int, default=50)
-    p.add_argument("--log-every", type=int, default=200)
+    p.add_argument("--workers", type=int, default=4, help="并发进程数，建议 2~4")
+    p.add_argument("--commit-every", type=int, default=20)
+    p.add_argument("--log-every", type=int, default=100)
+    p.add_argument("--sleep-ms", type=int, default=20, help="每条 UPDATE 后休眠毫秒")
     p.add_argument("--plan-file", default="", help="保存/读取 plan json")
     p.add_argument("--rebuild-plan", action="store_true")
     p.add_argument("--sql-out", default="", help="导出逐条 UPDATE SQL（IDEA 分批执行）")
@@ -359,50 +376,69 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = p.parse_args(argv)
     if args.apply and args.dry_run:
         p.error("use either --apply or --dry-run")
+    if args.apply_only and not args.plan_file.strip():
+        p.error("--apply-only requires --plan-file")
+    if args.apply_only:
+        args.apply = True
     dry_run = not args.apply
     bad_prefix_only = not args.all_mismatch
     plan_path = Path(args.plan_file) if args.plan_file.strip() else None
 
     cfg = load_env(Path(args.env))
     plan: List[dict] = []
-    use_cached = (
-        plan_path is not None
-        and plan_path.is_file()
-        and not args.rebuild_plan
-        and (args.sql_out or not dry_run)
-    )
-    tgt = connect_target(cfg)
-    try:
-        if use_cached:
-            plan = load_plan(plan_path)
-            print("loaded plan from %s rows=%s" % (plan_path, len(plan)), flush=True)
-        else:
-            cnt = count_mismatch(tgt, bad_prefix_only)
-            print(
-                "mismatch_count=%s bad_prefix_only=%s dry_run=%s"
-                % (cnt, bad_prefix_only, dry_run),
-                flush=True,
-            )
-            stats: Dict[str, int] = {}
-            plan, stats = build_plan(
-                tgt, args.scan_size, args.work_limit, bad_prefix_only
-            )
-            print("scan_stats=%s plan=%s" % (stats, len(plan)), flush=True)
-            if plan_path is not None:
-                save_plan(plan_path, plan)
-                print("saved plan to %s" % plan_path, flush=True)
-        for row in plan[:15]:
-            print(
-                "  %s  %s -> %s"
-                % (row["loan_no"], row["bad_application_no"], row["good_application_no"]),
-                flush=True,
-            )
-        if len(plan) > 15:
-            print("  ... and %s more" % (len(plan) - 15), flush=True)
-        if not plan:
-            return 0
-    finally:
-        tgt.close()
+
+    if args.apply_only:
+        plan = load_plan(plan_path)
+        print("apply-only loaded plan rows=%s" % len(plan), flush=True)
+    else:
+        use_cached = (
+            plan_path is not None
+            and plan_path.is_file()
+            and not args.rebuild_plan
+            and (args.sql_out or not dry_run)
+        )
+        tgt = connect_target(cfg)
+        try:
+            if use_cached:
+                plan = load_plan(plan_path)
+                print(
+                    "loaded plan from %s rows=%s" % (plan_path, len(plan)),
+                    flush=True,
+                )
+            else:
+                cnt = count_mismatch(tgt, bad_prefix_only)
+                print(
+                    "mismatch_count=%s bad_prefix_only=%s dry_run=%s"
+                    % (cnt, bad_prefix_only, dry_run),
+                    flush=True,
+                )
+                stats: Dict[str, int] = {}
+                plan, stats = build_plan(
+                    tgt, args.scan_size, args.work_limit, bad_prefix_only
+                )
+                print("scan_stats=%s plan=%s" % (stats, len(plan)), flush=True)
+                if plan_path is not None:
+                    save_plan(plan_path, plan)
+                    print("saved plan to %s" % plan_path, flush=True)
+            for row in plan[:15]:
+                print(
+                    "  %s  %s -> %s"
+                    % (
+                        row["loan_no"],
+                        row["bad_application_no"],
+                        row["good_application_no"],
+                    ),
+                    flush=True,
+                )
+            if len(plan) > 15:
+                print("  ... and %s more" % (len(plan) - 15), flush=True)
+            if not plan:
+                return 0
+        finally:
+            tgt.close()
+
+    if not plan:
+        return 0
 
     if args.sql_out:
         out = Path(args.sql_out)
@@ -421,15 +457,31 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     env_path = str(Path(args.env).resolve())
+    print(
+        "apply workers=%s rows=%s commit_every=%s sleep_ms=%s"
+        % (args.workers, len(plan), args.commit_every, args.sleep_ms),
+        flush=True,
+    )
     if args.workers > 1:
         ok, skip = run_parallel(
-            plan, args.workers, env_path, dry_run, args.commit_every, args.log_every
+            plan,
+            args.workers,
+            env_path,
+            dry_run,
+            args.commit_every,
+            args.log_every,
+            args.sleep_ms,
         )
     else:
-        tgt = connect_target(cfg)
+        tgt = connect_target(cfg, for_apply=True)
         try:
             ok, skip = run_apply_chunk(
-                tgt, plan, dry_run, args.commit_every, args.log_every
+                tgt,
+                plan,
+                dry_run,
+                args.commit_every,
+                args.log_every,
+                args.sleep_ms,
             )
         finally:
             tgt.close()
