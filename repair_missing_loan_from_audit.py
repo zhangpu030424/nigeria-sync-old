@@ -21,17 +21,23 @@ Usage:
   python3 repair_missing_loan_from_audit.py --env ./ng_migration.env --apply-only \\
     --plan-file /tmp/repair_missing_loan_plan.json
 
-  # 只分析：哪些 missing_loan 其实是 loan 挂错 application_no（导出 CSV）
+  # 只分析（默认跳过源库，最快）
   python3 repair_missing_loan_from_audit.py --env ./ng_migration.env \\
-    --issues-csv /tmp/loan_audit_issues_after_repair.csv --analyze
+    --issues-csv /tmp/loan_audit_issues.csv --analyze
+
+  # 分析时也要 insert 清单（会查源库 repay_plan，较慢）
+  python3 repair_missing_loan_from_audit.py --env ./ng_migration.env \\
+    --issues-csv /tmp/loan_audit_issues.csv --analyze --with-source
 """
 import argparse
 import csv
 import json
 import re
+import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import pymysql
 from pymysql.cursors import DictCursor
@@ -88,28 +94,81 @@ def market_suffix(application_no: str) -> str:
     return m.group(1).strip() if m else ""
 
 
-def load_missing_from_csv(path: Path) -> List[dict]:
+def _job_from_issue_row(row: dict) -> Optional[dict]:
+    app_no = str(row.get("application_no") or "").strip()
+    core_sn = str(row.get("core_sn") or row.get("loan_sn_used") or "").strip()
+    exp_ln = str(row.get("expected_loan_no") or "").strip()
+    if not app_no or not core_sn:
+        return None
+    if not exp_ln:
+        exp_ln = mig.format_loan_no(core_sn, 1, 0)
+    return {
+        "application_no": app_no,
+        "core_sn": core_sn,
+        "expected_loan_no": exp_ln,
+        "market_suffix": market_suffix(app_no),
+        "app_id": row.get("app_id"),
+    }
+
+
+def _grep_missing_loan_lines(path: Path) -> Iterable[str]:
+    """大 CSV 用 grep 先筛 missing_loan 行，避免解析 250 万行。"""
+    proc = subprocess.run(
+        ["grep", "-F", "missing_loan", str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode not in (0, 1):
+        raise RuntimeError("grep failed: %s" % (proc.stderr or proc.stdout))
+    for line in proc.stdout.splitlines():
+        if line.strip():
+            yield line
+
+
+def load_missing_from_csv(path: Path, use_grep: bool = True) -> List[dict]:
     out: List[dict] = []
+    t0 = time.perf_counter()
+
+    if use_grep and path.stat().st_size > 5_000_000:
+        try:
+            lines = list(_grep_missing_loan_lines(path))
+            if not lines:
+                return out
+            with path.open(encoding="utf-8", newline="") as fp:
+                header = fp.readline().strip()
+            fieldnames = next(csv.reader([header]))
+            for line in lines:
+                if line == header:
+                    continue
+                row = dict(zip(fieldnames, next(csv.reader([line]))))
+                if str(row.get("issue") or "").strip() != "missing_loan":
+                    continue
+                job = _job_from_issue_row(row)
+                if job:
+                    out.append(job)
+            print(
+                "load_missing_from_csv grep lines=%s jobs=%s elapsed=%.1fs"
+                % (len(lines), len(out), time.time() - t0),
+                flush=True,
+            )
+            return out
+        except (FileNotFoundError, OSError, RuntimeError) as exc:
+            print("grep fast-path failed (%s), fallback stream" % exc, flush=True)
+
     with path.open(encoding="utf-8", newline="") as fp:
-        for row in csv.DictReader(fp):
+        reader = csv.DictReader(fp)
+        for row in reader:
             if str(row.get("issue") or "").strip() != "missing_loan":
                 continue
-            app_no = str(row.get("application_no") or "").strip()
-            core_sn = str(row.get("core_sn") or row.get("loan_sn_used") or "").strip()
-            exp_ln = str(row.get("expected_loan_no") or "").strip()
-            if not app_no or not core_sn:
-                continue
-            if not exp_ln:
-                exp_ln = mig.format_loan_no(core_sn, 1, 0)
-            out.append(
-                {
-                    "application_no": app_no,
-                    "core_sn": core_sn,
-                    "expected_loan_no": exp_ln,
-                    "market_suffix": market_suffix(app_no),
-                    "app_id": row.get("app_id"),
-                }
-            )
+            job = _job_from_issue_row(row)
+            if job:
+                out.append(job)
+    print(
+        "load_missing_from_csv stream jobs=%s elapsed=%.1fs"
+        % (len(out), time.time() - t0),
+        flush=True,
+    )
     return out
 
 
@@ -154,7 +213,7 @@ def _ping_tgt(tgt):
 
 
 def batch_query_in(
-    tgt, table: str, col: str, values: List[str], chunk: int = 500
+    tgt, table: str, col: str, values: List[str], chunk: int = 2000, label: str = ""
 ) -> Set[str]:
     """SELECT col FROM table WHERE col IN (...)，返回存在的值集合。"""
     uniq = sorted({str(v).strip() for v in values if v})
@@ -162,6 +221,7 @@ def batch_query_in(
     if not uniq:
         return found
     total = (len(uniq) + chunk - 1) // chunk
+    tag = label or "%s.%s" % (table, col)
     for i, part in enumerate(_chunks(uniq, chunk), 1):
         _ping_tgt(tgt)
         ph = ",".join(["%s"] * len(part))
@@ -170,26 +230,19 @@ def batch_query_in(
             cur.execute(sql, part)
             for row in cur.fetchall():
                 found.add(str(row["v"]).strip())
-        if i == 1 or i % 10 == 0 or i == total:
+        if i == 1 or i % 20 == 0 or i == total:
             print(
-                "  batch_query %s.%s %s/%s hits=%s"
-                % (table, col, i, total, len(found)),
+                "  batch_query %s %s/%s hits=%s"
+                % (tag, i, total, len(found)),
                 flush=True,
             )
     return found
 
 
-def preload_loan_indexes(
-    tgt, jobs: List[dict], chunk: int = 500
-) -> Tuple[Dict[str, dict], Dict[str, List[dict]]]:
-    """预加载 loan_no -> row；market_suffix -> 错挂候选行列表。"""
-    loan_nos = sorted(
-        {str(j.get("expected_loan_no") or "").strip() for j in jobs if j.get("expected_loan_no")}
-    )
-    suffixes = sorted({str(j.get("market_suffix") or "").strip() for j in jobs if j.get("market_suffix")})
+def preload_loan_by_nos(
+    tgt, loan_nos: List[str], chunk: int = 2000
+) -> Dict[str, dict]:
     by_loan_no: Dict[str, dict] = {}
-    by_suffix: Dict[str, List[dict]] = {}
-
     total_ln = (len(loan_nos) + chunk - 1) // chunk if loan_nos else 0
     for i, part in enumerate(_chunks(loan_nos, chunk), 1):
         _ping_tgt(tgt)
@@ -203,13 +256,22 @@ def preload_loan_indexes(
                 ln = str(row.get("loan_no") or "").strip()
                 if ln:
                     by_loan_no[ln] = row
-        if total_ln and (i == 1 or i % 10 == 0 or i == total_ln):
+        if total_ln and (i == 1 or i % 20 == 0 or i == total_ln):
             print(
                 "  preload loan_no %s/%s hits=%s" % (i, total_ln, len(by_loan_no)),
                 flush=True,
             )
+    return by_loan_no
 
-    total_sfx = (len(suffixes) + chunk - 1) // chunk if suffixes else 0
+
+def preload_loan_by_suffixes(
+    tgt, suffixes: List[str], chunk: int = 200
+) -> Dict[str, List[dict]]:
+    """按 market 后缀查错挂 loan（较慢，仅对 loan_no 未命中的 job 使用）。"""
+    by_suffix: Dict[str, List[dict]] = {}
+    if not suffixes:
+        return by_suffix
+    total_sfx = (len(suffixes) + chunk - 1) // chunk
     for i, part in enumerate(_chunks(suffixes, chunk), 1):
         _ping_tgt(tgt)
         ph = ",".join(["%s"] * len(part))
@@ -227,13 +289,67 @@ def preload_loan_indexes(
                 sfx = str(row.get("sfx") or "").strip()
                 if sfx:
                     by_suffix.setdefault(sfx, []).append(row)
-        if total_sfx and (i == 1 or i % 10 == 0 or i == total_sfx):
+        if i == 1 or i % 10 == 0 or i == total_sfx:
             n = sum(len(v) for v in by_suffix.values())
             print(
                 "  preload suffix %s/%s rows=%s" % (i, total_sfx, n),
                 flush=True,
             )
-    return by_loan_no, by_suffix
+    return by_suffix
+
+
+def preload_target_indexes_parallel(
+    cfg: Dict[str, str],
+    app_nos: List[str],
+    loan_nos: List[str],
+    chunk: int = 2000,
+) -> Tuple[Set[str], Set[str], Dict[str, dict]]:
+    """并行预加载 application / loan.application_no / loan.loan_no（各用独立连接）。"""
+
+    def _apps():
+        conn = connect_target(cfg)
+        try:
+            return batch_query_in(
+                conn, "application", "application_no", app_nos, chunk, "application"
+            )
+        finally:
+            conn.close()
+
+    def _loan_apps():
+        conn = connect_target(cfg)
+        try:
+            return batch_query_in(
+                conn, "loan", "application_no", app_nos, chunk, "loan.application_no"
+            )
+        finally:
+            conn.close()
+
+    def _loan_nos():
+        conn = connect_target(cfg)
+        try:
+            return preload_loan_by_nos(conn, loan_nos, chunk)
+        finally:
+            conn.close()
+
+    existing_apps: Set[str] = set()
+    apps_with_loan: Set[str] = set()
+    by_loan_no: Dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futs = {
+            pool.submit(_apps): "apps",
+            pool.submit(_loan_apps): "loan_apps",
+            pool.submit(_loan_nos): "loan_nos",
+        }
+        for fut in as_completed(futs):
+            name = futs[fut]
+            result = fut.result()
+            if name == "apps":
+                existing_apps = result
+            elif name == "loan_apps":
+                apps_with_loan = result
+            else:
+                by_loan_no = result
+    return existing_apps, apps_with_loan, by_loan_no
 
 
 def find_mislinked_in_memory(job: dict, by_loan_no: Dict[str, dict], by_suffix: Dict[str, List[dict]]) -> Optional[dict]:
@@ -321,18 +437,33 @@ def print_preview(
 
 
 def build_plan(
-    jobs: List[dict], loan_by_sn: Dict[str, dict], tgt
+    jobs: List[dict],
+    loan_by_sn: Dict[str, dict],
+    cfg: Dict[str, str],
+    tgt,
+    query_chunk: int = 2000,
+    suffix_scan: bool = True,
+    insert_from_source: bool = True,
 ) -> Tuple[List[dict], List[dict], Dict[str, int]]:
     relink_plan: List[dict] = []
     insert_plan: List[dict] = []
     skipped: Dict[str, int] = {}
 
     app_nos = [j["application_no"] for j in jobs]
-    print("preload target indexes ...", flush=True)
-    existing_apps = batch_query_in(tgt, "application", "application_no", app_nos)
-    apps_with_loan = batch_query_in(tgt, "loan", "application_no", app_nos)
-    by_loan_no, by_suffix = preload_loan_indexes(tgt, jobs)
+    loan_nos = sorted(
+        {str(j.get("expected_loan_no") or "").strip() for j in jobs if j.get("expected_loan_no")}
+    )
+    print(
+        "preload target indexes (parallel, chunk=%s) ..."
+        % query_chunk,
+        flush=True,
+    )
+    existing_apps, apps_with_loan, by_loan_no = preload_target_indexes_parallel(
+        cfg, app_nos, loan_nos, query_chunk
+    )
     existing_loan_nos = set(by_loan_no.keys())
+    by_suffix: Dict[str, List[dict]] = {}
+    need_suffix: List[dict] = []
 
     for job in jobs:
         app_no = job["application_no"]
@@ -349,6 +480,14 @@ def build_plan(
             relink_plan.append(mislinked)
             continue
 
+        if suffix_scan:
+            need_suffix.append(job)
+            continue
+
+        if not insert_from_source:
+            skipped["pending_insert"] = skipped.get("pending_insert", 0) + 1
+            continue
+
         row = loan_by_sn.get(sn)
         if not row:
             skipped["no_source_repay"] = skipped.get("no_source_repay", 0) + 1
@@ -361,6 +500,41 @@ def build_plan(
             skipped["loan_no_orphan"] = skipped.get("loan_no_orphan", 0) + 1
             continue
         insert_plan.append(row)
+
+    if need_suffix:
+        suffixes = sorted(
+            {str(j.get("market_suffix") or "").strip() for j in need_suffix if j.get("market_suffix")}
+        )
+        print(
+            "lazy suffix scan jobs=%s suffixes=%s ..."
+            % (len(need_suffix), len(suffixes)),
+            flush=True,
+        )
+        by_suffix = preload_loan_by_suffixes(tgt, suffixes)
+        for job in need_suffix:
+            app_no = job["application_no"]
+            sn = job["core_sn"]
+            mislinked = find_mislinked_in_memory(job, by_loan_no, by_suffix)
+            if mislinked:
+                relink_plan.append(mislinked)
+                continue
+
+            if not insert_from_source:
+                skipped["pending_insert"] = skipped.get("pending_insert", 0) + 1
+                continue
+
+            row = loan_by_sn.get(sn)
+            if not row:
+                skipped["no_source_repay"] = skipped.get("no_source_repay", 0) + 1
+                continue
+            loan_no = str(row.get("loan_no") or "").strip()
+            if not loan_no:
+                skipped["empty_loan_no"] = skipped.get("empty_loan_no", 0) + 1
+                continue
+            if loan_no in existing_loan_nos:
+                skipped["loan_no_orphan"] = skipped.get("loan_no_orphan", 0) + 1
+                continue
+            insert_plan.append(row)
 
     return relink_plan, insert_plan, skipped
 
@@ -423,6 +597,13 @@ def print_analyze_summary(
     print("missing_loan analyze summary", flush=True)
     print("  relink (loan存在, application挂错): %s" % len(relink_plan), flush=True)
     print("  insert (确实无loan行):             %s" % len(insert_plan), flush=True)
+    pending = int(skipped.get("pending_insert") or 0)
+    if pending:
+        print(
+            "  pending_insert (未查源库):         %s  (加 --with-source 生成 insert 清单)"
+            % pending,
+            flush=True,
+        )
     if skipped:
         print(
             "  skipped: %s"
@@ -592,6 +773,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="--analyze 时写出需 INSERT 的清单",
     )
     p.add_argument("--work-limit", type=int, default=0)
+    p.add_argument("--query-chunk", type=int, default=2000, help="目标库 IN 查询分批大小")
+    p.add_argument(
+        "--with-source",
+        action="store_true",
+        help="分析时也查源库 repay_plan（生成 insert 清单，较慢）",
+    )
+    p.add_argument(
+        "--no-suffix-scan",
+        action="store_true",
+        help="跳过 suffix 全表扫描（最快，仅 loan_no 精确匹配 relink）",
+    )
+    p.add_argument(
+        "--no-grep-csv",
+        action="store_true",
+        help="大 CSV 不用 grep 预筛",
+    )
     p.add_argument("--batch-size", type=int, default=100)
     p.add_argument("--commit-every", type=int, default=20)
     args = p.parse_args(argv)
@@ -609,7 +806,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("issues csv not found: %s" % path, flush=True)
         return 1
 
-    jobs = dedupe_jobs(load_missing_from_csv(path))
+    jobs = dedupe_jobs(load_missing_from_csv(path, use_grep=not args.no_grep_csv))
     print("missing_loan jobs=%s (from %s)" % (len(jobs), path), flush=True)
     if args.work_limit > 0:
         jobs = jobs[: args.work_limit]
@@ -639,15 +836,31 @@ def main(argv: Optional[List[str]] = None) -> int:
             insert_plan = insert_plan[: args.work_limit]
     else:
         cfg = load_env(Path(args.env))
-        src = connect_source(cfg)
+        insert_from_source = args.with_source or (not args.analyze)
+        suffix_scan = not args.no_suffix_scan
+        loan_by_sn: Dict[str, dict] = {}
+        src = None
+        if insert_from_source:
+            src = connect_source(cfg)
         tgt = connect_target(cfg)
         try:
-            loan_by_sn = fetch_loan_rows_for_jobs(src, jobs)
-            print(
-                "source_repay_hit=%s/%s" % (len(loan_by_sn), len(jobs)),
-                flush=True,
+            if insert_from_source and src is not None:
+                loan_by_sn = fetch_loan_rows_for_jobs(src, jobs)
+                print(
+                    "source_repay_hit=%s/%s" % (len(loan_by_sn), len(jobs)),
+                    flush=True,
+                )
+            elif args.analyze:
+                print("analyze fast-path: skip source DB", flush=True)
+            relink_plan, insert_plan, skipped = build_plan(
+                jobs,
+                loan_by_sn,
+                cfg,
+                tgt,
+                query_chunk=max(100, args.query_chunk),
+                suffix_scan=suffix_scan,
+                insert_from_source=insert_from_source,
             )
-            relink_plan, insert_plan, skipped = build_plan(jobs, loan_by_sn, tgt)
             if skipped:
                 print(
                     "plan_skipped %s"
@@ -674,7 +887,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 )
                 return 0
         finally:
-            src.close()
+            if src is not None:
+                src.close()
             tgt.close()
 
         if plan_path and not args.analyze:
