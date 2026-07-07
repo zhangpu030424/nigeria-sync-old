@@ -15,10 +15,14 @@
 
 Usage:
   python3 repair_loan_app_no_from_application.py --env ./ng_migration.env --dry-run
-  python3 repair_loan_app_no_from_application.py --env ./ng_migration.env --apply --workers 8
+  python3 repair_loan_app_no_from_application.py --env ./ng_migration.env --dry-run \\
+    --plan-file /tmp/fix_app_no_plan.json --sql-out /tmp/fix_app_no.sql
+
+  # IDEA 里打开 fix_app_no.sql，每段 START TRANSACTION...COMMIT 逐段执行
 """
 import argparse
 import hashlib
+import json
 import multiprocessing
 import re
 from pathlib import Path
@@ -32,6 +36,37 @@ from repair_loan_no_from_audit import CommitTracker, exec_with_retry
 HERE = Path(__file__).resolve().parent
 LOAN_NO_RE = re.compile(r"^[Nn][Gg]-(\d+)-(\d{5})$")
 BAD_APP_PREFIX_RE = re.compile(r"^ng\d{5,}-", re.I)
+
+
+def _sql_escape(s: str) -> str:
+    return str(s).replace("\\", "\\\\").replace("'", "''")
+
+
+def save_plan(path: Path, plan: List[dict]) -> None:
+    path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_plan(path: Path) -> List[dict]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_sql_file(path: Path, plan: List[dict], sql_batch: int) -> None:
+    lines = ["-- fix loan.application_no from application.sn, rows=%s" % len(plan)]
+    for i in range(0, len(plan), sql_batch):
+        part = plan[i : i + sql_batch]
+        lines.append("START TRANSACTION;")
+        for row in part:
+            good = _sql_escape(row["good_application_no"])
+            bad = _sql_escape(row["bad_application_no"])
+            loan_no = _sql_escape(row["loan_no"])
+            lines.append(
+                "UPDATE loan SET application_no='%s' "
+                "WHERE loan_no='%s' AND application_no='%s';"
+                % (good, loan_no, bad)
+            )
+        lines.append("COMMIT;")
+        lines.append("")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def load_env(path: Path) -> Dict[str, str]:
@@ -317,23 +352,45 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--workers", type=int, default=1)
     p.add_argument("--commit-every", type=int, default=50)
     p.add_argument("--log-every", type=int, default=200)
+    p.add_argument("--plan-file", default="", help="保存/读取 plan json")
+    p.add_argument("--rebuild-plan", action="store_true")
+    p.add_argument("--sql-out", default="", help="导出逐条 UPDATE SQL（IDEA 分批执行）")
+    p.add_argument("--sql-batch", type=int, default=50, help="每个事务几条 UPDATE")
     args = p.parse_args(argv)
     if args.apply and args.dry_run:
         p.error("use either --apply or --dry-run")
     dry_run = not args.apply
     bad_prefix_only = not args.all_mismatch
+    plan_path = Path(args.plan_file) if args.plan_file.strip() else None
 
     cfg = load_env(Path(args.env))
+    plan: List[dict] = []
+    use_cached = (
+        plan_path is not None
+        and plan_path.is_file()
+        and not args.rebuild_plan
+        and (args.sql_out or not dry_run)
+    )
     tgt = connect_target(cfg)
     try:
-        cnt = count_mismatch(tgt, bad_prefix_only)
-        print(
-            "mismatch_count=%s bad_prefix_only=%s dry_run=%s"
-            % (cnt, bad_prefix_only, dry_run),
-            flush=True,
-        )
-        plan, stats = build_plan(tgt, args.scan_size, args.work_limit, bad_prefix_only)
-        print("scan_stats=%s plan=%s" % (stats, len(plan)), flush=True)
+        if use_cached:
+            plan = load_plan(plan_path)
+            print("loaded plan from %s rows=%s" % (plan_path, len(plan)), flush=True)
+        else:
+            cnt = count_mismatch(tgt, bad_prefix_only)
+            print(
+                "mismatch_count=%s bad_prefix_only=%s dry_run=%s"
+                % (cnt, bad_prefix_only, dry_run),
+                flush=True,
+            )
+            stats: Dict[str, int] = {}
+            plan, stats = build_plan(
+                tgt, args.scan_size, args.work_limit, bad_prefix_only
+            )
+            print("scan_stats=%s plan=%s" % (stats, len(plan)), flush=True)
+            if plan_path is not None:
+                save_plan(plan_path, plan)
+                print("saved plan to %s" % plan_path, flush=True)
         for row in plan[:15]:
             print(
                 "  %s  %s -> %s"
@@ -346,6 +403,22 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 0
     finally:
         tgt.close()
+
+    if args.sql_out:
+        out = Path(args.sql_out)
+        write_sql_file(out, plan, args.sql_batch)
+        batches = (len(plan) + args.sql_batch - 1) // args.sql_batch
+        print(
+            "wrote sql rows=%s batches=%s file=%s"
+            % (len(plan), batches, out),
+            flush=True,
+        )
+        if not args.apply:
+            return 0
+
+    if dry_run:
+        print("dry-run done plan=%s" % len(plan), flush=True)
+        return 0
 
     env_path = str(Path(args.env).resolve())
     if args.workers > 1:
