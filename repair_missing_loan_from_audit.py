@@ -35,7 +35,6 @@ import json
 import re
 import subprocess
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
@@ -69,9 +68,9 @@ def connect_target(cfg: Dict[str, str], for_apply: bool = False):
         database=cfg.get("TARGET_DB", "ng"),
         charset="utf8mb4",
         cursorclass=DictCursor,
-        connect_timeout=10,
-        read_timeout=120 if for_apply else 3600,
-        write_timeout=120 if for_apply else 3600,
+        connect_timeout=int(cfg.get("mysql_connect_timeout") or 60),
+        read_timeout=int(cfg.get("mysql_read_timeout") or 3600),
+        write_timeout=int(cfg.get("mysql_write_timeout") or 3600),
         autocommit=False,
     )
 
@@ -213,8 +212,28 @@ def _ping_tgt(tgt):
         pass
 
 
+def _mysql_retry(conn, fn, what: str, retries: int = 5):
+    for attempt in range(retries):
+        try:
+            _ping_tgt(conn)
+            return fn()
+        except pymysql.Error as exc:
+            if attempt >= retries - 1:
+                raise
+            print(
+                "%s retry %s/%s err=%s" % (what, attempt + 1, retries, exc),
+                flush=True,
+            )
+            try:
+                conn.ping(reconnect=True)
+            except Exception:
+                pass
+            time.sleep(min(2 * (attempt + 1), 10))
+    return None
+
+
 def batch_query_in(
-    tgt, table: str, col: str, values: List[str], chunk: int = 2000, label: str = ""
+    tgt, table: str, col: str, values: List[str], chunk: int = 500, label: str = ""
 ) -> Set[str]:
     """SELECT col FROM table WHERE col IN (...)，返回存在的值集合。"""
     uniq = sorted({str(v).strip() for v in values if v})
@@ -224,13 +243,17 @@ def batch_query_in(
     total = (len(uniq) + chunk - 1) // chunk
     tag = label or "%s.%s" % (table, col)
     for i, part in enumerate(_chunks(uniq, chunk), 1):
-        _ping_tgt(tgt)
         ph = ",".join(["%s"] * len(part))
         sql = "SELECT `%s` AS v FROM `%s` WHERE `%s` IN (%s)" % (col, table, col, ph)
-        with tgt.cursor() as cur:
-            cur.execute(sql, part)
-            for row in cur.fetchall():
-                found.add(str(row["v"]).strip())
+
+        def _one_chunk(sql=sql, part=part):
+            with tgt.cursor() as cur:
+                cur.execute(sql, part)
+                return cur.fetchall()
+
+        rows = _mysql_retry(tgt, _one_chunk, "%s %s/%s" % (tag, i, total))
+        for row in rows or []:
+            found.add(str(row["v"]).strip())
         if i == 1 or i % 20 == 0 or i == total:
             print(
                 "  batch_query %s %s/%s hits=%s"
@@ -241,22 +264,26 @@ def batch_query_in(
 
 
 def preload_loan_by_nos(
-    tgt, loan_nos: List[str], chunk: int = 2000
+    tgt, loan_nos: List[str], chunk: int = 500
 ) -> Dict[str, dict]:
     by_loan_no: Dict[str, dict] = {}
     total_ln = (len(loan_nos) + chunk - 1) // chunk if loan_nos else 0
     for i, part in enumerate(_chunks(loan_nos, chunk), 1):
-        _ping_tgt(tgt)
         ph = ",".join(["%s"] * len(part))
-        with tgt.cursor() as cur:
-            cur.execute(
-                "SELECT loan_no, application_no FROM loan WHERE loan_no IN (%s)" % ph,
-                part,
-            )
-            for row in cur.fetchall():
-                ln = str(row.get("loan_no") or "").strip()
-                if ln:
-                    by_loan_no[ln] = row
+
+        def _one_chunk(ph=ph, part=part):
+            with tgt.cursor() as cur:
+                cur.execute(
+                    "SELECT loan_no, application_no FROM loan WHERE loan_no IN (%s)" % ph,
+                    part,
+                )
+                return cur.fetchall()
+
+        rows = _mysql_retry(tgt, _one_chunk, "preload loan_no %s/%s" % (i, total_ln))
+        for row in rows or []:
+            ln = str(row.get("loan_no") or "").strip()
+            if ln:
+                by_loan_no[ln] = row
         if total_ln and (i == 1 or i % 20 == 0 or i == total_ln):
             print(
                 "  preload loan_no %s/%s hits=%s" % (i, total_ln, len(by_loan_no)),
@@ -274,22 +301,26 @@ def preload_loan_by_suffixes(
         return by_suffix
     total_sfx = (len(suffixes) + chunk - 1) // chunk
     for i, part in enumerate(_chunks(suffixes, chunk), 1):
-        _ping_tgt(tgt)
         ph = ",".join(["%s"] * len(part))
-        with tgt.cursor() as cur:
-            cur.execute(
-                """
-                SELECT loan_no, application_no,
-                       SUBSTRING_INDEX(application_no, '-', -1) AS sfx
-                FROM loan
-                WHERE SUBSTRING_INDEX(application_no, '-', -1) IN (%s)
-                """ % ph,
-                part,
-            )
-            for row in cur.fetchall():
-                sfx = str(row.get("sfx") or "").strip()
-                if sfx:
-                    by_suffix.setdefault(sfx, []).append(row)
+
+        def _one_chunk(ph=ph, part=part):
+            with tgt.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT loan_no, application_no,
+                           SUBSTRING_INDEX(application_no, '-', -1) AS sfx
+                    FROM loan
+                    WHERE SUBSTRING_INDEX(application_no, '-', -1) IN (%s)
+                    """ % ph,
+                    part,
+                )
+                return cur.fetchall()
+
+        rows = _mysql_retry(tgt, _one_chunk, "preload suffix %s/%s" % (i, total_sfx))
+        for row in rows or []:
+            sfx = str(row.get("sfx") or "").strip()
+            if sfx:
+                by_suffix.setdefault(sfx, []).append(row)
         if i == 1 or i % 10 == 0 or i == total_sfx:
             n = sum(len(v) for v in by_suffix.values())
             print(
@@ -299,57 +330,20 @@ def preload_loan_by_suffixes(
     return by_suffix
 
 
-def preload_target_indexes_parallel(
-    cfg: Dict[str, str],
+def preload_target_indexes(
+    tgt,
     app_nos: List[str],
     loan_nos: List[str],
-    chunk: int = 2000,
+    chunk: int = 500,
 ) -> Tuple[Set[str], Set[str], Dict[str, dict]]:
-    """并行预加载 application / loan.application_no / loan.loan_no（各用独立连接）。"""
-
-    def _apps():
-        conn = connect_target(cfg)
-        try:
-            return batch_query_in(
-                conn, "application", "application_no", app_nos, chunk, "application"
-            )
-        finally:
-            conn.close()
-
-    def _loan_apps():
-        conn = connect_target(cfg)
-        try:
-            return batch_query_in(
-                conn, "loan", "application_no", app_nos, chunk, "loan.application_no"
-            )
-        finally:
-            conn.close()
-
-    def _loan_nos():
-        conn = connect_target(cfg)
-        try:
-            return preload_loan_by_nos(conn, loan_nos, chunk)
-        finally:
-            conn.close()
-
-    existing_apps: Set[str] = set()
-    apps_with_loan: Set[str] = set()
-    by_loan_no: Dict[str, dict] = {}
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        futs = {
-            pool.submit(_apps): "apps",
-            pool.submit(_loan_apps): "loan_apps",
-            pool.submit(_loan_nos): "loan_nos",
-        }
-        for fut in as_completed(futs):
-            name = futs[fut]
-            result = fut.result()
-            if name == "apps":
-                existing_apps = result
-            elif name == "loan_apps":
-                apps_with_loan = result
-            else:
-                by_loan_no = result
+    """串行预加载（单连接，带重试；3787 条规模足够快）。"""
+    existing_apps = batch_query_in(
+        tgt, "application", "application_no", app_nos, chunk, "application"
+    )
+    apps_with_loan = batch_query_in(
+        tgt, "loan", "application_no", app_nos, chunk, "loan.application_no"
+    )
+    by_loan_no = preload_loan_by_nos(tgt, loan_nos, chunk)
     return existing_apps, apps_with_loan, by_loan_no
 
 
@@ -440,9 +434,8 @@ def print_preview(
 def build_plan(
     jobs: List[dict],
     loan_by_sn: Dict[str, dict],
-    cfg: Dict[str, str],
     tgt,
-    query_chunk: int = 2000,
+    query_chunk: int = 500,
     suffix_scan: bool = True,
     insert_from_source: bool = True,
 ) -> Tuple[List[dict], List[dict], Dict[str, int]]:
@@ -455,12 +448,12 @@ def build_plan(
         {str(j.get("expected_loan_no") or "").strip() for j in jobs if j.get("expected_loan_no")}
     )
     print(
-        "preload target indexes (parallel, chunk=%s) ..."
+        "preload target indexes (chunk=%s) ..."
         % query_chunk,
         flush=True,
     )
-    existing_apps, apps_with_loan, by_loan_no = preload_target_indexes_parallel(
-        cfg, app_nos, loan_nos, query_chunk
+    existing_apps, apps_with_loan, by_loan_no = preload_target_indexes(
+        tgt, app_nos, loan_nos, query_chunk
     )
     existing_loan_nos = set(by_loan_no.keys())
     by_suffix: Dict[str, List[dict]] = {}
@@ -774,7 +767,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="--analyze 时写出需 INSERT 的清单",
     )
     p.add_argument("--work-limit", type=int, default=0)
-    p.add_argument("--query-chunk", type=int, default=2000, help="目标库 IN 查询分批大小")
+    p.add_argument("--query-chunk", type=int, default=500, help="目标库 IN 查询分批大小")
     p.add_argument(
         "--with-source",
         action="store_true",
@@ -856,9 +849,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             relink_plan, insert_plan, skipped = build_plan(
                 jobs,
                 loan_by_sn,
-                cfg,
                 tgt,
-                query_chunk=max(100, args.query_chunk),
+                query_chunk=max(50, min(args.query_chunk, 1000)),
                 suffix_scan=suffix_scan,
                 insert_from_source=insert_from_source,
             )
