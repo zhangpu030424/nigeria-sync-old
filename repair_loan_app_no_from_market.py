@@ -2,19 +2,24 @@
 # -*- coding: utf-8 -*-
 """修复 loan.application_no：源库 market.applicationNo -> appId 拼正确单号。
 
-思路:
-  1. 目标库拉出所有异常 application_no（ng+5位以上前缀）且 loan_no 已是短号
-  2. 后缀 market 号批量查源库: SELECT appId FROM ng_loan_market.application
-  3. 组成 ng{appId:04d}-{applicationNo}，loan_no 不改
-  4. 并行 UPDATE（主键冲突则删当前错行），写审计 CSV
+适用：sn 对齐修完后仍剩的异常行（目标 application 表找不到对应 sn）。
+  例: ng20515427-178072863512023153
+  → 取后缀 178072863512023153
+  → SELECT appId FROM ng_loan_market.application WHERE applicationNo='178072863512023153'
+  → 更新为 ng{appId:04d}-178072863512023153
 
 Usage:
   python3 repair_loan_app_no_from_market.py --env ./ng_migration.env --dry-run
-  python3 repair_loan_app_no_from_market.py --env ./ng_migration.env --apply --workers 8
+  python3 repair_loan_app_no_from_market.py --env ./ng_migration.env --dry-run \\
+    --plan-file /tmp/fix_app_no_market_plan.json
+
+  python3 repair_loan_app_no_from_market.py --env ./ng_migration.env --apply-only \\
+    --plan-file /tmp/fix_app_no_market_plan.json --batch-size 200
 """
 import argparse
 import csv
 import hashlib
+import json
 import multiprocessing
 import re
 import time
@@ -33,6 +38,40 @@ LOAN_COLS = mig.LOAN_INSERT_COLS
 LOAN_NO_RE = re.compile(r"^[Nn][Gg]-(\d+)-(\d{5})$")
 APP_SUFFIX_RE = re.compile(r"^ng\d+-(.+)$", re.I)
 BAD_APP_PREFIX_RE = re.compile(r"^ng\d{5,}-", re.I)
+
+
+def _sql_escape(s: str) -> str:
+    return str(s).replace("\\", "\\\\").replace("'", "''")
+
+
+def save_plan(path: Path, plan: List[dict]) -> None:
+    path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_plan(path: Optional[Path]) -> List[dict]:
+    if path is None or not path.is_file():
+        return []
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_sql_out(plan: List[dict], out_path: Path, batch_size: int) -> None:
+    lines: List[str] = []
+    batch_size = max(1, batch_size)
+    for bi in range(0, len(plan), batch_size):
+        part = plan[bi : bi + batch_size]
+        lines.append("START TRANSACTION;")
+        for row in part:
+            good = _sql_escape(row["good_application_no"])
+            bad = _sql_escape(row["bad_application_no"])
+            ln = _sql_escape(row["loan_no"])
+            lines.append(
+                "UPDATE loan SET application_no='%s' "
+                "WHERE loan_no='%s' AND application_no='%s';"
+                % (good, ln, bad)
+            )
+        lines.append("COMMIT;")
+        lines.append("")
+    out_path.write_text("\n".join(lines), encoding="utf-8")
 
 
 def load_env(path: Path) -> Dict[str, str]:
@@ -59,7 +98,7 @@ def connect_source(cfg: Dict[str, str]):
     )
 
 
-def connect_target(cfg: Dict[str, str]):
+def connect_target(cfg: Dict[str, str], for_apply: bool = False):
     return pymysql.connect(
         host=cfg["TARGET_HOST"],
         port=int(cfg.get("TARGET_PORT", "3306")),
@@ -68,8 +107,9 @@ def connect_target(cfg: Dict[str, str]):
         database=cfg.get("TARGET_DB", "ng"),
         charset="utf8mb4",
         cursorclass=DictCursor,
-        read_timeout=3600,
-        write_timeout=3600,
+        connect_timeout=10,
+        read_timeout=120 if for_apply else 3600,
+        write_timeout=120 if for_apply else 3600,
         autocommit=False,
     )
 
@@ -314,6 +354,121 @@ def apply_one(
     return "ok"
 
 
+def apply_batch_update(tgt, rows: List[dict]) -> int:
+    if not rows:
+        return 0
+    parts: List[str] = []
+    params: List = []
+    for r in rows:
+        parts.append("SELECT %s AS loan_no, %s AS bad_app, %s AS good_app")
+        params.extend(
+            [r["loan_no"], r["bad_application_no"], r["good_application_no"]]
+        )
+    sql = (
+        """
+        UPDATE loan l
+        INNER JOIN (
+        """
+        + " UNION ALL ".join(parts)
+        + """
+        ) x ON l.loan_no = x.loan_no AND l.application_no = x.bad_app
+        SET l.application_no = x.good_app
+        """
+    )
+    with tgt.cursor() as cur:
+        cur.execute(sql, tuple(params))
+        return int(cur.rowcount or 0)
+
+
+def _apply_with_retry(
+    tgt,
+    cfg: Dict[str, str],
+    row: dict,
+    dry_run: bool,
+    tracker: Optional[CommitTracker],
+    log: Optional[RepairLog],
+) -> Tuple[str, object]:
+    conn = tgt
+    for attempt in range(4):
+        try:
+            return apply_one(conn, row, dry_run, tracker, log), conn
+        except pymysql.Error:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+            if attempt >= 3:
+                raise
+            time.sleep(1 + attempt)
+            conn = connect_target(cfg, for_apply=True)
+    return "skip_no_row", conn
+
+
+def run_apply_batch(
+    cfg: Dict[str, str],
+    plan: List[dict],
+    batch_size: int,
+    dry_run: bool,
+    repair_log: str,
+) -> Tuple[int, int]:
+    if batch_size <= 0:
+        batch_size = 200
+    tgt = connect_target(cfg, for_apply=True)
+    log = RepairLog(repair_log if not dry_run else None)
+    ok = skip = 0
+    total_batches = (len(plan) + batch_size - 1) // batch_size
+    try:
+        for bi in range(0, len(plan), batch_size):
+            part = plan[bi : bi + batch_size]
+            bno = bi // batch_size + 1
+            if dry_run:
+                ok += len(part)
+                print(
+                    "batch %s/%s would_update=%s"
+                    % (bno, total_batches, len(part)),
+                    flush=True,
+                )
+                continue
+            try:
+                n = exec_with_retry(
+                    tgt,
+                    lambda p=part: apply_batch_update(tgt, p),
+                    "batch update %s" % bno,
+                )
+                tgt.commit()
+                ok += n
+                skip += len(part) - n
+                print(
+                    "batch %s/%s updated=%s batch_rows=%s total_ok=%s"
+                    % (bno, total_batches, n, len(part), ok),
+                    flush=True,
+                )
+            except pymysql.err.IntegrityError:
+                tgt.rollback()
+                print(
+                    "batch %s/%s integrity_error fallback row-by-row"
+                    % (bno, total_batches),
+                    flush=True,
+                )
+                for row in part:
+                    st, tgt = _apply_with_retry(
+                        tgt, cfg, row, False, None, log
+                    )
+                    if st == "ok":
+                        ok += 1
+                    else:
+                        skip += 1
+                tgt.commit()
+    finally:
+        log.close()
+        tgt.close()
+    return ok, skip
+
+
 def run_apply_chunk(
     tgt,
     chunk: List[dict],
@@ -427,39 +582,26 @@ def run_parallel(
     return ok, skip
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    p = argparse.ArgumentParser(description="Fix loan.application_no via source market appId")
-    p.add_argument("--env", default=str(HERE / "ng_migration.env"))
-    p.add_argument("--apply", action="store_true")
-    p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--min-market-len", type=int, default=15)
-    p.add_argument("--workers", type=int, default=1)
-    p.add_argument("--commit-every", type=int, default=50)
-    p.add_argument("--log-every", type=int, default=200)
-    p.add_argument("--work-limit", type=int, default=0)
-    p.add_argument("--repair-log", default="")
-    args = p.parse_args(argv)
-    if args.apply and args.dry_run:
-        p.error("use either --apply or --dry-run")
-    dry_run = not args.apply
-
-    repair_log = args.repair_log or (
-        "/tmp/repair_loan_app_no_market_%s.csv"
-        % datetime.now().strftime("%Y%m%d_%H%M%S")
-    )
-
-    cfg = load_env(Path(args.env))
+def scan_and_build_plan(
+    cfg: Dict[str, str],
+    min_market_len: int,
+    work_limit: int,
+) -> Tuple[List[dict], Dict[str, int], List[dict]]:
+    """返回 (plan, stats, no_market_rows)。"""
     t0 = time.time()
     tgt = connect_target(cfg)
     try:
         print("load target bad loans into memory ...", flush=True)
-        rows = load_all_bad_loans(tgt, args.min_market_len)
-        print("target_bad_rows=%s elapsed=%.1fs" % (len(rows), time.time() - t0), flush=True)
+        rows = load_all_bad_loans(tgt, min_market_len)
+        print(
+            "target_bad_rows=%s elapsed=%.1fs" % (len(rows), time.time() - t0),
+            flush=True,
+        )
     finally:
         tgt.close()
 
-    if args.work_limit:
-        rows = rows[: args.work_limit]
+    if work_limit:
+        rows = rows[:work_limit]
 
     suffixes = sorted({market_suffix(str(r["application_no"])) for r in rows})
     suffixes = [s for s in suffixes if s]
@@ -478,7 +620,108 @@ def main(argv: Optional[List[str]] = None) -> int:
         src.close()
 
     plan, stats = build_plan(rows, market_app_id)
-    print("plan_stats=%s plan=%s" % (stats, len(plan)), flush=True)
+    no_market: List[dict] = []
+    for row in rows:
+        suffix = market_suffix(str(row["application_no"]))
+        if not suffix:
+            continue
+        if suffix not in market_app_id:
+            no_market.append(
+                {
+                    "loan_no": str(row["loan_no"]),
+                    "application_no": str(row["application_no"]),
+                    "market_no": suffix,
+                }
+            )
+    stats["no_market"] = len(no_market)
+    return plan, stats, no_market
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    p = argparse.ArgumentParser(description="Fix loan.application_no via source market appId")
+    p.add_argument("--env", default=str(HERE / "ng_migration.env"))
+    p.add_argument("--apply", action="store_true")
+    p.add_argument(
+        "--apply-only",
+        action="store_true",
+        help="只读 plan-file 并批更新，不再扫库",
+    )
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--min-market-len", type=int, default=15)
+    p.add_argument("--workers", type=int, default=1, help="逐条模式并发进程数")
+    p.add_argument("--batch-size", type=int, default=200, help="批更新每批行数，0=逐条")
+    p.add_argument(
+        "--row-by-row",
+        action="store_true",
+        help="逐条 UPDATE（含主键冲突删行逻辑）",
+    )
+    p.add_argument("--commit-every", type=int, default=50)
+    p.add_argument("--log-every", type=int, default=200)
+    p.add_argument("--work-limit", type=int, default=0)
+    p.add_argument("--plan-file", default="", help="保存/读取 plan json")
+    p.add_argument("--rebuild-plan", action="store_true")
+    p.add_argument("--sql-out", default="", help="导出 UPDATE SQL（IDEA 执行）")
+    p.add_argument("--sql-batch", type=int, default=50, help="每个事务几条 UPDATE")
+    p.add_argument("--repair-log", default="")
+    args = p.parse_args(argv)
+    if args.apply and args.dry_run:
+        p.error("use either --apply or --dry-run")
+    if args.apply_only and not args.plan_file.strip():
+        p.error("--apply-only requires --plan-file")
+    if args.apply_only:
+        args.apply = True
+    if args.row_by_row:
+        args.batch_size = 0
+    dry_run = not args.apply
+    plan_path = Path(args.plan_file) if args.plan_file.strip() else None
+
+    repair_log = args.repair_log or (
+        "/tmp/repair_loan_app_no_market_%s.csv"
+        % datetime.now().strftime("%Y%m%d_%H%M%S")
+    )
+
+    cfg = load_env(Path(args.env))
+    plan: List[dict] = []
+    stats: Dict[str, int] = {}
+    no_market: List[dict] = []
+
+    if args.apply_only:
+        plan = load_plan(plan_path)
+        print("apply-only loaded plan rows=%s" % len(plan), flush=True)
+    else:
+        use_cached = (
+            plan_path is not None
+            and plan_path.is_file()
+            and not args.rebuild_plan
+            and (args.sql_out or not dry_run)
+        )
+        if use_cached:
+            plan = load_plan(plan_path)
+            print(
+                "loaded plan from %s rows=%s" % (plan_path, len(plan)),
+                flush=True,
+            )
+        else:
+            plan, stats, no_market = scan_and_build_plan(
+                cfg, args.min_market_len, args.work_limit
+            )
+            print("plan_stats=%s plan=%s" % (stats, len(plan)), flush=True)
+            if no_market:
+                print(
+                    "no_market_in_source=%s (sample below)"
+                    % len(no_market),
+                    flush=True,
+                )
+                for row in no_market[:10]:
+                    print(
+                        "  %s  %s  market=%s"
+                        % (row["loan_no"], row["application_no"], row["market_no"]),
+                        flush=True,
+                    )
+            if plan_path and plan:
+                save_plan(plan_path, plan)
+                print("saved plan -> %s" % plan_path, flush=True)
+
     for row in plan[:15]:
         print(
             "  %s  %s -> %s (market=%s appId=%s)"
@@ -493,11 +736,27 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
     if len(plan) > 15:
         print("  ... and %s more" % (len(plan) - 15), flush=True)
+
+    if args.sql_out:
+        write_sql_out(plan, Path(args.sql_out), args.sql_batch)
+        print("wrote sql -> %s rows=%s" % (args.sql_out, len(plan)), flush=True)
+        if dry_run and not args.apply_only:
+            return 0
+
     if not plan:
         return 0
 
     env_path = str(Path(args.env).resolve())
-    if args.workers > 1:
+    if args.batch_size > 0:
+        print(
+            "apply batch_mode batch_size=%s rows=%s"
+            % (args.batch_size, len(plan)),
+            flush=True,
+        )
+        ok, skip = run_apply_batch(
+            cfg, plan, args.batch_size, dry_run, repair_log
+        )
+    elif args.workers > 1:
         ok, skip = run_parallel(
             plan,
             args.workers,
@@ -508,7 +767,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             repair_log if not dry_run else "",
         )
     else:
-        tgt = connect_target(cfg)
+        tgt = connect_target(cfg, for_apply=True)
         log = RepairLog(repair_log if not dry_run else None)
         try:
             ok, skip = run_apply_chunk(
