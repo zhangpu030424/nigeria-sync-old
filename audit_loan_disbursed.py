@@ -88,8 +88,10 @@ def connect_target(cfg: Dict[str, str]):
         database=cfg.get("TARGET_DB", "ng"),
         charset="utf8mb4",
         cursorclass=DictCursor,
-        read_timeout=3600,
-        write_timeout=3600,
+        connect_timeout=int(cfg.get("mysql_connect_timeout") or 60),
+        read_timeout=int(cfg.get("mysql_read_timeout") or 3600),
+        write_timeout=int(cfg.get("mysql_write_timeout") or 3600),
+        autocommit=True,
     )
 
 
@@ -163,27 +165,60 @@ def parse_exclude_created_ms(raw: str) -> Tuple[int, ...]:
     return tuple(out) if out else DEFAULT_EXCLUDE_LOAN_CREATED_MS
 
 
+def _ping_conn(conn) -> None:
+    try:
+        conn.ping(reconnect=True)
+    except Exception:
+        pass
+
+
+APP_PAGE_SIZE = 50000
+LOAN_PAGE_SIZE = 50000
+
+
 def load_disbursed_applications(
-    tgt, exclude_app_ids: Tuple[int, ...], work_limit: int
+    tgt,
+    exclude_app_ids: Tuple[int, ...],
+    work_limit: int,
+    page_size: int = APP_PAGE_SIZE,
 ) -> List[dict]:
-    """目标库：老系统已放款单 application_no 列表。"""
-    print("phase1: SELECT application (disbursed) ...", flush=True)
+    """目标库：老系统已放款单 application_no 列表（分页拉取，避免 SSCursor 断连）。"""
+    print(
+        "phase1: SELECT application (disbursed) page_size=%s ..."
+        % page_size,
+        flush=True,
+    )
     t_load = time.time()
     ph = ",".join(["%s"] * len(exclude_app_ids))
-    sql = f"""
+    base_sql = """
         SELECT application_no, app_id, sn
         FROM application
         WHERE app_id NOT IN ({ph})
           AND disbursed_time > 0
           AND application_no IS NOT NULL AND application_no <> ''
+          AND application_no > %s
         ORDER BY application_no ASC
-    """
+        LIMIT %s
+    """.format(ph=ph)
     if work_limit > 0:
-        sql += " LIMIT %s"
+        sql = """
+            SELECT application_no, app_id, sn
+            FROM application
+            WHERE app_id NOT IN ({ph})
+              AND disbursed_time > 0
+              AND application_no IS NOT NULL AND application_no <> ''
+            ORDER BY application_no ASC
+            LIMIT %s
+        """.format(ph=ph)
         params: Tuple[Any, ...] = tuple(exclude_app_ids) + (work_limit,)
-        with tgt.cursor() as cur:
-            cur.execute(sql, params)
-            rows = list(cur.fetchall())
+
+        def _one():
+            _ping_conn(tgt)
+            with tgt.cursor() as cur:
+                cur.execute(sql, params)
+                return list(cur.fetchall())
+
+        rows = exec_with_retry(tgt, _one, "load applications limit=%s" % work_limit)
         print(
             "loaded applications=%s elapsed=%.1fs"
             % (len(rows), time.time() - t_load),
@@ -191,21 +226,30 @@ def load_disbursed_applications(
         )
         return rows
 
-    params = tuple(exclude_app_ids)
     rows: List[dict] = []
-    with tgt.cursor(_StreamCursor) as cur:
-        cur.execute(sql, params)
-        while True:
-            batch = cur.fetchmany(50000)
-            if not batch:
-                break
-            rows.extend(batch)
-            if len(rows) == len(batch) or len(rows) % 100000 == 0:
-                print(
-                    "  applications loaded=%s elapsed=%.1fs"
-                    % (len(rows), time.time() - t_load),
-                    flush=True,
-                )
+    after = ""
+    page_no = 0
+    while True:
+        def _page(a=after, lim=page_size):
+            _ping_conn(tgt)
+            with tgt.cursor() as cur:
+                cur.execute(base_sql, tuple(exclude_app_ids) + (a, lim))
+                return list(cur.fetchall())
+
+        page_no += 1
+        batch = exec_with_retry(tgt, _page, "load applications page=%s after=%s" % (page_no, after or "(start)"))
+        if not batch:
+            break
+        rows.extend(batch)
+        after = str(batch[-1]["application_no"])
+        if page_no == 1 or len(rows) % 200000 == 0 or len(batch) < page_size:
+            print(
+                "  applications loaded=%s pages=%s elapsed=%.1fs last=%s"
+                % (len(rows), page_no, time.time() - t_load, after),
+                flush=True,
+            )
+        if len(batch) < page_size:
+            break
     print(
         "loaded applications=%s elapsed=%.1fs"
         % (len(rows), time.time() - t_load),
@@ -215,64 +259,75 @@ def load_disbursed_applications(
 
 
 def load_all_loans(
-    tgt, exclude_created_ms: Tuple[int, ...]
+    tgt,
+    exclude_created_ms: Tuple[int, ...],
+    page_size: int = LOAN_PAGE_SIZE,
 ) -> Tuple[DefaultDict[str, List[dict]], Dict[str, dict], Set[str]]:
-    """loan 全表进内存；跳过 exclude_created_ms 的行。
-
-    返回 (by_app, by_loan_no, excluded_only_apps)。
-    excluded_only_apps: 仅有被排除 loan、无其它 loan 的 application_no。
-    """
+    """loan 全表进内存；跳过 exclude_created_ms 的行（分页拉取）。"""
     by_app: DefaultDict[str, List[dict]] = defaultdict(list)
     by_loan_no: Dict[str, dict] = {}
     exclude_set = set(int(x) for x in exclude_created_ms)
     apps_touched_excluded: Set[str] = set()
-    print("phase2: stream loan table into memory ...", flush=True)
+    print("phase2: load loan table into memory page_size=%s ..." % page_size, flush=True)
     t_load = time.time()
     sql = """
         SELECT loan_no, application_no, period, roll_sequence,
                status, due_date, created_time
         FROM loan
         WHERE application_no IS NOT NULL AND application_no <> ''
+          AND loan_no > %s
+        ORDER BY loan_no ASC
+        LIMIT %s
     """
     n = skip = scanned = 0
-    last_log_scan = 0
-    with tgt.cursor(_StreamCursor) as cur:
-        cur.execute(sql)
-        while True:
-            batch = cur.fetchmany(50000)
-            if not batch:
-                break
-            for row in batch:
-                scanned += 1
-                app_no = str(row["application_no"]).strip()
-                ct = int(row.get("created_time") or 0)
-                if ct in exclude_set:
-                    apps_touched_excluded.add(app_no)
-                    skip += 1
-                    continue
-                ln = str(row["loan_no"]).strip()
-                item = {
-                    "loan_no": ln,
-                    "application_no": app_no,
-                    "period": int(row.get("period") or 1),
-                    "roll_sequence": int(row.get("roll_sequence") or 0),
-                    "status": row.get("status"),
-                    "due_date": row.get("due_date"),
-                    "created_time": ct,
-                }
-                by_app[app_no].append(item)
-                by_loan_no[ln] = item
-                n += 1
-            if scanned - last_log_scan >= 100000 or not batch:
-                elapsed = time.time() - t_load
-                rate = scanned / elapsed if elapsed > 0 else 0
-                print(
-                    "  loan scanned=%s kept=%s skipped=%s "
-                    "unique_app=%s elapsed=%.1fs (%.0f rows/s)"
-                    % (scanned, n, skip, len(by_app), elapsed, rate),
-                    flush=True,
-                )
-                last_log_scan = scanned
+    after = ""
+    page_no = 0
+    while True:
+        def _page(a=after, lim=page_size):
+            _ping_conn(tgt)
+            with tgt.cursor() as cur:
+                cur.execute(sql, (a, lim))
+                return list(cur.fetchall())
+
+        page_no += 1
+        batch = exec_with_retry(
+            tgt, _page, "load loans page=%s after=%s" % (page_no, after or "(start)")
+        )
+        if not batch:
+            break
+        for row in batch:
+            scanned += 1
+            app_no = str(row["application_no"]).strip()
+            ct = int(row.get("created_time") or 0)
+            if ct in exclude_set:
+                apps_touched_excluded.add(app_no)
+                skip += 1
+                continue
+            ln = str(row["loan_no"]).strip()
+            item = {
+                "loan_no": ln,
+                "application_no": app_no,
+                "period": int(row.get("period") or 1),
+                "roll_sequence": int(row.get("roll_sequence") or 0),
+                "status": row.get("status"),
+                "due_date": row.get("due_date"),
+                "created_time": ct,
+            }
+            by_app[app_no].append(item)
+            by_loan_no[ln] = item
+            n += 1
+        after = str(batch[-1]["loan_no"])
+        if page_no == 1 or scanned % 500000 == 0 or len(batch) < page_size:
+            elapsed = time.time() - t_load
+            rate = scanned / elapsed if elapsed > 0 else 0
+            print(
+                "  loan scanned=%s kept=%s skipped=%s "
+                "unique_app=%s pages=%s elapsed=%.1fs (%.0f rows/s)"
+                % (scanned, n, skip, len(by_app), page_no, elapsed, rate),
+                flush=True,
+            )
+        if len(batch) < page_size:
+            break
     excluded_only_apps = apps_touched_excluded - set(by_app.keys())
     print(
         "loaded loan rows=%s skipped_created_time=%s unique_app=%s "
@@ -833,6 +888,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--sql-batch", type=int, default=50)
     p.add_argument("--skip-orphan", action="store_true", help="不扫 orphan loan")
     p.add_argument(
+        "--page-size",
+        type=int,
+        default=50000,
+        help="phase1/2 从目标库分页拉取的每页行数",
+    )
+    p.add_argument(
         "--workers",
         type=int,
         default=8,
@@ -886,9 +947,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("connecting target %s ..." % cfg.get("TARGET_HOST"), flush=True)
     tgt = connect_target(cfg)
     try:
-        apps = load_disbursed_applications(tgt, exclude_ids, args.work_limit)
+        apps = load_disbursed_applications(
+            tgt, exclude_ids, args.work_limit, page_size=max(1000, args.page_size)
+        )
         loans_by_app, _loans_by_ln, excluded_only_apps = load_all_loans(
-            tgt, exclude_created_ms
+            tgt, exclude_created_ms, page_size=max(1000, args.page_size)
         )
     finally:
         tgt.close()
