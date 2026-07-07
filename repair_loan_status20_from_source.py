@@ -27,7 +27,7 @@ Usage:
   python3 repair_loan_status20_from_source.py --env ./ng_migration.env --dup-only \\
     --dup-due-before 2026-07-06 --dry-run --plan-only
   python3 repair_loan_status20_from_source.py --env ./ng_migration.env --dup-only \\
-    --dup-due-before 2026-07-06 --apply
+    --dup-due-before 2026-07-06 --apply --workers 8
 """
 import argparse
 import hashlib
@@ -1200,9 +1200,10 @@ def run_dup_only(cfg: Dict[str, str], args, dry_run: bool) -> int:
         repair_log, enabled=not args.no_repair_log and not args.plan_only
     )
     scope = dup_due_before or "ALL"
+    env_path = str(Path(args.env).resolve())
     print(
-        "dup-only scope=due_date<%s dry_run=%s min_sn_len=%s"
-        % (scope, dry_run, args.min_sn_len),
+        "dup-only scope=due_date<%s dry_run=%s workers=%s min_sn_len=%s"
+        % (scope, dry_run, args.workers, args.min_sn_len),
         flush=True,
     )
     tgt = connect_target(cfg)
@@ -1250,16 +1251,31 @@ def run_dup_only(cfg: Dict[str, str], args, dry_run: bool) -> int:
         if args.work_limit > 0:
             dup_plan = dup_plan[: args.work_limit]
         ok = skip = 0
-        ok, skip = run_apply_chunk(
-            tgt,
-            dup_plan,
-            dry_run,
-            audit,
-            row_audit,
-            args.commit_every,
-            args.work_limit,
-            args.log_every,
-        )
+        if args.workers > 1:
+            audit.close()
+            row_audit.close()
+            ok, skip = run_apply_parallel(
+                dup_plan,
+                args.workers,
+                env_path,
+                dry_run,
+                args.work_limit,
+                args.log_every,
+                args.commit_every,
+                repair_log if not args.no_repair_log else "",
+                args.no_repair_log,
+            )
+        else:
+            ok, skip = run_apply_chunk(
+                tgt,
+                dup_plan,
+                dry_run,
+                audit,
+                row_audit,
+                args.commit_every,
+                args.work_limit,
+                args.log_every,
+            )
         print(
             "finished dup-only plan=%s ok=%s skip=%s elapsed=%.1fs log=%s"
             % (len(dup_plan), ok, skip, time.time() - run_t0, repair_log),
@@ -1288,7 +1304,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     p.add_argument("--status", default="20")
     p.add_argument("--min-sn-len", type=int, default=15)
-    p.add_argument("--workers", type=int, default=1)
+    p.add_argument("--workers", type=int, default=1, help="apply 并行进程数（dup-only 同样生效）")
     p.add_argument("--commit-every", type=int, default=50)
     p.add_argument("--work-limit", type=int, default=0)
     p.add_argument("--log-every", type=int, default=100)
