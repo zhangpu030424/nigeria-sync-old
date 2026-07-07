@@ -20,6 +20,14 @@ Usage:
   python3 repair_loan_status20_from_source.py --env ./ng_migration.env --dry-run --plan-only
   python3 repair_loan_status20_from_source.py --env ./ng_migration.env --list-dup
   python3 repair_loan_status20_from_source.py --env ./ng_migration.env --apply --workers 1
+
+  # 只删重复 loan_no 下错挂 application_no 的行（不做 status 同步）
+  python3 repair_loan_status20_from_source.py --env ./ng_migration.env --list-dup \\
+    --dup-due-before 2026-07-06
+  python3 repair_loan_status20_from_source.py --env ./ng_migration.env --dup-only \\
+    --dup-due-before 2026-07-06 --dry-run --plan-only
+  python3 repair_loan_status20_from_source.py --env ./ng_migration.env --dup-only \\
+    --dup-due-before 2026-07-06 --apply
 """
 import argparse
 import hashlib
@@ -1077,6 +1085,96 @@ def run_apply_parallel(
     return total_ok, total_skip
 
 
+    return 0 if ok or skip else 1
+
+
+def run_dup_only(cfg: Dict[str, str], args, dry_run: bool) -> int:
+    """仅处理同一 loan_no 多行：删 application_no 后缀误用 core sn 的错行。"""
+    dup_due_before = (args.dup_due_before or "").strip() or None
+    repair_log = args.repair_log or (
+        "/tmp/repair_dup_loan_no_%s.csv" % datetime.now().strftime("%Y%m%d_%H%M%S")
+    )
+    audit = RepairAuditLog(
+        repair_log if not args.no_repair_log else None,
+        enabled=not args.no_repair_log and not args.plan_only,
+    )
+    row_audit = RowChangeAuditLog(
+        repair_log, enabled=not args.no_repair_log and not args.plan_only
+    )
+    scope = dup_due_before or "ALL"
+    print(
+        "dup-only scope=due_date<%s dry_run=%s min_sn_len=%s"
+        % (scope, dry_run, args.min_sn_len),
+        flush=True,
+    )
+    tgt = connect_target(cfg)
+    src = connect_source(cfg)
+    run_t0 = time.time()
+    try:
+        dup_rows = exec_with_retry(
+            tgt,
+            lambda: load_loans_for_dup_check(tgt, dup_due_before),
+            "load dup check",
+        )
+        print("dup_scan_rows=%s" % len(dup_rows), flush=True)
+        dup_groups = group_dup_loan_nos(dup_rows)
+        if not dup_groups:
+            print("no duplicate loan_no found", flush=True)
+            return 0
+        dup_ext_sns = collect_ext_sns_from_dup_groups(dup_groups, args.min_sn_len)
+        dup_market = fetch_market_app_no_by_ext_sn(src, dup_ext_sns)
+        print("market_canonical_hits=%s" % len(dup_market), flush=True)
+        report_dup_loan_nos(dup_groups, args.min_sn_len, dup_market)
+        dup_plan, dup_stats = build_dup_app_no_plan(
+            dup_groups, args.min_sn_len, dup_market
+        )
+        print(
+            "dup_plan=%s dup_stats=%s" % (len(dup_plan), dup_stats),
+            flush=True,
+        )
+        for row in dup_plan[:20]:
+            print(
+                "  drop loan=%s app=%s keep=%s reason=%s"
+                % (
+                    row["loan_no"],
+                    row["before"].get("application_no"),
+                    row.get("keep_application_no"),
+                    row.get("dup_reason"),
+                ),
+                flush=True,
+            )
+        if len(dup_plan) > 20:
+            print("  ... and %s more" % (len(dup_plan) - 20), flush=True)
+        if args.plan_only:
+            return 0 if dup_plan else 1
+        if not dup_plan:
+            return 0
+        if args.work_limit > 0:
+            dup_plan = dup_plan[: args.work_limit]
+        ok = skip = 0
+        ok, skip = run_apply_chunk(
+            tgt,
+            dup_plan,
+            dry_run,
+            audit,
+            row_audit,
+            args.commit_every,
+            args.work_limit,
+            args.log_every,
+        )
+        print(
+            "finished dup-only plan=%s ok=%s skip=%s elapsed=%.1fs log=%s"
+            % (len(dup_plan), ok, skip, time.time() - run_t0, repair_log),
+            flush=True,
+        )
+        return 0 if ok or skip else 1
+    finally:
+        audit.close()
+        row_audit.close()
+        tgt.close()
+        src.close()
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(
         description="Fix long loan_no + sync status from ng_loan_core.repay_plan"
@@ -1109,17 +1207,27 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="仅列出同一 loan_no 多行（不写库）；默认扫全表",
     )
+    p.add_argument(
+        "--dup-only",
+        action="store_true",
+        help="只删重复 loan_no 下错挂 application_no 的行，不做 status/loan_no 同步",
+    )
     p.add_argument("--plan-only", action="store_true")
     args = p.parse_args(argv)
     if args.apply and args.dry_run:
         p.error("use either --apply or --dry-run")
     if args.list_dup and args.apply:
         p.error("--list-dup 与 --apply 不能同时使用")
+    if args.dup_only and args.long_only:
+        p.error("--dup-only 与 --long-only 不能同时使用")
     dry_run = not args.apply
 
     cfg = load_env(Path(args.env))
 
     dup_due_before = (args.dup_due_before or "").strip() or None
+
+    if args.dup_only:
+        return run_dup_only(cfg, args, dry_run)
 
     if args.list_dup:
         tgt = connect_target(cfg)
