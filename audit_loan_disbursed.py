@@ -10,24 +10,22 @@
 
 每个 application_no 在 loan 表应 **有且仅有 1 条** 对应行。
 
-期望 loan_no（源库 canonical）:
+期望 loan_no（源库 canonical，由 --loan-no-sn 选择中间段）:
   1. 从 application_no 取 market 后缀，如 ng0562-177702748012033909 → 177702748012033909
-  2. 源库:
-       SELECT ca.sn, rp.plan_sn
-       FROM ng_loan_core.application ca
-       JOIN ng_loan_core.repay_plan rp ON rp.sn = ca.sn AND rp.plan_sn = (
-         SELECT MAX(plan_sn) FROM ng_loan_core.repay_plan WHERE sn = ca.sn
-       )
-       WHERE ca.ext_sn = '{market_suffix}';
-  3. loan_no = ng-{plan_sn}-{period:02d}{roll_sequence:03d}
-     例: ng-217770275191-01000（plan_sn=217770275191, period=1, roll=0）
-
-     **已确认：loan_no 中间段必须用 repay_plan.plan_sn**（不是 core application.sn）。
-     ng_migration_run 曾误用 rp.sn，以此脚本核对结果为准。
+  2. 源库查 ext_sn = market_suffix:
+     plan_sn（默认）: repay_plan 最大 plan_sn 那条
+     core_sn: SELECT sn FROM ng_loan_core.application WHERE ext_sn = '{market_suffix}'
+  3. loan_no = ng-{sn}-{period:02d}{roll_sequence:03d}
+     例 plan_sn: ng-217770275191-01000
+     例 core_sn: ng-178126532212019674-01000（与 ng_migration_run 入库逻辑一致）
 
 Usage:
-  # 全量核对（默认 8 进程对账 + 源库并行查）
+  # 全量核对（默认 plan_sn 中间段）
   python3 audit_loan_disbursed.py --env ./ng_migration.env --workers 8
+
+  # 用 core application.sn 作为 loan_no 中间段（对齐迁移入库）
+  python3 audit_loan_disbursed.py --env ./ng_migration.env --workers 16 \\
+    --loan-no-sn core_sn --issues-csv /tmp/loan_audit_issues_core_sn.csv
 
   # 抽样
   python3 audit_loan_disbursed.py --env ./ng_migration.env --work-limit 10000
@@ -115,6 +113,36 @@ def connect_source(cfg: Dict[str, str]):
 def market_suffix(application_no: str) -> str:
     m = APP_SUFFIX_RE.match(str(application_no or "").strip())
     return m.group(1).strip() if m else ""
+
+
+def build_market_suffixes(
+    apps: List[dict], excluded_only_apps: Set[str]
+) -> List[str]:
+    """仅为参与对账的 application 收集 market 后缀。"""
+    uniq: Set[str] = set()
+    n = 0
+    t0 = time.time()
+    for app in apps:
+        app_no = str(app["application_no"]).strip()
+        if app_no in excluded_only_apps:
+            continue
+        n += 1
+        suffix = market_suffix(app_no)
+        if suffix:
+            uniq.add(suffix)
+        if n % 500000 == 0:
+            print(
+                "  suffix scan apps=%s unique_suffix=%s elapsed=%.1fs"
+                % (n, len(uniq), time.time() - t0),
+                flush=True,
+            )
+    out = sorted(uniq)
+    print(
+        "suffix done audit_apps=%s unique_market_suffix=%s elapsed=%.1fs"
+        % (n, len(out), time.time() - t0),
+        flush=True,
+    )
+    return out
 
 
 def parse_exclude_ids(raw: str) -> Tuple[int, ...]:
@@ -210,7 +238,8 @@ def load_all_loans(
         FROM loan
         WHERE application_no IS NOT NULL AND application_no <> ''
     """
-    n = skip = 0
+    n = skip = scanned = 0
+    last_log_scan = 0
     with tgt.cursor(_StreamCursor) as cur:
         cur.execute(sql)
         while True:
@@ -218,6 +247,7 @@ def load_all_loans(
             if not batch:
                 break
             for row in batch:
+                scanned += 1
                 app_no = str(row["application_no"]).strip()
                 ct = int(row.get("created_time") or 0)
                 if ct in exclude_set:
@@ -237,12 +267,16 @@ def load_all_loans(
                 by_app[app_no].append(item)
                 by_loan_no[ln] = item
                 n += 1
-            if n > 0 and (n <= 50000 or n % 100000 == 0):
+            if scanned - last_log_scan >= 100000 or not batch:
+                elapsed = time.time() - t_load
+                rate = scanned / elapsed if elapsed > 0 else 0
                 print(
-                    "  loan rows loaded=%s skipped=%s elapsed=%.1fs"
-                    % (n, skip, time.time() - t_load),
+                    "  loan scanned=%s kept=%s skipped=%s "
+                    "unique_app=%s elapsed=%.1fs (%.0f rows/s)"
+                    % (scanned, n, skip, len(by_app), elapsed, rate),
                     flush=True,
                 )
+                last_log_scan = scanned
     excluded_only_apps = apps_touched_excluded - set(by_app.keys())
     print(
         "loaded loan rows=%s skipped_created_time=%s unique_app=%s "
@@ -303,13 +337,16 @@ def fetch_source_repay_by_ext_sn(
 
 
 def fetch_core_sn_only(src, ext_sns: List[str]) -> Dict[str, str]:
-    """无 repay_plan 时仍可知 core sn。"""
+    """ext_sn -> core application.sn（SELECT sn FROM application WHERE ext_sn=...）。"""
     uniq = sorted({str(x).strip() for x in ext_sns if x})
     out: Dict[str, str] = {}
     if not uniq:
         return out
     c = "ng_loan_core"
+    total_batches = (len(uniq) + 1999) // 2000
+    t0 = time.time()
     for i in range(0, len(uniq), 2000):
+        bno = i // 2000 + 1
         part = uniq[i : i + 2000]
         ph = ",".join(["%s"] * len(part))
         with src.cursor() as cur:
@@ -325,6 +362,12 @@ def fetch_core_sn_only(src, ext_sns: List[str]) -> Dict[str, str]:
                 ext = str(row.get("ext_sn") or "").strip()
                 if ext:
                     out[ext] = str(row.get("core_sn") or "").strip()
+        if bno == 1 or bno % 20 == 0 or bno == total_batches:
+            print(
+                "  source_core batch %s/%s hits=%s elapsed=%.1fs"
+                % (bno, total_batches, len(out), time.time() - t0),
+                flush=True,
+            )
     return out
 
 
@@ -341,6 +384,7 @@ def reconcile_one(
     core_only: str,
     default_period: int,
     default_roll: int,
+    loan_no_sn: str = "plan_sn",
 ) -> List[dict]:
     """返回该 application 的所有 issue 行（0~n）。"""
     app_no = str(app["application_no"]).strip()
@@ -352,6 +396,7 @@ def reconcile_one(
         "app_id": app.get("app_id"),
         "target_sn": str(app.get("sn") or "").strip(),
         "market_suffix": suffix,
+        "loan_no_sn_mode": loan_no_sn,
     }
 
     if not suffix:
@@ -359,38 +404,45 @@ def reconcile_one(
         return issues
 
     meta = source_meta or {}
-    core_sn = meta.get("core_sn") or core_only or ""
-    plan_sn = meta.get("plan_sn") or ""
-    if not core_sn and not core_only:
+    core_sn = str(meta.get("core_sn") or core_only or "").strip()
+    plan_sn = str(meta.get("plan_sn") or "").strip()
+    if not core_sn:
         issues.append({**base, "issue": ISSUE_NO_CORE_SN, "market_suffix": suffix})
         return issues
-    if not meta and core_only:
-        issues.append({
-            **base,
-            "issue": ISSUE_NO_REPAY_PLAN,
-            "core_sn": core_only,
-            "market_suffix": suffix,
-        })
-        return issues
 
-    loan_sn = str(meta.get("plan_sn") or "").strip()
-    if not loan_sn:
-        issues.append({
-            **base,
-            "issue": ISSUE_NO_REPAY_PLAN,
-            "core_sn": core_sn,
-            "plan_sn": plan_sn,
-        })
-        return issues
+    if loan_no_sn == "core_sn":
+        loan_sn = core_sn
+    else:
+        if not meta and core_only:
+            issues.append({
+                **base,
+                "issue": ISSUE_NO_REPAY_PLAN,
+                "core_sn": core_only,
+                "market_suffix": suffix,
+            })
+            return issues
+        loan_sn = plan_sn
+        if not loan_sn:
+            issues.append({
+                **base,
+                "issue": ISSUE_NO_REPAY_PLAN,
+                "core_sn": core_sn,
+                "plan_sn": plan_sn,
+            })
+            return issues
 
     exp_ln = expected_loan_no(loan_sn, default_period, default_roll)
     exp_ln_core = (
         expected_loan_no(core_sn, default_period, default_roll) if core_sn else ""
     )
+    exp_ln_plan = (
+        expected_loan_no(plan_sn, default_period, default_roll) if plan_sn else ""
+    )
     base_exp = {
         **base,
         "expected_loan_no": exp_ln,
         "expected_loan_no_core_sn": exp_ln_core,
+        "expected_loan_no_plan_sn": exp_ln_plan,
         "core_sn": core_sn,
         "plan_sn": plan_sn,
         "loan_sn_used": loan_sn,
@@ -458,6 +510,7 @@ def reconcile_apps(
     default_roll: int,
     log_every: int = 200000,
     prefix: str = "",
+    loan_no_sn: str = "plan_sn",
 ) -> Tuple[List[dict], int]:
     issues: List[dict] = []
     skipped = 0
@@ -475,6 +528,7 @@ def reconcile_apps(
                 core_only_map.get(suffix, ""),
                 default_period,
                 default_roll,
+                loan_no_sn,
             )
         )
         if log_every > 0 and i % log_every == 0:
@@ -512,6 +566,7 @@ def _worker_reconcile(spec: dict) -> Tuple[List[dict], int]:
         spec["default_roll"],
         spec.get("log_every", 200000),
         label,
+        spec.get("loan_no_sn", "plan_sn"),
     )
     print(
         "%sdone issues=%s skipped=%s" % (label, len(issues), skipped),
@@ -530,6 +585,7 @@ def run_parallel_reconcile(
     default_period: int,
     default_roll: int,
     log_every: int,
+    loan_no_sn: str = "plan_sn",
 ) -> Tuple[List[dict], int]:
     workers = min(max(1, int(workers)), 32)
     chunks = split_chunks(apps, workers)
@@ -561,6 +617,7 @@ def run_parallel_reconcile(
                 "default_period": default_period,
                 "default_roll": default_roll,
                 "log_every": log_every,
+                "loan_no_sn": loan_no_sn,
             }
         )
     print(
@@ -787,6 +844,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=200000,
         help="每 worker 对账进度打印间隔",
     )
+    p.add_argument(
+        "--loan-no-sn",
+        choices=("plan_sn", "core_sn"),
+        default="plan_sn",
+        help="期望 loan_no 中间段：plan_sn=repay_plan 最大 plan_sn；"
+        "core_sn=ng_loan_core.application.sn（ext_sn 查，对齐迁移入库）",
+    )
     args = p.parse_args(argv)
 
     source_workers = args.source_workers or args.workers
@@ -795,9 +859,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     exclude_created_ms = parse_exclude_created_ms(args.exclude_loan_created_ms)
     t0 = time.time()
 
+    issues_csv = args.issues_csv
+    if issues_csv == "/tmp/loan_audit_issues.csv" and args.loan_no_sn == "core_sn":
+        issues_csv = "/tmp/loan_audit_issues_core_sn.csv"
+
     print(
-        "audit_loan_disbursed start workers=%s source_workers=%s work_limit=%s"
-        % (args.workers, source_workers, args.work_limit or "all"),
+        "audit_loan_disbursed start workers=%s source_workers=%s work_limit=%s "
+        "loan_no_sn=%s"
+        % (
+            args.workers,
+            source_workers,
+            args.work_limit or "all",
+            args.loan_no_sn,
+        ),
         flush=True,
     )
 
@@ -821,30 +895,39 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     app_set = {str(a["application_no"]).strip() for a in apps}
     print("phase3: build market suffix list ...", flush=True)
-    t_suf = time.time()
-    suffixes = sorted({market_suffix(str(a["application_no"])) for a in apps})
-    suffixes = [s for s in suffixes if s]
-    print(
-        "unique_market_suffix=%s elapsed=%.1fs"
-        % (len(suffixes), time.time() - t_suf),
-        flush=True,
-    )
+    suffixes = build_market_suffixes(apps, excluded_only_apps)
 
-    print("phase3: fetch source repay_plan (may take long) ...", flush=True)
     t1 = time.time()
-    repay_meta = fetch_source_repay_parallel(cfg, suffixes, source_workers)
-    print(
-        "source_repay_hit=%s/%s elapsed=%.1fs"
-        % (len(repay_meta), len(suffixes), time.time() - t1),
-        flush=True,
-    )
-    missing_ext = [s for s in suffixes if s not in repay_meta]
-    core_only_map = (
-        fetch_core_sn_parallel(cfg, missing_ext, source_workers)
-        if missing_ext
-        else {}
-    )
-    print("source_core_only=%s" % len(core_only_map), flush=True)
+    if args.loan_no_sn == "core_sn":
+        print(
+            "phase3: fetch core.application.sn by ext_sn (no repay_plan) ...",
+            flush=True,
+        )
+        core_map = fetch_core_sn_parallel(cfg, suffixes, source_workers)
+        repay_meta = {
+            ext: {"core_sn": sn, "plan_sn": ""} for ext, sn in core_map.items()
+        }
+        core_only_map = {}
+        print(
+            "source_core_hit=%s/%s elapsed=%.1fs"
+            % (len(repay_meta), len(suffixes), time.time() - t1),
+            flush=True,
+        )
+    else:
+        print("phase3: fetch source repay_plan (may take long) ...", flush=True)
+        repay_meta = fetch_source_repay_parallel(cfg, suffixes, source_workers)
+        print(
+            "source_repay_hit=%s/%s elapsed=%.1fs"
+            % (len(repay_meta), len(suffixes), time.time() - t1),
+            flush=True,
+        )
+        missing_ext = [s for s in suffixes if s not in repay_meta]
+        core_only_map = (
+            fetch_core_sn_parallel(cfg, missing_ext, source_workers)
+            if missing_ext
+            else {}
+        )
+        print("source_core_only=%s" % len(core_only_map), flush=True)
 
     print("phase4: reconcile in memory ...", flush=True)
     if args.workers > 1:
@@ -858,6 +941,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.default_period,
             args.default_roll,
             args.log_every,
+            args.loan_no_sn,
         )
     else:
         issues, skipped_apps = reconcile_apps(
@@ -869,6 +953,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.default_period,
             args.default_roll,
             args.log_every,
+            "",
+            args.loan_no_sn,
         )
 
     print("skipped_apps_excluded_loan_only=%s" % skipped_apps, flush=True)
@@ -881,8 +967,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     stats = summarize(issues)
     print("issue_stats=%s" % stats, flush=True)
 
-    write_issues_csv(Path(args.issues_csv), issues)
-    print("wrote issues_csv=%s rows=%s" % (args.issues_csv, len(issues)), flush=True)
+    write_issues_csv(Path(issues_csv), issues)
+    print("wrote issues_csv=%s rows=%s" % (issues_csv, len(issues)), flush=True)
 
     fix_plan = build_fix_plan(issues)
     if args.plan_file:
