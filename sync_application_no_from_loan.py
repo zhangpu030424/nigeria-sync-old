@@ -13,14 +13,13 @@
   loan:        loan_no=ng-217832529551-01000, application_no=ng0564-1783...
 
 Usage:
+  # 只出计划
   python3 sync_application_no_from_loan.py --env ./ng_migration.env --dry-run \\
     --plan-file /tmp/sync_app_no_from_loan_plan.json
 
-  python3 sync_application_no_from_loan.py --env ./ng_migration.env --apply \\
-    --plan-file /tmp/sync_app_no_from_loan_plan.json --workers 8
-
+  # 已有 plan：跳过扫描，直接多进程修复
   python3 sync_application_no_from_loan.py --env ./ng_migration.env --apply-only \\
-    --plan-file /tmp/sync_app_no_from_loan_plan.json --workers 8
+    --plan-file /tmp/sync_app_no_from_loan_plan.json --workers 4 --batch-size 50
 """
 import argparse
 import json
@@ -64,6 +63,8 @@ def load_env(path: Path) -> Dict[str, str]:
 
 
 def connect_target(cfg: Dict[str, str], for_apply: bool = False):
+    # apply 也要给足超时：PK UPDATE 可能锁等待，30s 容易 2013
+    timeout = 120 if for_apply else 3600
     return pymysql.connect(
         host=cfg["TARGET_HOST"],
         port=int(cfg.get("TARGET_PORT", "3306")),
@@ -73,8 +74,8 @@ def connect_target(cfg: Dict[str, str], for_apply: bool = False):
         charset="utf8mb4",
         cursorclass=DictCursor,
         connect_timeout=int(cfg.get("mysql_connect_timeout") or 60),
-        read_timeout=30 if for_apply else 3600,
-        write_timeout=30 if for_apply else 3600,
+        read_timeout=timeout,
+        write_timeout=timeout,
         autocommit=False,
     )
 
@@ -84,6 +85,15 @@ def _ping(conn) -> None:
         conn.ping(reconnect=True)
     except Exception:
         pass
+
+
+def _reconnect(cfg: Dict[str, str], old=None):
+    if old is not None:
+        try:
+            old.close()
+        except Exception:
+            pass
+    return connect_target(cfg, for_apply=True)
 
 
 def app_suffix(application_no: str) -> str:
@@ -238,46 +248,132 @@ def build_plan(
     return plan, stats
 
 
-def apply_one(tgt, row: dict) -> str:
-    """返回 ok / skip_exists / skip_missing / skip_dup_key / err。"""
-    bad = row["bad_application_no"]
-    good = row["good_application_no"]
-    sn = row["sn"]
+def apply_batch(tgt, rows: List[dict]) -> Tuple[int, int, Dict[str, int]]:
+    """批量 UPDATE：先查出已存在的目标号并跳过，再更新其余行。"""
+    if not rows:
+        return 0, 0, {}
+    goods = sorted({str(r["good_application_no"]).strip() for r in rows})
+    existing: set = set()
+
+    def _lookup():
+        _ping(tgt)
+        if not goods:
+            return []
+        ph = ",".join(["%s"] * len(goods))
+        with tgt.cursor() as cur:
+            cur.execute(
+                "SELECT application_no FROM application WHERE application_no IN (%s)"
+                % ph,
+                goods,
+            )
+            return list(cur.fetchall())
+
+    for row in exec_with_retry(tgt, _lookup, "lookup exists batch=%s" % len(goods)) or []:
+        app = str(row.get("application_no") or "").strip()
+        if app:
+            existing.add(app)
+
+    todo = [r for r in rows if str(r["good_application_no"]).strip() not in existing]
+    skipped_exists = len(rows) - len(todo)
+    stats: Dict[str, int] = {}
+    if skipped_exists:
+        stats["skip_exists"] = skipped_exists
+    if not todo:
+        return 0, skipped_exists, stats
+
+    parts: List[str] = []
+    params: List = []
+    for r in todo:
+        parts.append("SELECT %s AS bad_app, %s AS good_app, %s AS sn")
+        params.extend(
+            [r["bad_application_no"], r["good_application_no"], r["sn"]]
+        )
+    sql = (
+        """
+        UPDATE application a
+        INNER JOIN (
+        """
+        + " UNION ALL ".join(parts)
+        + """
+        ) x ON a.application_no = x.bad_app AND a.sn = x.sn
+        SET a.application_no = x.good_app
+        """
+    )
 
     def _run():
         _ping(tgt)
         with tgt.cursor() as cur:
-            cur.execute(
-                "SELECT application_no FROM application WHERE application_no=%s LIMIT 1",
-                (good,),
-            )
-            if cur.fetchone():
-                return "skip_exists"
-            cur.execute(
-                """
-                UPDATE application
-                SET application_no=%s
-                WHERE application_no=%s AND sn=%s
-                """,
-                (good, bad, sn),
-            )
-            if int(cur.rowcount or 0) <= 0:
-                return "skip_missing"
-            return "ok"
+            cur.execute(sql, tuple(params))
+            return int(cur.rowcount or 0)
 
     try:
-        return exec_with_retry(
-            tgt, _run, "update %s->%s" % (bad, good)
-        )
+        ok = int(exec_with_retry(tgt, _run, "apply batch size=%s" % len(todo)) or 0)
+        missing = max(0, len(todo) - ok)
+        if missing:
+            stats["skip_missing"] = missing
+        return ok, skipped_exists + missing, stats
     except pymysql.err.IntegrityError as e:
-        # 并发下目标号已被占用
         if getattr(e, "args", None) and e.args and e.args[0] == 1062:
             try:
                 tgt.rollback()
             except Exception:
                 pass
-            return "skip_dup_key"
+            return apply_rows_fallback(tgt, todo, skipped_exists)
         raise
+
+
+def apply_rows_fallback(
+    tgt, rows: List[dict], already_skipped: int = 0
+) -> Tuple[int, int, Dict[str, int]]:
+    """批量撞 1062 时逐条修：存在则跳过。"""
+    ok = skip = already_skipped
+    stats: Dict[str, int] = {"fallback_row": len(rows)}
+    if already_skipped:
+        stats["skip_exists"] = already_skipped
+    for r in rows:
+        bad, good, sn = r["bad_application_no"], r["good_application_no"], r["sn"]
+
+        def _one(b=bad, g=good, s=sn):
+            _ping(tgt)
+            with tgt.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM application WHERE application_no=%s LIMIT 1",
+                    (g,),
+                )
+                if cur.fetchone():
+                    return "skip_exists"
+                cur.execute(
+                    """
+                    UPDATE application
+                    SET application_no=%s
+                    WHERE application_no=%s AND sn=%s
+                    """,
+                    (g, b, s),
+                )
+                return "ok" if int(cur.rowcount or 0) > 0 else "skip_missing"
+
+        try:
+            result = exec_with_retry(tgt, _one, "fallback %s->%s" % (bad, good))
+        except pymysql.err.IntegrityError as e:
+            if getattr(e, "args", None) and e.args and e.args[0] == 1062:
+                try:
+                    tgt.rollback()
+                except Exception:
+                    pass
+                result = "skip_dup_key"
+            else:
+                raise
+        if result == "ok":
+            ok += 1
+            tgt.commit()
+        else:
+            skip += 1
+            stats[result] = stats.get(result, 0) + 1
+            try:
+                tgt.rollback()
+            except Exception:
+                pass
+    return ok, skip, stats
 
 
 def split_chunks(rows: List[dict], workers: int) -> List[List[dict]]:
@@ -297,37 +393,48 @@ def worker_run(spec: dict) -> Tuple[int, int, Dict[str, int]]:
     if not chunk:
         return 0, 0, stats
     cfg = load_env(Path(spec["env"]))
-    commit_every = max(1, int(spec.get("commit_every") or 50))
-    print("%sstart rows=%s" % (label, len(chunk)), flush=True)
+    batch_size = max(1, int(spec.get("batch_size") or 50))
+    print(
+        "%sstart rows=%s batch_size=%s" % (label, len(chunk), batch_size),
+        flush=True,
+    )
     tgt = connect_target(cfg, for_apply=True)
     ok = skip = 0
-    since_commit = 0
     try:
-        for i, row in enumerate(chunk, 1):
-            result = apply_one(tgt, row)
-            if result == "ok":
-                ok += 1
-                since_commit += 1
-                if since_commit >= commit_every:
-                    tgt.commit()
-                    since_commit = 0
-            else:
-                skip += 1
-                stats[result] = stats.get(result, 0) + 1
+        total_batches = (len(chunk) + batch_size - 1) // batch_size
+        for bi in range(0, len(chunk), batch_size):
+            part = chunk[bi : bi + batch_size]
+            bno = bi // batch_size + 1
+
+            def _do(p=part):
+                return apply_batch(tgt, p)
+
+            try:
+                bok, bskip, bstats = _do()
+                tgt.commit()
+            except Exception as exc:
+                print("%sbatch %s err=%s, reconnect" % (label, bno, exc), flush=True)
                 try:
                     tgt.rollback()
                 except Exception:
                     pass
-            if i == 1 or i % 200 == 0 or i == len(chunk):
-                print(
-                    "%sprogress %s/%s ok=%s skip=%s"
-                    % (label, i, len(chunk), ok, skip),
-                    flush=True,
-                )
-        if since_commit:
-            tgt.commit()
+                tgt = _reconnect(cfg, tgt)
+                bok, bskip, bstats = apply_batch(tgt, part)
+                tgt.commit()
+            ok += bok
+            skip += bskip
+            for k, v in bstats.items():
+                stats[k] = stats.get(k, 0) + v
+            print(
+                "%sbatch %s/%s updated=%s skip=%s total_ok=%s"
+                % (label, bno, total_batches, bok, bskip, ok),
+                flush=True,
+            )
     finally:
-        tgt.close()
+        try:
+            tgt.close()
+        except Exception:
+            pass
     print("%sdone ok=%s skip=%s stats=%s" % (label, ok, skip, stats), flush=True)
     return ok, skip, stats
 
@@ -336,7 +443,7 @@ def run_parallel(
     plan: List[dict],
     workers: int,
     env_path: str,
-    commit_every: int,
+    batch_size: int,
 ) -> Tuple[int, int, Dict[str, int]]:
     workers = min(max(1, int(workers)), 16)
     chunks = split_chunks(plan, workers)
@@ -347,13 +454,13 @@ def run_parallel(
                 "worker_id": i + 1,
                 "workers": len(chunks),
                 "env": env_path,
-                "commit_every": commit_every,
+                "batch_size": batch_size,
                 "plan_chunk": chunk,
             }
         )
     print(
-        "parallel apply workers=%s rows=%s commit_every=%s"
-        % (len(specs), len(plan), commit_every),
+        "parallel apply workers=%s rows=%s batch_size=%s"
+        % (len(specs), len(plan), batch_size),
         flush=True,
     )
     if len(specs) == 1:
@@ -380,15 +487,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     p.add_argument("--env", default=str(HERE / "ng_migration.env"))
     p.add_argument("--apply", action="store_true")
-    p.add_argument("--apply-only", action="store_true")
+    p.add_argument(
+        "--apply-only",
+        action="store_true",
+        help="只读 plan-file 执行修复，跳过 orphan/loan 扫描",
+    )
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--plan-file", default="/tmp/sync_app_no_from_loan_plan.json")
     p.add_argument("--loan-page-size", type=int, default=50000)
     p.add_argument("--period", type=int, default=1)
     p.add_argument("--roll-sequence", type=int, default=0)
     p.add_argument("--min-market-len", type=int, default=15)
-    p.add_argument("--workers", type=int, default=8, help="apply 并行进程数")
-    p.add_argument("--commit-every", type=int, default=50)
+    p.add_argument("--workers", type=int, default=4, help="apply 并行进程数")
+    p.add_argument("--batch-size", type=int, default=50, help="每批 UPDATE 行数")
     p.add_argument(
         "--all-suffix",
         action="store_true",
@@ -406,9 +517,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     cfg = load_env(Path(args.env))
     env_path = str(Path(args.env).resolve())
 
-    if args.apply_only and plan_path.is_file():
+    if args.apply_only:
+        if not plan_path.is_file():
+            p.error("--apply-only requires existing --plan-file: %s" % plan_path)
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
-        print("apply-only loaded plan=%s" % len(plan), flush=True)
+        print(
+            "apply-only loaded plan=%s from %s (skip scan)"
+            % (len(plan), plan_path),
+            flush=True,
+        )
     else:
         tgt = connect_target(cfg)
         try:
@@ -452,7 +569,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         plan,
         args.workers,
         env_path,
-        args.commit_every,
+        max(1, args.batch_size),
     )
     print("done ok=%s skip=%s skip_stats=%s" % (ok, skip, skip_stats), flush=True)
     return 0 if ok or skip else 1
