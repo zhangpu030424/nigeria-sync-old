@@ -5,7 +5,8 @@
 加载策略（尽量少查库）:
   1. 一条 SQL 拉出 orphan application（已放款但 JOIN 不上 loan）
   2. 分页拉全量 loan(loan_no, application_no) 进内存建索引
-  3. 内存匹配生成 plan，再批量 UPDATE
+  3. 分页拉已放款 application(application_no, sn) 做 PK 冲突检测
+  4. 内存匹配生成 plan，再批量 UPDATE
 
 场景：application_no 后缀误写成 core sn，loan 上已是 market 长号。
   application: ng0564-217832529551
@@ -153,6 +154,63 @@ def load_all_loans_index(
     return dict(by_loan_no)
 
 
+def load_disbursed_app_index(
+    tgt, page_size: int = 50000
+) -> Dict[str, str]:
+    """分页拉已放款 application(application_no, sn) 进内存，用于 PK 冲突检测。"""
+    print(
+        "phase2b: load disbursed application index page_size=%s ..."
+        % page_size,
+        flush=True,
+    )
+    t0 = time.time()
+    by_app_no: Dict[str, str] = {}
+    sql = """
+        SELECT application_no, sn
+        FROM application
+        WHERE disbursed_time > 0
+          AND application_no IS NOT NULL AND application_no <> ''
+          AND application_no > %s
+        ORDER BY application_no ASC
+        LIMIT %s
+    """
+    after = ""
+    page_no = 0
+    total = 0
+    while True:
+        def _page(a=after, lim=page_size):
+            _ping(tgt)
+            with tgt.cursor() as cur:
+                cur.execute(sql, (a, lim))
+                return list(cur.fetchall())
+
+        page_no += 1
+        batch = exec_with_retry(tgt, _page, "load application page=%s" % page_no)
+        if not batch:
+            break
+        for row in batch:
+            app = str(row.get("application_no") or "").strip()
+            if not app:
+                continue
+            by_app_no[app] = str(row.get("sn") or "").strip()
+            total += 1
+        after = str(batch[-1]["application_no"])
+        if page_no == 1 or total % 500000 == 0 or len(batch) < page_size:
+            print(
+                "  application rows=%s pages=%s elapsed=%.1fs"
+                % (total, page_no, time.time() - t0),
+                flush=True,
+            )
+        if len(batch) < page_size:
+            break
+    print(
+        "loaded disbursed application rows=%s elapsed=%.1fs"
+        % (total, time.time() - t0),
+        flush=True,
+    )
+    return by_app_no
+
+
 def pick_good_application_no(loan_rows: List[dict], min_market_len: int) -> Optional[str]:
     candidates: List[str] = []
     for row in loan_rows:
@@ -174,6 +232,7 @@ def pick_good_application_no(loan_rows: List[dict], min_market_len: int) -> Opti
 def build_plan_in_memory(
     orphan_apps: List[dict],
     loan_by_no: Dict[str, List[dict]],
+    existing_apps: Dict[str, str],
     period: int,
     roll_sequence: int,
     min_market_len: int,
@@ -181,19 +240,7 @@ def build_plan_in_memory(
 ) -> Tuple[List[dict], Dict[str, int]]:
     stats: Dict[str, int] = {"orphan_apps": len(orphan_apps)}
     t0 = time.time()
-
-    # 已有 application_no（loan 上出现过的 + 待修 bad）用于粗粒度冲突检测
-    taken_app_no: Dict[str, str] = {}
-    for rows in loan_by_no.values():
-        for row in rows:
-            app = str(row.get("application_no") or "").strip()
-            if app:
-                taken_app_no.setdefault(app, "")
-    for app in orphan_apps:
-        bad = str(app.get("bad_application_no") or "").strip()
-        sn = str(app.get("sn") or "").strip()
-        if bad:
-            taken_app_no[bad] = sn
+    planned_good: set = set()
 
     plan: List[dict] = []
     for app in orphan_apps:
@@ -221,9 +268,18 @@ def build_plan_in_memory(
         if not good or good == bad:
             stats["skip_same_or_empty"] = stats.get("skip_same_or_empty", 0) + 1
             continue
-        owner_sn = taken_app_no.get(good)
-        if owner_sn is not None and owner_sn != sn:
-            stats["skip_good_app_taken"] = stats.get("skip_good_app_taken", 0) + 1
+        # good 在 loan 上出现是正常的；只检查 application 表 PK 是否已被占用
+        owner_sn = existing_apps.get(good)
+        if owner_sn is not None:
+            if owner_sn == sn:
+                stats["skip_good_exists_same_sn"] = stats.get(
+                    "skip_good_exists_same_sn", 0
+                ) + 1
+            else:
+                stats["skip_good_app_taken"] = stats.get("skip_good_app_taken", 0) + 1
+            continue
+        if good in planned_good:
+            stats["skip_good_planned_dup"] = stats.get("skip_good_planned_dup", 0) + 1
             continue
         plan.append(
             {
@@ -234,7 +290,7 @@ def build_plan_in_memory(
                 "app_id": app.get("app_id"),
             }
         )
-        taken_app_no[good] = sn
+        planned_good.add(good)
 
     stats["plan"] = len(plan)
     print(
@@ -255,9 +311,11 @@ def build_plan(
 ) -> Tuple[List[dict], Dict[str, int]]:
     orphan_apps = load_orphan_apps(tgt)
     loan_by_no = load_all_loans_index(tgt, loan_page_size)
+    existing_apps = load_disbursed_app_index(tgt, loan_page_size)
     return build_plan_in_memory(
         orphan_apps,
         loan_by_no,
+        existing_apps,
         period,
         roll_sequence,
         min_market_len,
