@@ -5,8 +5,8 @@
 加载策略（尽量少查库）:
   1. 一条 SQL 拉出 orphan application（已放款但 JOIN 不上 loan）
   2. 分页拉全量 loan(loan_no, application_no) 进内存建索引
-  3. 内存匹配出候选 good_application_no 后，仅对这些 key 批量查 application PK
-  4. 过滤冲突后写 plan，再批量 UPDATE
+  3. 内存匹配直接出 plan（不预查 application PK）
+  4. apply 多进程逐条 UPDATE；目标 application_no 已存在则跳过
 
 场景：application_no 后缀误写成 core sn，loan 上已是 market 长号。
   application: ng0564-217832529551
@@ -16,11 +16,15 @@ Usage:
   python3 sync_application_no_from_loan.py --env ./ng_migration.env --dry-run \\
     --plan-file /tmp/sync_app_no_from_loan_plan.json
 
+  python3 sync_application_no_from_loan.py --env ./ng_migration.env --apply \\
+    --plan-file /tmp/sync_app_no_from_loan_plan.json --workers 8
+
   python3 sync_application_no_from_loan.py --env ./ng_migration.env --apply-only \\
-    --plan-file /tmp/sync_app_no_from_loan_plan.json --batch-size 200
+    --plan-file /tmp/sync_app_no_from_loan_plan.json --workers 8
 """
 import argparse
 import json
+import multiprocessing
 import re
 import time
 from collections import defaultdict
@@ -97,9 +101,7 @@ def load_orphan_apps(tgt) -> List[dict]:
     return rows
 
 
-def load_all_loans_index(
-    tgt, page_size: int = 50000
-) -> Dict[str, List[dict]]:
+def load_all_loans_index(tgt, page_size: int = 50000) -> Dict[str, List[dict]]:
     """分页拉全表 loan_no + application_no，返回 loan_no -> [rows]。"""
     print("phase2: load loan table into memory page_size=%s ..." % page_size, flush=True)
     t0 = time.time()
@@ -154,49 +156,6 @@ def load_all_loans_index(
     return dict(by_loan_no)
 
 
-def lookup_existing_apps(
-    tgt, app_nos: List[str], chunk_size: int = 500
-) -> Dict[str, str]:
-    """仅查候选 good_application_no 是否已在 application 表（PK 冲突检测）。"""
-    uniq = sorted({str(x).strip() for x in app_nos if str(x).strip()})
-    print(
-        "phase2b: lookup existing application PK keys=%s chunk=%s ..."
-        % (len(uniq), chunk_size),
-        flush=True,
-    )
-    t0 = time.time()
-    by_app_no: Dict[str, str] = {}
-    if not uniq:
-        return by_app_no
-    for i in range(0, len(uniq), chunk_size):
-        part = uniq[i : i + chunk_size]
-        ph = ",".join(["%s"] * len(part))
-
-        def _q(p=part, placeholder=ph):
-            _ping(tgt)
-            with tgt.cursor() as cur:
-                cur.execute(
-                    "SELECT application_no, sn FROM application "
-                    "WHERE application_no IN (%s)" % placeholder,
-                    p,
-                )
-                return list(cur.fetchall())
-
-        batch = exec_with_retry(
-            tgt, _q, "lookup application chunk=%s" % (i // chunk_size + 1)
-        )
-        for row in batch:
-            app = str(row.get("application_no") or "").strip()
-            if app:
-                by_app_no[app] = str(row.get("sn") or "").strip()
-    print(
-        "existing hits=%s/%s elapsed=%.1fs"
-        % (len(by_app_no), len(uniq), time.time() - t0),
-        flush=True,
-    )
-    return by_app_no
-
-
 def pick_good_application_no(loan_rows: List[dict], min_market_len: int) -> Optional[str]:
     candidates: List[str] = []
     for row in loan_rows:
@@ -215,17 +174,22 @@ def pick_good_application_no(loan_rows: List[dict], min_market_len: int) -> Opti
     return None
 
 
-def collect_candidates(
-    orphan_apps: List[dict],
-    loan_by_no: Dict[str, List[dict]],
+def build_plan(
+    tgt,
     period: int,
     roll_sequence: int,
     min_market_len: int,
     core_sn_suffix_only: bool,
+    loan_page_size: int,
 ) -> Tuple[List[dict], Dict[str, int]]:
-    """内存匹配 orphan → loan，生成候选（尚未做 PK 冲突过滤）。"""
+    orphan_apps = load_orphan_apps(tgt)
+    loan_by_no = load_all_loans_index(tgt, loan_page_size)
+
     stats: Dict[str, int] = {"orphan_apps": len(orphan_apps)}
-    candidates: List[dict] = []
+    t0 = time.time()
+    planned_good: set = set()
+    plan: List[dict] = []
+
     for app in orphan_apps:
         bad = str(app.get("bad_application_no") or "").strip()
         sn = str(app.get("sn") or "").strip()
@@ -251,7 +215,10 @@ def collect_candidates(
         if not good or good == bad:
             stats["skip_same_or_empty"] = stats.get("skip_same_or_empty", 0) + 1
             continue
-        candidates.append(
+        if good in planned_good:
+            stats["skip_good_planned_dup"] = stats.get("skip_good_planned_dup", 0) + 1
+            continue
+        plan.append(
             {
                 "bad_application_no": bad,
                 "good_application_no": good,
@@ -260,109 +227,168 @@ def collect_candidates(
                 "app_id": app.get("app_id"),
             }
         )
-    stats["candidates"] = len(candidates)
-    return candidates, stats
-
-
-def filter_plan_by_pk(
-    candidates: List[dict],
-    existing_apps: Dict[str, str],
-    stats: Dict[str, int],
-) -> List[dict]:
-    planned_good: set = set()
-    plan: List[dict] = []
-    for row in candidates:
-        good = row["good_application_no"]
-        sn = row["sn"]
-        owner_sn = existing_apps.get(good)
-        if owner_sn is not None:
-            if owner_sn == sn:
-                stats["skip_good_exists_same_sn"] = stats.get(
-                    "skip_good_exists_same_sn", 0
-                ) + 1
-            else:
-                stats["skip_good_app_taken"] = stats.get("skip_good_app_taken", 0) + 1
-            continue
-        if good in planned_good:
-            stats["skip_good_planned_dup"] = stats.get("skip_good_planned_dup", 0) + 1
-            continue
-        plan.append(row)
         planned_good.add(good)
+
     stats["plan"] = len(plan)
-    return plan
-
-
-def build_plan(
-    tgt,
-    period: int,
-    roll_sequence: int,
-    min_market_len: int,
-    core_sn_suffix_only: bool,
-    loan_page_size: int,
-) -> Tuple[List[dict], Dict[str, int]]:
-    orphan_apps = load_orphan_apps(tgt)
-    loan_by_no = load_all_loans_index(tgt, loan_page_size)
-    t0 = time.time()
-    candidates, stats = collect_candidates(
-        orphan_apps,
-        loan_by_no,
-        period,
-        roll_sequence,
-        min_market_len,
-        core_sn_suffix_only,
-    )
     print(
-        "phase3a: candidates=%s stats=%s elapsed=%.1fs"
-        % (len(candidates), stats, time.time() - t0),
+        "phase3: plan=%s stats=%s elapsed=%.1fs"
+        % (len(plan), stats, time.time() - t0),
         flush=True,
     )
-    good_keys = [c["good_application_no"] for c in candidates]
-    existing_apps = lookup_existing_apps(tgt, good_keys)
-    plan = filter_plan_by_pk(candidates, existing_apps, stats)
-    print("phase3b: plan=%s final_stats=%s" % (len(plan), stats), flush=True)
     return plan, stats
 
 
-def apply_batch(tgt, rows: List[dict], dry_run: bool) -> int:
-    if not rows:
-        return 0
-    if dry_run:
-        return len(rows)
-    parts: List[str] = []
-    params: List = []
-    for r in rows:
-        parts.append("SELECT %s AS bad_app, %s AS good_app, %s AS sn")
-        params.extend([r["bad_application_no"], r["good_application_no"], r["sn"]])
-    sql = (
-        """
-        UPDATE application a
-        INNER JOIN (
-        """
-        + " UNION ALL ".join(parts)
-        + """
-        ) x ON a.application_no = x.bad_app AND a.sn = x.sn
-        SET a.application_no = x.good_app
-        """
+def apply_one(tgt, row: dict) -> str:
+    """返回 ok / skip_exists / skip_missing / skip_dup_key / err。"""
+    bad = row["bad_application_no"]
+    good = row["good_application_no"]
+    sn = row["sn"]
+
+    def _run():
+        _ping(tgt)
+        with tgt.cursor() as cur:
+            cur.execute(
+                "SELECT application_no FROM application WHERE application_no=%s LIMIT 1",
+                (good,),
+            )
+            if cur.fetchone():
+                return "skip_exists"
+            cur.execute(
+                """
+                UPDATE application
+                SET application_no=%s
+                WHERE application_no=%s AND sn=%s
+                """,
+                (good, bad, sn),
+            )
+            if int(cur.rowcount or 0) <= 0:
+                return "skip_missing"
+            return "ok"
+
+    try:
+        return exec_with_retry(
+            tgt, _run, "update %s->%s" % (bad, good)
+        )
+    except pymysql.err.IntegrityError as e:
+        # 并发下目标号已被占用
+        if getattr(e, "args", None) and e.args and e.args[0] == 1062:
+            try:
+                tgt.rollback()
+            except Exception:
+                pass
+            return "skip_dup_key"
+        raise
+
+
+def split_chunks(rows: List[dict], workers: int) -> List[List[dict]]:
+    n = max(1, int(workers))
+    if n == 1:
+        return [rows]
+    chunks: List[List[dict]] = [[] for _ in range(n)]
+    for i, row in enumerate(rows):
+        chunks[i % n].append(row)
+    return [c for c in chunks if c]
+
+
+def worker_run(spec: dict) -> Tuple[int, int, Dict[str, int]]:
+    label = "[%s/%s] " % (spec["worker_id"], spec["workers"])
+    chunk = spec.get("plan_chunk") or []
+    stats: Dict[str, int] = {}
+    if not chunk:
+        return 0, 0, stats
+    cfg = load_env(Path(spec["env"]))
+    commit_every = max(1, int(spec.get("commit_every") or 50))
+    print("%sstart rows=%s" % (label, len(chunk)), flush=True)
+    tgt = connect_target(cfg, for_apply=True)
+    ok = skip = 0
+    since_commit = 0
+    try:
+        for i, row in enumerate(chunk, 1):
+            result = apply_one(tgt, row)
+            if result == "ok":
+                ok += 1
+                since_commit += 1
+                if since_commit >= commit_every:
+                    tgt.commit()
+                    since_commit = 0
+            else:
+                skip += 1
+                stats[result] = stats.get(result, 0) + 1
+                try:
+                    tgt.rollback()
+                except Exception:
+                    pass
+            if i == 1 or i % 200 == 0 or i == len(chunk):
+                print(
+                    "%sprogress %s/%s ok=%s skip=%s"
+                    % (label, i, len(chunk), ok, skip),
+                    flush=True,
+                )
+        if since_commit:
+            tgt.commit()
+    finally:
+        tgt.close()
+    print("%sdone ok=%s skip=%s stats=%s" % (label, ok, skip, stats), flush=True)
+    return ok, skip, stats
+
+
+def run_parallel(
+    plan: List[dict],
+    workers: int,
+    env_path: str,
+    commit_every: int,
+) -> Tuple[int, int, Dict[str, int]]:
+    workers = min(max(1, int(workers)), 16)
+    chunks = split_chunks(plan, workers)
+    specs = []
+    for i, chunk in enumerate(chunks):
+        specs.append(
+            {
+                "worker_id": i + 1,
+                "workers": len(chunks),
+                "env": env_path,
+                "commit_every": commit_every,
+                "plan_chunk": chunk,
+            }
+        )
+    print(
+        "parallel apply workers=%s rows=%s commit_every=%s"
+        % (len(specs), len(plan), commit_every),
+        flush=True,
     )
-    with tgt.cursor() as cur:
-        cur.execute(sql, tuple(params))
-        return int(cur.rowcount or 0)
+    if len(specs) == 1:
+        return worker_run(specs[0])
+    ctx = multiprocessing.get_context("spawn")
+    with ctx.Pool(processes=len(specs)) as pool:
+        results = pool.map(worker_run, specs)
+    ok = sum(r[0] for r in results)
+    skip = sum(r[1] for r in results)
+    stats: Dict[str, int] = {}
+    for _, _, s in results:
+        for k, v in s.items():
+            stats[k] = stats.get(k, 0) + v
+    print(
+        "parallel done ok=%s skip=%s skip_stats=%s" % (ok, skip, stats),
+        flush=True,
+    )
+    return ok, skip, stats
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(
-        description="Sync application.application_no from loan (2 queries + memory)"
+        description="Sync application.application_no from loan (memory plan + parallel apply)"
     )
     p.add_argument("--env", default=str(HERE / "ng_migration.env"))
     p.add_argument("--apply", action="store_true")
     p.add_argument("--apply-only", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--plan-file", default="/tmp/sync_app_no_from_loan_plan.json")
-    p.add_argument("--batch-size", type=int, default=200)
     p.add_argument("--loan-page-size", type=int, default=50000)
     p.add_argument("--period", type=int, default=1)
     p.add_argument("--roll-sequence", type=int, default=0)
     p.add_argument("--min-market-len", type=int, default=15)
+    p.add_argument("--workers", type=int, default=8, help="apply 并行进程数")
+    p.add_argument("--commit-every", type=int, default=50)
     p.add_argument(
         "--all-suffix",
         action="store_true",
@@ -378,6 +404,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     plan_path = Path(args.plan_file)
     cfg = load_env(Path(args.env))
+    env_path = str(Path(args.env).resolve())
 
     if args.apply_only and plan_path.is_file():
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
@@ -421,29 +448,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("dry-run only, no DB writes (use --apply or --apply-only)", flush=True)
         return 0
 
-    tgt = connect_target(cfg, for_apply=True)
-    ok = skip = 0
-    batch_size = max(1, args.batch_size)
-    try:
-        for i in range(0, len(plan), batch_size):
-            part = plan[i : i + batch_size]
-            bno = i // batch_size + 1
-            n = exec_with_retry(
-                tgt,
-                lambda p=part: apply_batch(tgt, p, False),
-                "apply batch %s" % bno,
-            )
-            tgt.commit()
-            ok += n
-            skip += len(part) - n
-            print(
-                "batch %s updated=%s/%s total_ok=%s"
-                % (bno, n, len(part), ok),
-                flush=True,
-            )
-    finally:
-        tgt.close()
-    print("done ok=%s skip=%s" % (ok, skip), flush=True)
+    ok, skip, skip_stats = run_parallel(
+        plan,
+        args.workers,
+        env_path,
+        args.commit_every,
+    )
+    print("done ok=%s skip=%s skip_stats=%s" % (ok, skip, skip_stats), flush=True)
     return 0 if ok or skip else 1
 
 
