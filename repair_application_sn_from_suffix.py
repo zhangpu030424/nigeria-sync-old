@@ -21,12 +21,18 @@ Usage:
 
   python3 repair_application_sn_from_suffix.py --env ./ng_migration.env --apply-only \\
     --plan-file /tmp/fix_app_sn_plan.json --workers 4 --batch-size 100
+
+  # 同一 application_no 多个 sn：从 cache 出修复 plan
+  python3 repair_application_sn_from_suffix.py --build-dup-app-no-plan \\
+    --cache-file /tmp/application_sn_snapshot.json \\
+    --dup-plan-file /tmp/fix_dup_app_no_plan.json
 """
 import argparse
 import json
 import multiprocessing
 import re
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -232,6 +238,110 @@ def analyze_snapshot(rows: List[dict]) -> Dict[str, int]:
 
     print("analyze snapshot stats=%s" % stats, flush=True)
     return stats
+
+
+def build_dup_application_no_plan(rows: List[dict]) -> Tuple[List[dict], Dict[str, int]]:
+    """同一 application_no 对应多个 sn 时的修复 plan。
+
+    策略：
+      - good_sn = application_no 后缀（market applicationNo）
+      - 已有 sn=good_sn 的行 → 保留，删除其余错 sn 行
+      - 全无 good_sn → 若 (mobile,gid,good_sn) 已存在则全删；否则改一条、删其余
+    """
+    stats: Dict[str, int] = {"total": len(rows)}
+    t0 = time.time()
+    by_app_no: Dict[str, List[dict]] = defaultdict(list)
+    pk_index: Dict[Tuple[str, int, str], dict] = {}
+    for row in rows:
+        app_no = row["application_no"]
+        mobile = row["mobile"]
+        gid = int(row["group_user_id"])
+        sn = row["sn"]
+        by_app_no[app_no].append(row)
+        pk_index[(mobile, gid, sn)] = row
+
+    plan: List[dict] = []
+    delete_keys: Set[Tuple[str, int, str, str]] = set()
+
+    def _plan_delete(r: dict, app_no: str, good_sn: str, reason: str) -> None:
+        key = (app_no, r["mobile"], int(r["group_user_id"]), r["sn"])
+        if key in delete_keys:
+            return
+        delete_keys.add(key)
+        plan.append(
+            {
+                "action": "delete",
+                "application_no": app_no,
+                "mobile": r["mobile"],
+                "group_user_id": int(r["group_user_id"]),
+                "bad_sn": r["sn"],
+                "good_sn": good_sn,
+                "reason": reason,
+                "app_id": r.get("app_id"),
+            }
+        )
+
+    def _plan_update(r: dict, app_no: str, good_sn: str, reason: str) -> None:
+        plan.append(
+            {
+                "action": "update_sn",
+                "application_no": app_no,
+                "mobile": r["mobile"],
+                "group_user_id": int(r["group_user_id"]),
+                "bad_sn": r["sn"],
+                "good_sn": good_sn,
+                "reason": reason,
+                "app_id": r.get("app_id"),
+            }
+        )
+
+    for app_no, group in by_app_no.items():
+        if len({r["sn"] for r in group}) <= 1:
+            continue
+        good_sn = app_suffix(app_no)
+        if not good_sn:
+            stats["skip_bad_app_no"] = stats.get("skip_bad_app_no", 0) + 1
+            continue
+        stats["dup_groups"] = stats.get("dup_groups", 0) + 1
+        keepers = [r for r in group if r["sn"] == good_sn]
+        losers = [r for r in group if r["sn"] != good_sn]
+
+        if keepers:
+            stats["groups_with_keeper"] = stats.get("groups_with_keeper", 0) + 1
+            if len(keepers) > 1:
+                stats["groups_multi_keeper"] = stats.get("groups_multi_keeper", 0) + 1
+            for r in losers:
+                _plan_delete(r, app_no, good_sn, "dup_app_no_wrong_sn")
+            stats["delete"] = stats.get("delete", 0) + len(losers)
+            continue
+
+        losers_sorted = sorted(
+            losers,
+            key=lambda r: (len(r["sn"]), r["mobile"], r["group_user_id"], r["sn"]),
+        )
+        primary = losers_sorted[0]
+        target_pk = (primary["mobile"], int(primary["group_user_id"]), good_sn)
+        existing = pk_index.get(target_pk)
+        if existing is not None and existing is not primary:
+            stats["groups_good_pk_exists"] = stats.get("groups_good_pk_exists", 0) + 1
+            for r in losers:
+                _plan_delete(r, app_no, good_sn, "dup_app_no_good_pk_exists")
+            stats["delete"] = stats.get("delete", 0) + len(losers)
+            continue
+
+        _plan_update(primary, app_no, good_sn, "dup_app_no_no_keeper")
+        stats["update_sn"] = stats.get("update_sn", 0) + 1
+        for r in losers_sorted[1:]:
+            _plan_delete(r, app_no, good_sn, "dup_app_no_extra_row")
+        stats["delete"] = stats.get("delete", 0) + max(0, len(losers) - 1)
+
+    stats["plan"] = len(plan)
+    print(
+        "dup_app_no plan=%s stats=%s elapsed=%.1fs"
+        % (len(plan), stats, time.time() - t0),
+        flush=True,
+    )
+    return plan, stats
 
 
 def apply_batch(tgt, rows: List[dict]) -> Tuple[int, int, Dict[str, int]]:
@@ -495,6 +605,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="只分析 cache-file，不连库、不写 plan",
     )
+    p.add_argument(
+        "--build-dup-app-no-plan",
+        action="store_true",
+        help="从 cache 生成 application_no_multi_sn 修复 plan",
+    )
+    p.add_argument(
+        "--dup-plan-file",
+        default="/tmp/fix_dup_app_no_plan.json",
+        help="application_no 重复 sn 的 plan 输出路径",
+    )
     p.add_argument("--work-limit", type=int, default=0)
     args = p.parse_args(argv)
     if args.apply and args.dry_run:
@@ -515,6 +635,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         rows = json.loads(cache_path.read_text(encoding="utf-8"))
         print("loaded cache_file=%s rows=%s" % (cache_path, len(rows)), flush=True)
         analyze_snapshot(rows)
+        return 0
+
+    if args.build_dup_app_no_plan:
+        if not cache_path.is_file():
+            p.error("cache not found: %s (run dry-run first or pass --cache-file)" % cache_path)
+        rows = json.loads(cache_path.read_text(encoding="utf-8"))
+        print("loaded cache_file=%s rows=%s" % (cache_path, len(rows)), flush=True)
+        dup_plan, dup_stats = build_dup_application_no_plan(rows)
+        if args.work_limit > 0:
+            dup_plan = dup_plan[: args.work_limit]
+        dup_path = Path(args.dup_plan_file)
+        dup_path.write_text(
+            json.dumps(dup_plan, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print("wrote dup_plan_file=%s rows=%s" % (dup_path, len(dup_plan)), flush=True)
         return 0
 
     if args.apply_only:
