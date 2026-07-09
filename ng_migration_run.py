@@ -2021,8 +2021,8 @@ COUNTRY_CODE = "ng"
 def format_application_no(app_id: Any, suffix: Any) -> str:
     """Target application_no: ng{appId:04d}-{market applicationNo}.
 
-    suffix 为目标单号后半段，一般为源库 market.applicationNo（如 178099546912018102），
-    不是 core.application.sn。
+    suffix 为目标单号后半段，一般为源库 market.applicationNo（如 178099546912018102）。
+    application.sn 同样取 market.applicationNo；loan_no 中间段仍用 core.application.sn。
     """
     tail = str(suffix or "").strip()
     if not tail:
@@ -2290,7 +2290,6 @@ def _build_application_rows(
     out: List[dict] = []
     for row in raw_rows:
         user_id = int(row["user_id"])
-        market_sn = row.get("sn") or ""
         market_no = str(row.get("application_no") or "").strip()
         core_sn = str(row.get("core_sn") or "").strip()
         if not core_sn or not market_no:
@@ -2355,7 +2354,7 @@ def _build_application_rows(
             "app_version": row["app_version"],
             "user_id": user_id,
             "group_user_id": user_id,
-            "sn": core_sn,
+            "sn": market_no,
             "core_sn": core_sn,
             "is_test": 0,
             "is_first_apply": int(row.get("is_first_apply") or 0),

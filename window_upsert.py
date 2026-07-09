@@ -12,8 +12,8 @@ Usage:
   python3 window_upsert.py --date-window last-month --apply --tables loan
     # 仅 upsert loan（跳过 application 写库；源端走 loan 快速加载）
 
-loan_no 中间段与全量迁移一致：repay_plan.sn（= ng_loan_core.application.sn），
-见 ng_migration_run.loan_sn_from_repay_plan / format_loan_no；勿用 plan_sn 或 market 长号。
+loan_no 中间段与全量迁移一致：repay_plan.sn（= ng_loan_core.application.sn）；
+application.sn 取 market.applicationNo，见 ng_migration_run._build_application_rows。
 """
 import argparse
 import sys
