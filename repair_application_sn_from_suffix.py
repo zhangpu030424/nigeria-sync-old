@@ -23,13 +23,12 @@ Usage:
     --plan-file /tmp/fix_app_sn_plan.json --workers 4 --batch-size 100
 """
 import argparse
-import heapq
 import json
 import multiprocessing
 import re
 import time
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import pymysql
 from pymysql.cursors import DictCursor
@@ -204,163 +203,57 @@ def build_plan(rows: List[dict]) -> Tuple[List[dict], Dict[str, int]]:
     return plan, stats
 
 
-def _track_multi(
-    first_map: Dict,
-    multi_map: Dict,
-    key,
-    value: str,
-) -> None:
-    if key in multi_map:
-        multi_map[key].add(value)
-        return
-    prev = first_map.get(key)
-    if prev is None:
-        first_map[key] = value
-        return
-    if prev != value:
-        multi_map[key] = {prev, value}
-        del first_map[key]
+def analyze_snapshot(rows: List[dict], sample_limit: int = 20) -> Dict[str, int]:
+    """统计 application_no 对应多个 sn 等情况。"""
+    stats: Dict[str, int] = {"total": len(rows)}
+    by_app_no: Dict[str, Set[str]] = {}
+    by_user: Dict[Tuple[str, int], Set[str]] = {}
+    for row in rows:
+        app_no = row["application_no"]
+        sn = row["sn"]
+        mobile = row["mobile"]
+        gid = int(row["group_user_id"])
+        by_app_no.setdefault(app_no, set()).add(sn)
+        by_user.setdefault((mobile, gid), set()).add(sn)
 
+    multi_app_no = {k: v for k, v in by_app_no.items() if len(v) > 1}
+    multi_user = {k: v for k, v in by_user.items() if len(v) > 1}
+    stats["unique_application_no"] = len(by_app_no)
+    stats["application_no_multi_sn"] = len(multi_app_no)
+    stats["unique_user_pk_prefix"] = len(by_user)
+    stats["user_multi_sn"] = len(multi_user)
 
-def _consume_row(
-    row: dict,
-    app_first: Dict[str, str],
-    app_multi: Dict[str, Set[str]],
-    user_first: Dict[Tuple[str, int], str],
-    user_multi: Dict[Tuple[str, int], Set[str]],
-    stats: Dict[str, int],
-) -> None:
-    app_no = str(row.get("application_no") or "").strip()
-    sn = str(row.get("sn") or "").strip()
-    mobile = str(row.get("mobile") or "").strip()
-    gid = int(row["group_user_id"])
-    stats["total"] = stats.get("total", 0) + 1
-    _track_multi(app_first, app_multi, app_no, sn)
-    _track_multi(user_first, user_multi, (mobile, gid), sn)
-    good = app_suffix(app_no)
-    if good and sn != good:
-        stats["sn_mismatch_rows"] = stats.get("sn_mismatch_rows", 0) + 1
+    sn_mismatch = 0
+    for row in rows:
+        good = app_suffix(row["application_no"])
+        if good and row["sn"] != good:
+            sn_mismatch += 1
+    stats["sn_mismatch_rows"] = sn_mismatch
 
-
-def iter_snapshot_rows(path: Path, chunk_size: int = 1024 * 1024) -> Iterator[dict]:
-    """流式读取 JSON 数组，避免 1400 万行一次性进内存。"""
-    decoder = json.JSONDecoder()
-    with path.open("r", encoding="utf-8") as f:
-        buf = ""
-        while True:
-            if not buf:
-                chunk = f.read(chunk_size)
-                if not chunk:
-                    break
-                buf = chunk
-            buf = buf.lstrip()
-            if not buf:
-                continue
-            if buf[0] == "[":
-                buf = buf[1:]
-                continue
-            if buf[0] == "]":
-                break
-            if buf[0] == ",":
-                buf = buf[1:]
-                continue
-            try:
-                obj, end = decoder.raw_decode(buf)
-            except json.JSONDecodeError:
-                chunk = f.read(chunk_size)
-                if not chunk:
-                    raise
-                buf += chunk
-                continue
-            if isinstance(obj, dict):
-                yield obj
-            buf = buf[end:]
-
-
-def analyze_snapshot_file(
-    path: Path, sample_limit: int = 20, progress_every: int = 1000000
-) -> Dict[str, int]:
-    """流式统计，适合千万级 snapshot。"""
-    print("analyze streaming cache=%s ..." % path, flush=True)
-    t0 = time.time()
-    stats: Dict[str, int] = {"sn_mismatch_rows": 0}
-    app_first: Dict[str, str] = {}
-    app_multi: Dict[str, Set[str]] = {}
-    user_first: Dict[Tuple[str, int], str] = {}
-    user_multi: Dict[Tuple[str, int], Set[str]] = {}
-    total = 0
-    for row in iter_snapshot_rows(path):
-        _consume_row(row, app_first, app_multi, user_first, user_multi, stats)
-        total += 1
-        if progress_every > 0 and total % progress_every == 0:
-            print(
-                "  scanned=%s multi_app_no=%s multi_user=%s elapsed=%.1fs"
-                % (total, len(app_multi), len(user_multi), time.time() - t0),
-                flush=True,
-            )
-    stats["total"] = total
-    stats["unique_application_no"] = len(app_first) + len(app_multi)
-    stats["application_no_multi_sn"] = len(app_multi)
-    stats["unique_user_pk_prefix"] = len(user_first) + len(user_multi)
-    stats["user_multi_sn"] = len(user_multi)
-    print("analyze snapshot stats=%s elapsed=%.1fs" % (stats, time.time() - t0), flush=True)
-
-    if app_multi:
-        top = heapq.nlargest(
-            sample_limit,
-            app_multi.items(),
-            key=lambda x: (len(x[1]), x[0]),
-        )
+    print("analyze snapshot stats=%s" % stats, flush=True)
+    if multi_app_no:
         print(
             "application_no with multiple sn (show %s/%s):"
-            % (len(top), len(app_multi)),
+            % (min(sample_limit, len(multi_app_no)), len(multi_app_no)),
             flush=True,
         )
-        for app_no, sns in top:
+        for i, (app_no, sns) in enumerate(
+            sorted(multi_app_no.items(), key=lambda x: (-len(x[1]), x[0]))
+        ):
+            if i >= sample_limit:
+                break
             print("  %s -> %s" % (app_no, sorted(sns)), flush=True)
-    if user_multi:
-        top_u = heapq.nlargest(
-            sample_limit,
-            user_multi.items(),
-            key=lambda x: (len(x[1]), x[0][0]),
-        )
+    if multi_user:
         print(
             "same mobile+group_user_id multiple sn (show %s/%s):"
-            % (len(top_u), len(user_multi)),
+            % (min(sample_limit, len(multi_user)), len(multi_user)),
             flush=True,
         )
-        for (mobile, gid), sns in top_u:
-            print("  mobile=%s gid=%s sns=%s" % (mobile, gid, sorted(sns)), flush=True)
-    return stats
-
-
-def analyze_snapshot(rows: List[dict], sample_limit: int = 20) -> Dict[str, int]:
-    """内存列表统计（小数据量）。"""
-    stats: Dict[str, int] = {"total": len(rows), "sn_mismatch_rows": 0}
-    app_first: Dict[str, str] = {}
-    app_multi: Dict[str, Set[str]] = {}
-    user_first: Dict[Tuple[str, int], str] = {}
-    user_multi: Dict[Tuple[str, int], Set[str]] = {}
-    for row in rows:
-        _consume_row(row, app_first, app_multi, user_first, user_multi, stats)
-    stats["unique_application_no"] = len(app_first) + len(app_multi)
-    stats["application_no_multi_sn"] = len(app_multi)
-    stats["unique_user_pk_prefix"] = len(user_first) + len(user_multi)
-    stats["user_multi_sn"] = len(user_multi)
-    print("analyze snapshot stats=%s" % stats, flush=True)
-    if app_multi:
-        top = heapq.nlargest(
-            sample_limit, app_multi.items(), key=lambda x: (len(x[1]), x[0])
-        )
-        print("application_no with multiple sn (show %s/%s):" % (len(top), len(app_multi)), flush=True)
-        for app_no, sns in top:
-            print("  %s -> %s" % (app_no, sorted(sns)), flush=True)
-    if user_multi:
-        top_u = heapq.nlargest(
-            sample_limit, user_multi.items(), key=lambda x: (len(x[1]), x[0][0])
-        )
-        print("same mobile+group_user_id multiple sn (show %s/%s):" % (len(top_u), len(user_multi)), flush=True)
-        for (mobile, gid), sns in top_u:
+        for i, ((mobile, gid), sns) in enumerate(
+            sorted(multi_user.items(), key=lambda x: (-len(x[1]), x[0][0]))
+        ):
+            if i >= sample_limit:
+                break
             print("  mobile=%s gid=%s sns=%s" % (mobile, gid, sorted(sns)), flush=True)
     return stats
 
@@ -644,7 +537,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.analyze_cache:
         if not cache_path.is_file():
             p.error("cache not found: %s" % cache_path)
-        analyze_snapshot_file(cache_path, args.analyze_sample)
+        rows = json.loads(cache_path.read_text(encoding="utf-8"))
+        print("loaded cache_file=%s rows=%s" % (cache_path, len(rows)), flush=True)
+        analyze_snapshot(rows, args.analyze_sample)
         return 0
 
     if args.apply_only:
