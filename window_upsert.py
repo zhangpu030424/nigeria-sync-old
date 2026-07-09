@@ -14,6 +14,10 @@ Usage:
 
 loan_no 中间段与全量迁移一致：repay_plan.sn（= ng_loan_core.application.sn）；
 application.sn 取 market.applicationNo，见 ng_migration_run._build_application_rows。
+
+目标库主键（去重与 ON DUPLICATE KEY UPDATE 对齐）：
+  application: (mobile, group_user_id, sn)
+  loan:        (application_no, period, roll_sequence)
 """
 import argparse
 import sys
@@ -39,6 +43,16 @@ def _user_update_cols() -> List[str]:
     return _cols_except(mig.USER_INSERT_COLS, "user_id")
 
 
+def _application_update_cols() -> List[str]:
+    # PK=(mobile, group_user_id, sn)；application_no 等非主键列在冲突时刷新
+    return _cols_except(mig.APPLICATION_INSERT_COLS, "mobile", "group_user_id", "sn")
+
+
+def _loan_update_cols() -> List[str]:
+    # PK=(application_no, period, roll_sequence)；loan_no 在冲突时可更新
+    return _cols_except(mig.LOAN_INSERT_COLS, "application_no", "period", "roll_sequence")
+
+
 def _upsert_table_specs() -> Tuple[Tuple[str, List[str], List[str], str], ...]:
     return (
         ("user", mig.USER_INSERT_COLS, _user_update_cols(), "rows_user"),
@@ -58,13 +72,13 @@ def _upsert_table_specs() -> Tuple[Tuple[str, List[str], List[str], str], ...]:
         (
             "application",
             mig.APPLICATION_INSERT_COLS,
-            _cols_except(mig.APPLICATION_INSERT_COLS, "application_no"),
+            _application_update_cols(),
             "app_rows",
         ),
         (
             "loan",
             mig.LOAN_INSERT_COLS,
-            _cols_except(mig.LOAN_INSERT_COLS, "loan_no"),
+            _loan_update_cols(),
             "loan_rows",
         ),
         (
@@ -97,9 +111,9 @@ def _primary_key_cols(table: str, columns: Sequence[str]) -> Tuple[str, ...]:
     if table == "user_product":
         return ("group_user_id", "product_id")
     if table == "application":
-        return ("application_no",)
+        return ("mobile", "group_user_id", "sn")
     if table == "loan":
-        return ("loan_no",)
+        return ("application_no", "period", "roll_sequence")
     if table == "id_mapping":
         return ("id", "app_id", "mapping_id", "type")
     raise ValueError(f"unknown table: {table}")
