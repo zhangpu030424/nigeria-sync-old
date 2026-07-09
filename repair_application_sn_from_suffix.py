@@ -107,7 +107,9 @@ def load_applications(
         """
         SELECT application_no, mobile, group_user_id, sn, app_id
         FROM application
-        WHERE app_id NOT IN (%s)
+        WHERE app_id NOT IN ("""
+        + ph
+        + """)
           AND application_no IS NOT NULL AND application_no <> ''
           AND mobile IS NOT NULL AND mobile <> ''
           AND sn IS NOT NULL AND sn <> ''
@@ -119,18 +121,21 @@ def load_applications(
         LIMIT %s
         """
     )
-    params_tail = list(exclude_app_ids)
+    params_head = list(exclude_app_ids)
     after = ""
     page_no = 0
     rows: List[dict] = []
     while True:
-        def _page(a=after, lim=page_size, p=list(params_tail)):
+        page_no += 1
+        mobile_after = after
+        lim = page_size
+
+        def _page():
             _ping(tgt)
             with tgt.cursor() as cur:
-                cur.execute(sql, tuple(p + [a, lim]))
+                cur.execute(sql, tuple(params_head + [mobile_after, lim]))
                 return list(cur.fetchall())
 
-        page_no += 1
         batch = exec_with_retry(tgt, _page, "load application page=%s" % page_no)
         if not batch:
             break
