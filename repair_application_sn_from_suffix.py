@@ -34,7 +34,6 @@ import argparse
 import json
 import multiprocessing
 import re
-import sys
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -48,9 +47,6 @@ from repair_loan_no_from_audit import exec_with_retry
 HERE = Path(__file__).resolve().parent
 APP_SUFFIX_RE = re.compile(r"^ng\d+-(.+)$", re.I)
 DEFAULT_EXCLUDE_APP_IDS = (567, 568, 569, 571, 572, 573)
-
-# fork 子进程共享快照（仅 Linux 本地索引用）
-_SNAPSHOT_ROWS: Optional[List[dict]] = None
 
 
 def load_env(path: Path) -> Dict[str, str]:
@@ -113,110 +109,59 @@ def load_snapshot_cache(path: Path) -> List[dict]:
     return rows
 
 
-def _snapshot_init(rows: List[dict]) -> None:
-    global _SNAPSHOT_ROWS
-    _SNAPSHOT_ROWS = rows
-
-
-def _index_chunk(chunk: List[dict]) -> dict:
-    by_app: Dict[str, List[dict]] = defaultdict(list)
+def scan_snapshot_light(
+    rows: List[dict], label: str = "scan"
+) -> Tuple[Dict[str, Set[str]], Dict[Tuple[str, int], Set[str]], Set[Tuple[str, int, str]], int]:
+    """单遍轻量扫描：只建 set，不存行列表（14M 行也快）。"""
+    t0 = time.time()
     by_app_sn: Dict[str, Set[str]] = defaultdict(set)
     by_user_sn: Dict[Tuple[str, int], Set[str]] = defaultdict(set)
-    pk_index: Dict[Tuple[str, int, str], dict] = {}
+    pk_set: Set[Tuple[str, int, str]] = set()
     sn_mismatch = 0
-    for row in chunk:
+    total = len(rows)
+    for i, row in enumerate(rows, 1):
         app_no = row["application_no"]
         mobile = row["mobile"]
         gid = int(row["group_user_id"])
         sn = row["sn"]
-        by_app[app_no].append(row)
         by_app_sn[app_no].add(sn)
         by_user_sn[(mobile, gid)].add(sn)
-        pk_index[(mobile, gid, sn)] = row
+        pk_set.add((mobile, gid, sn))
         good = app_suffix(app_no)
         if good and sn != good:
             sn_mismatch += 1
-    return {
-        "by_app": dict(by_app),
-        "by_app_sn": {k: set(v) for k, v in by_app_sn.items()},
-        "by_user_sn": dict(by_user_sn),
-        "pk_index": pk_index,
-        "sn_mismatch": sn_mismatch,
-        "count": len(chunk),
-    }
+        if i % 2000000 == 0:
+            print(
+                "%s progress %s/%s elapsed=%.1fs"
+                % (label, i, total, time.time() - t0),
+                flush=True,
+            )
+    print("%s done rows=%s elapsed=%.1fs" % (label, total, time.time() - t0), flush=True)
+    return by_app_sn, by_user_sn, pk_set, sn_mismatch
 
 
-def _index_range(rng: Tuple[int, int]) -> dict:
-    start, end = rng
-    return _index_chunk(_SNAPSHOT_ROWS[start:end])
-
-
-def _merge_index_parts(parts: List[dict]) -> Tuple[
-    Dict[str, List[dict]],
-    Dict[str, Set[str]],
-    Dict[Tuple[str, int], Set[str]],
-    Dict[Tuple[str, int, str], dict],
-    int,
-    int,
-]:
-    by_app_no: Dict[str, List[dict]] = defaultdict(list)
-    by_app_sn: Dict[str, Set[str]] = defaultdict(set)
-    by_user_sn: Dict[Tuple[str, int], Set[str]] = defaultdict(set)
-    pk_index: Dict[Tuple[str, int, str], dict] = {}
-    sn_mismatch = 0
-    total = 0
-    for part in parts:
-        total += int(part.get("count") or 0)
-        sn_mismatch += int(part.get("sn_mismatch") or 0)
-        for k, v in part["by_app"].items():
-            by_app_no[k].extend(v)
-        for k, v in part["by_app_sn"].items():
-            by_app_sn[k].update(v)
-        for k, v in part["by_user_sn"].items():
-            by_user_sn[k].update(v)
-        pk_index.update(part["pk_index"])
-    return by_app_no, by_app_sn, by_user_sn, pk_index, sn_mismatch, total
-
-
-def parallel_snapshot_index(
-    rows: List[dict], local_workers: int
-) -> Tuple[
-    Dict[str, List[dict]],
-    Dict[str, Set[str]],
-    Dict[Tuple[str, int], Set[str]],
-    Dict[Tuple[str, int, str], dict],
-    int,
-    int,
-]:
-    workers = max(1, min(int(local_workers), 32))
-    n = len(rows)
+def collect_dup_rows(
+    rows: List[dict], dup_app_nos: Set[str]
+) -> Tuple[Dict[str, List[dict]], Dict[Tuple[str, int, str], dict]]:
+    """第二遍：只收集重复 application_no 的行（约几千行）。"""
     t0 = time.time()
-    if workers <= 1 or n < 200000:
-        parts = [_index_chunk(rows)]
-    else:
-        step = (n + workers - 1) // workers
-        ranges = [(i, min(i + step, n)) for i in range(0, n, step)]
-        print(
-            "parallel index workers=%s chunks=%s rows=%s ..."
-            % (len(ranges), len(ranges), n),
-            flush=True,
-        )
-        if sys.platform == "win32":
-            chunks = [rows[a:b] for a, b in ranges]
-            ctx = multiprocessing.get_context("spawn")
-            with ctx.Pool(processes=len(chunks)) as pool:
-                parts = pool.map(_index_chunk, chunks)
-        else:
-            ctx = multiprocessing.get_context("fork")
-            with ctx.Pool(
-                processes=len(ranges),
-                initializer=_snapshot_init,
-                initargs=(rows,),
-            ) as pool:
-                parts = pool.map(_index_range, ranges)
-    merged = _merge_index_parts(parts)
-    print("parallel index elapsed=%.1fs" % (time.time() - t0), flush=True)
-    return merged
+    by_app_no: Dict[str, List[dict]] = defaultdict(list)
+    pk_index: Dict[Tuple[str, int, str], dict] = {}
+    for row in rows:
+        app_no = row["application_no"]
+        if app_no not in dup_app_nos:
+            continue
+        mobile = row["mobile"]
+        gid = int(row["group_user_id"])
+        sn = row["sn"]
+        by_app_no[app_no].append(row)
+        pk_index[(mobile, gid, sn)] = row
+    print(
+        "collect dup rows apps=%s rows=%s elapsed=%.1fs"
+        % (len(by_app_no), sum(len(v) for v in by_app_no.values()), time.time() - t0),
+        flush=True,
+    )
+    return by_app_no, pk_index
 
 
 def load_applications(
@@ -292,41 +237,49 @@ def load_applications(
     return rows
 
 
-def build_plan(rows: List[dict], local_workers: int = 8) -> Tuple[List[dict], Dict[str, int]]:
+def build_plan(rows: List[dict], local_workers: int = 1) -> Tuple[List[dict], Dict[str, int]]:
     stats: Dict[str, int] = {"total": len(rows)}
     t0 = time.time()
-    by_app_no, _, _, _, sn_mismatch, _ = parallel_snapshot_index(rows, local_workers)
-    stats["sn_mismatch_rows"] = sn_mismatch
     pk_seen: Set[Tuple[str, int, str]] = set()
     plan: List[dict] = []
-    for app_no, group in by_app_no.items():
+    sn_mismatch = 0
+    total = len(rows)
+    for i, row in enumerate(rows, 1):
+        app_no = row["application_no"]
         good_sn = app_suffix(app_no)
         if not good_sn:
-            stats["skip_bad_app_no"] = stats.get("skip_bad_app_no", 0) + len(group)
+            stats["skip_bad_app_no"] = stats.get("skip_bad_app_no", 0) + 1
             continue
-        for row in group:
-            bad_sn = row["sn"]
-            if bad_sn == good_sn:
-                stats["ok"] = stats.get("ok", 0) + 1
-                continue
-            mobile = row["mobile"]
-            gid = int(row["group_user_id"])
-            target_pk = (mobile, gid, good_sn)
-            if target_pk in pk_seen:
-                stats["skip_pk_target_dup"] = stats.get("skip_pk_target_dup", 0) + 1
-                continue
-            pk_seen.add(target_pk)
-            plan.append(
-                {
-                    "action": "update_sn",
-                    "application_no": app_no,
-                    "mobile": mobile,
-                    "group_user_id": gid,
-                    "bad_sn": bad_sn,
-                    "good_sn": good_sn,
-                    "app_id": row.get("app_id"),
-                }
+        bad_sn = row["sn"]
+        if bad_sn == good_sn:
+            stats["ok"] = stats.get("ok", 0) + 1
+            continue
+        sn_mismatch += 1
+        mobile = row["mobile"]
+        gid = int(row["group_user_id"])
+        target_pk = (mobile, gid, good_sn)
+        if target_pk in pk_seen:
+            stats["skip_pk_target_dup"] = stats.get("skip_pk_target_dup", 0) + 1
+            continue
+        pk_seen.add(target_pk)
+        plan.append(
+            {
+                "action": "update_sn",
+                "application_no": app_no,
+                "mobile": mobile,
+                "group_user_id": gid,
+                "bad_sn": bad_sn,
+                "good_sn": good_sn,
+                "app_id": row.get("app_id"),
+            }
+        )
+        if i % 2000000 == 0:
+            print(
+                "build_plan progress %s/%s elapsed=%.1fs"
+                % (i, total, time.time() - t0),
+                flush=True,
             )
+    stats["sn_mismatch_rows"] = sn_mismatch
     stats["plan"] = len(plan)
     print(
         "phase2: plan=%s stats=%s elapsed=%.1fs"
@@ -336,16 +289,15 @@ def build_plan(rows: List[dict], local_workers: int = 8) -> Tuple[List[dict], Di
     return plan, stats
 
 
-def analyze_snapshot(rows: List[dict], local_workers: int = 8) -> Dict[str, int]:
-    """统计 application_no 对应多个 sn 等情况（多进程分块索引）。"""
+def analyze_snapshot(rows: List[dict], local_workers: int = 1) -> Dict[str, int]:
+    """统计 application_no 对应多个 sn 等情况（单遍轻量扫描）。"""
+    del local_workers  # 保留参数兼容；多进程合并反而更慢
     t0 = time.time()
-    _, by_app_sn, by_user_sn, _, sn_mismatch, total = parallel_snapshot_index(
-        rows, local_workers
-    )
+    by_app_sn, by_user_sn, _, sn_mismatch = scan_snapshot_light(rows, "analyze")
     multi_app_no = {k: v for k, v in by_app_sn.items() if len(v) > 1}
     multi_user = {k: v for k, v in by_user_sn.items() if len(v) > 1}
     stats = {
-        "total": total,
+        "total": len(rows),
         "unique_application_no": len(by_app_sn),
         "application_no_multi_sn": len(multi_app_no),
         "unique_user_pk_prefix": len(by_user_sn),
@@ -360,7 +312,7 @@ def analyze_snapshot(rows: List[dict], local_workers: int = 8) -> Dict[str, int]
 
 
 def build_dup_application_no_plan(
-    rows: List[dict], local_workers: int = 8
+    rows: List[dict], local_workers: int = 1
 ) -> Tuple[List[dict], Dict[str, int]]:
     """同一 application_no 对应多个 sn 时的修复 plan。
 
@@ -371,10 +323,10 @@ def build_dup_application_no_plan(
     """
     stats: Dict[str, int] = {"total": len(rows)}
     t0 = time.time()
-    by_app_no, by_app_sn, _, pk_index, _, _ = parallel_snapshot_index(
-        rows, local_workers
-    )
-    dup_app_nos = [k for k, sns in by_app_sn.items() if len(sns) > 1]
+    del local_workers
+    by_app_sn, _, pk_set, _ = scan_snapshot_light(rows, "dup_scan")
+    dup_app_nos = {k for k, sns in by_app_sn.items() if len(sns) > 1}
+    by_app_no, _pk_index = collect_dup_rows(rows, dup_app_nos)
 
     plan: List[dict] = []
     delete_keys: Set[Tuple[str, int, str, str]] = set()
@@ -412,7 +364,7 @@ def build_dup_application_no_plan(
         )
 
     for app_no in dup_app_nos:
-        group = by_app_no[app_no]
+        group = by_app_no.get(app_no) or []
         if len({r["sn"] for r in group}) <= 1:
             continue
         good_sn = app_suffix(app_no)
@@ -438,19 +390,13 @@ def build_dup_application_no_plan(
         )
         primary = losers_sorted[0]
         target_pk = (primary["mobile"], int(primary["group_user_id"]), good_sn)
-        existing = pk_index.get(target_pk)
-        if existing is not None:
+        if target_pk in pk_set:
             ppk = (
                 primary["mobile"],
                 int(primary["group_user_id"]),
                 primary["sn"],
             )
-            epk = (
-                existing["mobile"],
-                int(existing["group_user_id"]),
-                existing["sn"],
-            )
-            if epk != ppk:
+            if target_pk != ppk:
                 stats["groups_good_pk_exists"] = stats.get(
                     "groups_good_pk_exists", 0
                 ) + 1
@@ -910,8 +856,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument(
         "--local-workers",
         type=int,
-        default=8,
-        help="本地 cache 分析/建 plan 的并行进程数（Linux fork）",
+        default=1,
+        help="已弃用：本地扫描固定单遍，该参数仅保留兼容",
     )
     p.add_argument("--batch-size", type=int, default=100)
     p.add_argument(
