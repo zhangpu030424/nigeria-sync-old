@@ -405,24 +405,74 @@ def load_applications(
     return rows
 
 
+def _mismatch_chunk(chunk: List[dict]) -> Tuple[List[dict], int]:
+    out: List[dict] = []
+    skip_bad = 0
+    for row in chunk:
+        app_no = row["application_no"]
+        good_sn = app_suffix(app_no)
+        if not good_sn:
+            skip_bad += 1
+            continue
+        if row["sn"] != good_sn:
+            out.append(row)
+    return out, skip_bad
+
+
+def _mismatch_range(rng: Tuple[int, int]) -> Tuple[List[dict], int]:
+    start, end = rng
+    return _mismatch_chunk(_SCAN_ROWS[start:end])
+
+
+def _collect_mismatch_rows(
+    rows: List[dict], local_workers: int
+) -> Tuple[List[dict], int]:
+    workers = max(1, min(int(local_workers), 32))
+    n = len(rows)
+    if workers <= 1 or n < 500000:
+        return _mismatch_chunk(rows)
+    step = (n + workers - 1) // workers
+    ranges = [(i, min(i + step, n)) for i in range(0, n, step)]
+    print(
+        "build_plan mismatch parallel workers=%s chunks=%s ..."
+        % (len(ranges), len(ranges)),
+        flush=True,
+    )
+    import sys
+
+    if sys.platform == "win32":
+        chunks = [rows[a:b] for a, b in ranges]
+        ctx = multiprocessing.get_context("spawn")
+        with ctx.Pool(processes=len(chunks)) as pool:
+            parts = pool.map(_mismatch_chunk, chunks)
+    else:
+        ctx = multiprocessing.get_context("fork")
+        with ctx.Pool(
+            processes=len(ranges),
+            initializer=_scan_init,
+            initargs=(rows,),
+        ) as pool:
+            parts = pool.map(_mismatch_range, ranges)
+    merged: List[dict] = []
+    skip_bad = 0
+    for part_mismatches, part_skip in parts:
+        merged.extend(part_mismatches)
+        skip_bad += part_skip
+    return merged, skip_bad
+
+
 def build_plan(rows: List[dict], local_workers: int = 1) -> Tuple[List[dict], Dict[str, int]]:
     stats: Dict[str, int] = {"total": len(rows)}
     t0 = time.time()
     pk_seen: Set[Tuple[str, int, str]] = set()
     plan: List[dict] = []
-    sn_mismatch = 0
-    total = len(rows)
-    for i, row in enumerate(rows, 1):
+    mismatches, skip_bad = _collect_mismatch_rows(rows, local_workers)
+    stats["skip_bad_app_no"] = skip_bad
+    sn_mismatch = len(mismatches)
+    for row in mismatches:
         app_no = row["application_no"]
         good_sn = app_suffix(app_no)
-        if not good_sn:
-            stats["skip_bad_app_no"] = stats.get("skip_bad_app_no", 0) + 1
-            continue
         bad_sn = row["sn"]
-        if bad_sn == good_sn:
-            stats["ok"] = stats.get("ok", 0) + 1
-            continue
-        sn_mismatch += 1
         mobile = row["mobile"]
         gid = int(row["group_user_id"])
         target_pk = (mobile, gid, good_sn)
@@ -441,13 +491,8 @@ def build_plan(rows: List[dict], local_workers: int = 1) -> Tuple[List[dict], Di
                 "app_id": row.get("app_id"),
             }
         )
-        if i % 2000000 == 0:
-            print(
-                "build_plan progress %s/%s elapsed=%.1fs"
-                % (i, total, time.time() - t0),
-                flush=True,
-            )
     stats["sn_mismatch_rows"] = sn_mismatch
+    stats["ok"] = len(rows) - sn_mismatch - skip_bad
     stats["plan"] = len(plan)
     print(
         "phase2: plan=%s stats=%s elapsed=%.1fs"
