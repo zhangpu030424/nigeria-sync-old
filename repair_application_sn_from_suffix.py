@@ -203,6 +203,61 @@ def build_plan(rows: List[dict]) -> Tuple[List[dict], Dict[str, int]]:
     return plan, stats
 
 
+def analyze_snapshot(rows: List[dict], sample_limit: int = 20) -> Dict[str, int]:
+    """统计 application_no 对应多个 sn 等情况。"""
+    stats: Dict[str, int] = {"total": len(rows)}
+    by_app_no: Dict[str, Set[str]] = {}
+    by_user: Dict[Tuple[str, int], Set[str]] = {}
+    for row in rows:
+        app_no = row["application_no"]
+        sn = row["sn"]
+        mobile = row["mobile"]
+        gid = int(row["group_user_id"])
+        by_app_no.setdefault(app_no, set()).add(sn)
+        by_user.setdefault((mobile, gid), set()).add(sn)
+
+    multi_app_no = {k: v for k, v in by_app_no.items() if len(v) > 1}
+    multi_user = {k: v for k, v in by_user.items() if len(v) > 1}
+    stats["unique_application_no"] = len(by_app_no)
+    stats["application_no_multi_sn"] = len(multi_app_no)
+    stats["unique_user_pk_prefix"] = len(by_user)
+    stats["user_multi_sn"] = len(multi_user)
+
+    sn_mismatch = 0
+    for row in rows:
+        good = app_suffix(row["application_no"])
+        if good and row["sn"] != good:
+            sn_mismatch += 1
+    stats["sn_mismatch_rows"] = sn_mismatch
+
+    print("analyze snapshot stats=%s" % stats, flush=True)
+    if multi_app_no:
+        print(
+            "application_no with multiple sn (show %s/%s):"
+            % (min(sample_limit, len(multi_app_no)), len(multi_app_no)),
+            flush=True,
+        )
+        for i, (app_no, sns) in enumerate(
+            sorted(multi_app_no.items(), key=lambda x: (-len(x[1]), x[0]))
+        ):
+            if i >= sample_limit:
+                break
+            print("  %s -> %s" % (app_no, sorted(sns)), flush=True)
+    if multi_user:
+        print(
+            "same mobile+group_user_id multiple sn (show %s/%s):"
+            % (min(sample_limit, len(multi_user)), len(multi_user)),
+            flush=True,
+        )
+        for i, ((mobile, gid), sns) in enumerate(
+            sorted(multi_user.items(), key=lambda x: (-len(x[1]), x[0][0]))
+        ):
+            if i >= sample_limit:
+                break
+            print("  mobile=%s gid=%s sns=%s" % (mobile, gid, sorted(sns)), flush=True)
+    return stats
+
+
 def apply_batch(tgt, rows: List[dict]) -> Tuple[int, int, Dict[str, int]]:
     if not rows:
         return 0, 0, {}
@@ -459,6 +514,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="只处理 disbursed_time>0（默认全表）",
     )
+    p.add_argument(
+        "--analyze-cache",
+        action="store_true",
+        help="只分析 cache-file，不连库、不写 plan",
+    )
+    p.add_argument("--analyze-sample", type=int, default=20)
     p.add_argument("--work-limit", type=int, default=0)
     args = p.parse_args(argv)
     if args.apply and args.dry_run:
@@ -472,6 +533,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     cfg = load_env(Path(args.env))
     env_path = str(Path(args.env).resolve())
     exclude_ids = parse_exclude_ids(args.exclude_app_ids)
+
+    if args.analyze_cache:
+        if not cache_path.is_file():
+            p.error("cache not found: %s" % cache_path)
+        rows = json.loads(cache_path.read_text(encoding="utf-8"))
+        print("loaded cache_file=%s rows=%s" % (cache_path, len(rows)), flush=True)
+        analyze_snapshot(rows, args.analyze_sample)
+        return 0
 
     if args.apply_only:
         if not plan_path.is_file():
