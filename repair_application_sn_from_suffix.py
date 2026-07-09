@@ -248,27 +248,88 @@ def scan_snapshot_light(
 
 
 def collect_dup_rows(
-    rows: List[dict], dup_app_nos: Set[str]
+    rows: List[dict], dup_app_nos: Set[str], local_workers: int = 1
 ) -> Tuple[Dict[str, List[dict]], Dict[Tuple[str, int, str], dict]]:
     """第二遍：只收集重复 application_no 的行（约几千行）。"""
     t0 = time.time()
-    by_app_no: Dict[str, List[dict]] = defaultdict(list)
-    pk_index: Dict[Tuple[str, int, str], dict] = {}
-    for row in rows:
-        app_no = row["application_no"]
-        if app_no not in dup_app_nos:
-            continue
-        mobile = row["mobile"]
-        gid = int(row["group_user_id"])
-        sn = row["sn"]
-        by_app_no[app_no].append(row)
-        pk_index[(mobile, gid, sn)] = row
+    workers = max(1, min(int(local_workers), 32))
+    n = len(rows)
+    if workers <= 1 or n < 500000:
+        by_app_no: Dict[str, List[dict]] = defaultdict(list)
+        pk_index: Dict[Tuple[str, int, str], dict] = {}
+        for row in rows:
+            app_no = row["application_no"]
+            if app_no not in dup_app_nos:
+                continue
+            mobile = row["mobile"]
+            gid = int(row["group_user_id"])
+            sn = row["sn"]
+            by_app_no[app_no].append(row)
+            pk_index[(mobile, gid, sn)] = row
+    else:
+        step = (n + workers - 1) // workers
+        ranges = [(i, min(i + step, n)) for i in range(0, n, step)]
+        print(
+            "collect dup parallel workers=%s chunks=%s ..."
+            % (len(ranges), len(ranges)),
+            flush=True,
+        )
+        import sys
+
+        if sys.platform == "win32":
+            chunks = [rows[a:b] for a, b in ranges]
+
+            def _collect(c: List[dict]) -> Dict[str, List[dict]]:
+                out: Dict[str, List[dict]] = defaultdict(list)
+                for row in c:
+                    app_no = row["application_no"]
+                    if app_no in dup_app_nos:
+                        out[app_no].append(row)
+                return dict(out)
+
+            ctx = multiprocessing.get_context("spawn")
+            with ctx.Pool(processes=len(chunks)) as pool:
+                parts = pool.map(_collect, chunks)
+        else:
+            ctx = multiprocessing.get_context("fork")
+            with ctx.Pool(
+                processes=len(ranges),
+                initializer=_dup_init,
+                initargs=(rows, dup_app_nos),
+            ) as pool:
+                parts = pool.map(_collect_dup_range, ranges)
+        by_app_no = defaultdict(list)
+        for part in parts:
+            for app_no, group in part.items():
+                by_app_no[app_no].extend(group)
+        by_app_no = dict(by_app_no)
+        pk_index = {}
+        for group in by_app_no.values():
+            for row in group:
+                pk_index[
+                    (row["mobile"], int(row["group_user_id"]), row["sn"])
+                ] = row
     print(
         "collect dup rows apps=%s rows=%s elapsed=%.1fs"
         % (len(by_app_no), sum(len(v) for v in by_app_no.values()), time.time() - t0),
         flush=True,
     )
     return by_app_no, pk_index
+
+
+def _collect_dup_chunk(chunk: List[dict]) -> Dict[str, List[dict]]:
+    by_app_no: Dict[str, List[dict]] = defaultdict(list)
+    dup = _DUP_APP_NOS or set()
+    for row in chunk:
+        app_no = row["application_no"]
+        if app_no in dup:
+            by_app_no[app_no].append(row)
+    return dict(by_app_no)
+
+
+def _collect_dup_range(rng: Tuple[int, int]) -> Dict[str, List[dict]]:
+    start, end = rng
+    return _collect_dup_chunk(_SCAN_ROWS[start:end])
 
 
 def load_applications(
@@ -397,10 +458,11 @@ def build_plan(rows: List[dict], local_workers: int = 1) -> Tuple[List[dict], Di
 
 
 def analyze_snapshot(rows: List[dict], local_workers: int = 1) -> Dict[str, int]:
-    """统计 application_no 对应多个 sn 等情况（单遍轻量扫描）。"""
-    del local_workers  # 保留参数兼容；多进程合并反而更慢
+    """统计 application_no 对应多个 sn 等情况（轻量 set 扫描，可多进程）。"""
     t0 = time.time()
-    by_app_sn, by_user_sn, _, sn_mismatch = scan_snapshot_light(rows, "analyze")
+    by_app_sn, by_user_sn, _, sn_mismatch = scan_snapshot(
+        rows, "analyze", local_workers
+    )
     multi_app_no = {k: v for k, v in by_app_sn.items() if len(v) > 1}
     multi_user = {k: v for k, v in by_user_sn.items() if len(v) > 1}
     stats = {
@@ -430,10 +492,9 @@ def build_dup_application_no_plan(
     """
     stats: Dict[str, int] = {"total": len(rows)}
     t0 = time.time()
-    del local_workers
-    by_app_sn, _, pk_set, _ = scan_snapshot_light(rows, "dup_scan")
+    by_app_sn, _, pk_set, _ = scan_snapshot(rows, "dup_scan", local_workers)
     dup_app_nos = {k for k, sns in by_app_sn.items() if len(sns) > 1}
-    by_app_no, _pk_index = collect_dup_rows(rows, dup_app_nos)
+    by_app_no, _pk_index = collect_dup_rows(rows, dup_app_nos, local_workers)
 
     plan: List[dict] = []
     delete_keys: Set[Tuple[str, int, str, str]] = set()
@@ -963,8 +1024,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument(
         "--local-workers",
         type=int,
-        default=1,
-        help="已弃用：本地扫描固定单遍，该参数仅保留兼容",
+        default=default_local_workers(),
+        help="本地快照扫描并行度（fork 分块，只合并 set；默认 min(16, CPU核数)）",
     )
     p.add_argument("--batch-size", type=int, default=100)
     p.add_argument(
