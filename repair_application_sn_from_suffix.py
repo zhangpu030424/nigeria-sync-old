@@ -19,6 +19,11 @@ Usage:
     --plan-file /tmp/fix_app_sn_plan.json \\
     --cache-file /tmp/application_sn_snapshot.json
 
+  # sn 与 application_no 后缀不一致：从 cache 出修复 plan
+  python3 repair_application_sn_from_suffix.py --build-plan \\
+    --cache-file /tmp/application_sn_snapshot.json \\
+    --plan-file /tmp/fix_sn_mismatch_plan.json
+
   python3 repair_application_sn_from_suffix.py --env ./ng_migration.env --apply-only \\
     --plan-file /tmp/fix_app_sn_plan.json --workers 4 --batch-size 100
 
@@ -1093,6 +1098,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="从 cache 生成 application_no_multi_sn 修复 plan",
     )
     p.add_argument(
+        "--build-plan",
+        action="store_true",
+        help="从 cache 生成 sn_mismatch 修复 plan（不连库）",
+    )
+    p.add_argument(
         "--dup-plan-file",
         default="/tmp/fix_dup_app_no_plan.json",
         help="application_no 重复 sn 的 plan 输出路径",
@@ -1150,6 +1160,23 @@ def main(argv: Optional[List[str]] = None) -> int:
             json.dumps(dup_plan, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         print("wrote dup_plan_file=%s rows=%s" % (dup_path, len(dup_plan)), flush=True)
+        return 0
+
+    if args.build_plan:
+        if not cache_path.is_file():
+            p.error("cache not found: %s" % cache_path)
+        rows = load_snapshot_cache(cache_path)
+        plan, stats = build_plan(rows, args.local_workers)
+        if args.work_limit > 0:
+            plan = plan[: args.work_limit]
+        plan_path.write_text(
+            json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print(
+            "wrote plan_file=%s rows=%s stats=%s"
+            % (plan_path, len(plan), stats),
+            flush=True,
+        )
         return 0
 
     if args.apply_only:
