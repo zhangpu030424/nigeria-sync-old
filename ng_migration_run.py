@@ -2383,7 +2383,7 @@ def _build_application_rows(
             "submited_time": int(row.get("core_apply_time") or 0) * 1000,
             "reviewed_time": int(row.get("core_audit_time") or 0) * 1000,
             "disbursed_time": int(row.get("disburse_time") or 0) * 1000,
-            "last_paid_time": repay_map.get(market_sn, 0) * 1000,
+            "last_paid_time": repay_map.get(market_no, 0) * 1000,
             "paid_off_time": int(row.get("paid_time") or 0) * 1000,
             "lock_expire_time": (int(apply_date) + 7 * 86400) * 1000 if apply_date else 0,
             "status": _map_application_status(row.get("src_status")),
