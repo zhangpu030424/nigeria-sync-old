@@ -33,6 +33,7 @@ Usage:
 import argparse
 import json
 import multiprocessing
+import os
 import re
 import time
 from collections import defaultdict
@@ -47,6 +48,14 @@ from repair_loan_no_from_audit import exec_with_retry
 HERE = Path(__file__).resolve().parent
 APP_SUFFIX_RE = re.compile(r"^ng\d+-(.+)$", re.I)
 DEFAULT_EXCLUDE_APP_IDS = (567, 568, 569, 571, 572, 573)
+
+# fork 子进程共享快照（轻量扫描 / dup 收集）
+_SCAN_ROWS: Optional[List[dict]] = None
+_DUP_APP_NOS: Optional[Set[str]] = None
+
+
+def default_local_workers() -> int:
+    return min(16, os.cpu_count() or 8)
 
 
 def load_env(path: Path) -> Dict[str, str]:
@@ -107,6 +116,104 @@ def load_snapshot_cache(path: Path) -> List[dict]:
         flush=True,
     )
     return rows
+
+
+def _scan_init(rows: List[dict]) -> None:
+    global _SCAN_ROWS
+    _SCAN_ROWS = rows
+
+
+def _dup_init(rows: List[dict], dup_app_nos: Set[str]) -> None:
+    global _SCAN_ROWS, _DUP_APP_NOS
+    _SCAN_ROWS = rows
+    _DUP_APP_NOS = dup_app_nos
+
+
+def _light_scan_chunk(chunk: List[dict]) -> dict:
+    by_app_sn: Dict[str, Set[str]] = defaultdict(set)
+    by_user_sn: Dict[Tuple[str, int], Set[str]] = defaultdict(set)
+    pk_set: Set[Tuple[str, int, str]] = set()
+    sn_mismatch = 0
+    for row in chunk:
+        app_no = row["application_no"]
+        mobile = row["mobile"]
+        gid = int(row["group_user_id"])
+        sn = row["sn"]
+        by_app_sn[app_no].add(sn)
+        by_user_sn[(mobile, gid)].add(sn)
+        pk_set.add((mobile, gid, sn))
+        good = app_suffix(app_no)
+        if good and sn != good:
+            sn_mismatch += 1
+    return {
+        "by_app_sn": dict(by_app_sn),
+        "by_user_sn": dict(by_user_sn),
+        "pk_set": pk_set,
+        "sn_mismatch": sn_mismatch,
+        "count": len(chunk),
+    }
+
+
+def _light_scan_range(rng: Tuple[int, int]) -> dict:
+    start, end = rng
+    return _light_scan_chunk(_SCAN_ROWS[start:end])
+
+
+def _merge_light_parts(
+    parts: List[dict],
+) -> Tuple[Dict[str, Set[str]], Dict[Tuple[str, int], Set[str]], Set[Tuple[str, int, str]], int]:
+    by_app_sn: Dict[str, Set[str]] = defaultdict(set)
+    by_user_sn: Dict[Tuple[str, int], Set[str]] = defaultdict(set)
+    pk_set: Set[Tuple[str, int, str]] = set()
+    sn_mismatch = 0
+    for part in parts:
+        sn_mismatch += int(part.get("sn_mismatch") or 0)
+        for k, v in part["by_app_sn"].items():
+            by_app_sn[k].update(v)
+        for k, v in part["by_user_sn"].items():
+            by_user_sn[k].update(v)
+        pk_set.update(part["pk_set"])
+    return by_app_sn, by_user_sn, pk_set, sn_mismatch
+
+
+def scan_snapshot(
+    rows: List[dict], label: str, local_workers: int
+) -> Tuple[Dict[str, Set[str]], Dict[Tuple[str, int], Set[str]], Set[Tuple[str, int, str]], int]:
+    """轻量扫描：只建 set。workers>1 时 fork 分块，只合并 set（不合并行列表）。"""
+    workers = max(1, min(int(local_workers), 32))
+    n = len(rows)
+    t0 = time.time()
+    if workers <= 1 or n < 500000:
+        return scan_snapshot_light(rows, label)
+    step = (n + workers - 1) // workers
+    ranges = [(i, min(i + step, n)) for i in range(0, n, step)]
+    print(
+        "%s parallel workers=%s chunks=%s rows=%s ..."
+        % (label, len(ranges), len(ranges), n),
+        flush=True,
+    )
+    import sys
+
+    if sys.platform == "win32":
+        chunks = [rows[a:b] for a, b in ranges]
+        ctx = multiprocessing.get_context("spawn")
+        with ctx.Pool(processes=len(chunks)) as pool:
+            parts = pool.map(_light_scan_chunk, chunks)
+    else:
+        ctx = multiprocessing.get_context("fork")
+        with ctx.Pool(
+            processes=len(ranges),
+            initializer=_scan_init,
+            initargs=(rows,),
+        ) as pool:
+            parts = pool.map(_light_scan_range, ranges)
+    merged = _merge_light_parts(parts)
+    print(
+        "%s parallel done rows=%s elapsed=%.1fs"
+        % (label, n, time.time() - t0),
+        flush=True,
+    )
+    return merged
 
 
 def scan_snapshot_light(
