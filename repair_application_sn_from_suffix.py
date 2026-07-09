@@ -203,7 +203,7 @@ def build_plan(rows: List[dict]) -> Tuple[List[dict], Dict[str, int]]:
     return plan, stats
 
 
-def analyze_snapshot(rows: List[dict], sample_limit: int = 20) -> Dict[str, int]:
+def analyze_snapshot(rows: List[dict]) -> Dict[str, int]:
     """统计 application_no 对应多个 sn 等情况。"""
     stats: Dict[str, int] = {"total": len(rows)}
     by_app_no: Dict[str, Set[str]] = {}
@@ -231,30 +231,6 @@ def analyze_snapshot(rows: List[dict], sample_limit: int = 20) -> Dict[str, int]
     stats["sn_mismatch_rows"] = sn_mismatch
 
     print("analyze snapshot stats=%s" % stats, flush=True)
-    if multi_app_no:
-        print(
-            "application_no with multiple sn (show %s/%s):"
-            % (min(sample_limit, len(multi_app_no)), len(multi_app_no)),
-            flush=True,
-        )
-        for i, (app_no, sns) in enumerate(
-            sorted(multi_app_no.items(), key=lambda x: (-len(x[1]), x[0]))
-        ):
-            if i >= sample_limit:
-                break
-            print("  %s -> %s" % (app_no, sorted(sns)), flush=True)
-    if multi_user:
-        print(
-            "same mobile+group_user_id multiple sn (show %s/%s):"
-            % (min(sample_limit, len(multi_user)), len(multi_user)),
-            flush=True,
-        )
-        for i, ((mobile, gid), sns) in enumerate(
-            sorted(multi_user.items(), key=lambda x: (-len(x[1]), x[0][0]))
-        ):
-            if i >= sample_limit:
-                break
-            print("  mobile=%s gid=%s sns=%s" % (mobile, gid, sorted(sns)), flush=True)
     return stats
 
 
@@ -519,7 +495,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="只分析 cache-file，不连库、不写 plan",
     )
-    p.add_argument("--analyze-sample", type=int, default=20)
     p.add_argument("--work-limit", type=int, default=0)
     args = p.parse_args(argv)
     if args.apply and args.dry_run:
@@ -539,7 +514,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             p.error("cache not found: %s" % cache_path)
         rows = json.loads(cache_path.read_text(encoding="utf-8"))
         print("loaded cache_file=%s rows=%s" % (cache_path, len(rows)), flush=True)
-        analyze_snapshot(rows, args.analyze_sample)
+        analyze_snapshot(rows)
         return 0
 
     if args.apply_only:
