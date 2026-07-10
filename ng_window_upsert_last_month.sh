@@ -95,8 +95,8 @@ run_python() {
     --tables all \
     --app-validate-batch "${APP_VALIDATE_BATCH:-20000}" \
     --user-insert-batch "${USER_INSERT_BATCH:-5000}" \
-    --app-insert-batch "${APP_INSERT_BATCH:-5000}" \
-    --id-mapping-insert-batch "${ID_MAPPING_INSERT_BATCH:-10000}" \
+    --app-insert-batch "${APP_INSERT_BATCH:-500}" \
+    --id-mapping-insert-batch "${ID_MAPPING_INSERT_BATCH:-2000}" \
     --log-file "$LOG_FILE" \
     --reports-dir "$REPORTS_DIR" \
     --feishu-webhook "${FEISHU_WEBHOOK:-}" \
@@ -114,8 +114,8 @@ if [[ "$BACKGROUND" == "1" ]]; then
     --tables all \
     --app-validate-batch "${APP_VALIDATE_BATCH:-20000}" \
     --user-insert-batch "${USER_INSERT_BATCH:-5000}" \
-    --app-insert-batch "${APP_INSERT_BATCH:-5000}" \
-    --id-mapping-insert-batch "${ID_MAPPING_INSERT_BATCH:-10000}" \
+    --app-insert-batch "${APP_INSERT_BATCH:-500}" \
+    --id-mapping-insert-batch "${ID_MAPPING_INSERT_BATCH:-2000}" \
     --log-file "$LOG_FILE" \
     --reports-dir "$REPORTS_DIR" \
     --feishu-webhook "${FEISHU_WEBHOOK:-}" \

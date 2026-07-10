@@ -66,12 +66,7 @@ def _user_product_schemes_json(credit_amount: int) -> str:
     ])
 
 
-APPLICATION_SCHEME_PARAM_JSON = _json_dumps({
-    "penalty_rate": 0.05,
-    "upfront_rate": 0.35,
-    "interest_rate": 0,
-    "post_paid_rate": 0.05,
-})
+APPLICATION_SCHEME_PARAM_JSON = "{}"
 
 
 def _strip_env_value(v: str) -> str:
@@ -335,9 +330,27 @@ def _ensure_mysql_conn(conn, cfg: Dict[str, Any], kind: str):
 
 
 def _reconnect_mysql(conn, cfg: Dict[str, Any], kind: str):
-    """主动断开并新建连接（批量失败后降级逐行前调用）。"""
+    """主动断开并新建连接（批量失败后降级逐行前调用）。
+
+    2013/2006 后代理或库可能短暂不可用，建连本身也重试几次。
+    """
     _close_mysql_conn(conn)
-    return _new_mysql_conn(cfg, kind)
+    max_tries = max(1, int(cfg.get("mysql_reconnect_retries") or 5))
+    last_exc: Optional[BaseException] = None
+    for attempt in range(max_tries):
+        try:
+            return _new_mysql_conn(cfg, kind)
+        except Exception as exc:
+            last_exc = exc
+            delay = min(8.0, 0.5 * (2 ** attempt)) + random.uniform(0, 0.3)
+            mig_log(
+                f"mysql reconnect {kind} attempt={attempt + 1}/{max_tries} "
+                f"err={type(exc).__name__}: {exc} sleep={delay:.1f}s"
+            )
+            time.sleep(delay)
+    if last_exc is not None:
+        raise last_exc
+    raise pymysql.err.OperationalError(2013, f"reconnect {kind} failed")
 
 
 def preload_vt_token_store(cfg: Dict[str, Any]) -> int:
@@ -1370,7 +1383,8 @@ def _bulk_upsert_rows(
             params.extend(_row_insert_params(columns, row))
         batch_ok = False
         last_exc: Optional[BaseException] = None
-        for attempt in range(2):
+        batch_retries = max(2, int(cfg.get("mysql_batch_retries") or 4))
+        for attempt in range(batch_retries):
             try:
                 conn = _ensure_mysql_conn(conn, cfg, conn_kind)
                 with conn.cursor() as cur:
@@ -1382,15 +1396,65 @@ def _bulk_upsert_rows(
                 if _is_deadlock_error(exc):
                     raise
                 last_exc = exc
-                if attempt == 0 and _is_transient_insert_error(exc):
-                    conn = _reconnect_mysql(conn, cfg, conn_kind)
-                    time.sleep(0.1 + random.uniform(0, 0.05))
+                if attempt < batch_retries - 1 and _is_transient_insert_error(exc):
+                    delay = min(5.0, 0.2 * (2 ** attempt)) + random.uniform(0, 0.1)
+                    mig_log(
+                        f"upsert batch retry table={table} size={len(batch)} "
+                        f"attempt={attempt + 1}/{batch_retries} "
+                        f"err={exc.args[0] if exc.args else type(exc).__name__} "
+                        f"sleep={delay:.1f}s"
+                    )
+                    try:
+                        conn = _reconnect_mysql(conn, cfg, conn_kind)
+                    except Exception as re_exc:
+                        mig_log(f"upsert reconnect failed: {re_exc}")
+                        time.sleep(delay)
+                        continue
+                    time.sleep(delay)
                     continue
                 break
         if batch_ok:
             continue
         if last_exc is not None and not _should_skip_row_on_error(last_exc):
             raise last_exc
+        # 大包仍失败：减半再试一次，再不行逐行
+        if len(batch) > 1:
+            half = max(1, len(batch) // 2)
+            mig_log(
+                f"upsert batch split table={table} size={len(batch)} -> {half}"
+            )
+            for j in range(0, len(batch), half):
+                sub = batch[j : j + half]
+                if len(sub) == 1:
+                    conn, n = _execute_rows_with_retry(
+                        conn, cfg, conn_kind, table, columns, sub,
+                        lambda r: (
+                            insert_prefix + one + upsert_suffix,
+                            _row_insert_params(columns, r),
+                        ),
+                    )
+                    affected += n
+                    continue
+                sub_sql = insert_prefix + ",".join([one] * len(sub)) + upsert_suffix
+                sub_params: List[Any] = []
+                for row in sub:
+                    sub_params.extend(_row_insert_params(columns, row))
+                try:
+                    conn = _reconnect_mysql(conn, cfg, conn_kind)
+                    with conn.cursor() as cur:
+                        cur.execute(sub_sql, sub_params)
+                        affected += cur.rowcount
+                except pymysql.err.Error:
+                    conn = _reconnect_mysql(conn, cfg, conn_kind)
+                    conn, n = _execute_rows_with_retry(
+                        conn, cfg, conn_kind, table, columns, sub,
+                        lambda r: (
+                            insert_prefix + one + upsert_suffix,
+                            _row_insert_params(columns, r),
+                        ),
+                    )
+                    affected += n
+            continue
         conn = _reconnect_mysql(conn, cfg, conn_kind)
         conn, n = _execute_rows_with_retry(
             conn, cfg, conn_kind, table, columns, batch,

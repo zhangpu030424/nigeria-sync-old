@@ -250,7 +250,12 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="--tables loan 时每批源端 app_id 数（默认 500，避免目标库大查询 2013）",
     )
     p.add_argument("--user-insert-batch", type=int, default=5000)
-    p.add_argument("--app-insert-batch", type=int, default=5000)
+    p.add_argument(
+        "--app-insert-batch",
+        type=int,
+        default=500,
+        help="application/loan upsert 每批行数（默认 500，过大易 2013）",
+    )
     p.add_argument("--id-mapping-insert-batch", type=int, default=10000)
     p.add_argument(
         "--no-vt-preload",
