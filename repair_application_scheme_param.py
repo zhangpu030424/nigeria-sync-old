@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import pymysql
+from pymysql.constants import CLIENT
 from pymysql.cursors import DictCursor
 
 HERE = Path(__file__).resolve().parent
@@ -57,6 +58,8 @@ def connect_target(cfg: Dict[str, str], for_apply: bool = False):
         read_timeout=timeout,
         write_timeout=timeout,
         autocommit=False,
+        # matched rows（含值未变），避免 rowcount 全是 0 误判
+        client_flag=CLIENT.FOUND_ROWS,
     )
 
 
@@ -127,39 +130,39 @@ def _reconnect(cfg: Dict[str, str], conn):
 
 
 def apply_batch(tgt, rows: List[dict]) -> Tuple[int, int]:
-    """按主键批量 UPDATE；返回 (ok_estimate, skip_estimate)。"""
+    """按主键逐批 UPDATE；返回 (matched, missing)。"""
     if not rows:
         return 0, 0
-    parts: List[str] = []
-    params: List[Any] = []
-    for r in rows:
-        parts.append("SELECT %s AS mobile, %s AS gid, %s AS sn")
-        params.extend([r["mobile"], int(r["group_user_id"]), r["sn"]])
-    sql = (
-        """
-        UPDATE application a
-        INNER JOIN (
-        """
-        + " UNION ALL ".join(parts)
-        + """
-        ) x ON a.mobile = x.mobile
-           AND a.group_user_id = x.gid
-           AND a.sn = x.sn
-        SET a.product_scheme_param = %s
-        """
-    )
-    params.append(TARGET_VALUE)
+    sql = """
+        UPDATE application
+        SET product_scheme_param = %s
+        WHERE mobile = %s AND group_user_id = %s AND sn = %s
+    """
+    params = [
+        (TARGET_VALUE, r["mobile"], int(r["group_user_id"]), r["sn"])
+        for r in rows
+    ]
 
     def _run():
         _ping(tgt)
         with tgt.cursor() as cur:
-            cur.execute(sql, tuple(params))
-            return int(cur.rowcount or 0)
+            # executemany 比大 UNION JOIN 更稳；FOUND_ROWS 下 rowcount≈命中行数
+            n = cur.executemany(sql, params)
+            return int(n if n is not None else (cur.rowcount or 0))
 
     for attempt in range(6):
         try:
-            ok = _run()
-            return ok, max(0, len(rows) - ok)
+            matched = _run()
+            # executemany 有的版本返回 None，用 rowcount；仍可能 < len(rows)
+            if matched <= 0:
+                # 兜底：逐条确认，避免整批被记成 0
+                matched = 0
+                with tgt.cursor() as cur:
+                    for p in params:
+                        cur.execute(sql, p)
+                        matched += int(cur.rowcount or 0)
+            missing = max(0, len(rows) - matched)
+            return matched, missing
         except pymysql.err.OperationalError as e:
             errno = e.args[0] if e.args else 0
             try:
@@ -173,6 +176,23 @@ def apply_batch(tgt, rows: List[dict]) -> Tuple[int, int]:
     return 0, len(rows)
 
 
+def probe_sample(tgt, rows: List[dict], label: str) -> None:
+    """启动时抽查主键是否在库、当前 product_scheme_param 是什么。"""
+    for r in rows[:3]:
+        with tgt.cursor() as cur:
+            cur.execute(
+                """
+                SELECT mobile, group_user_id, sn,
+                       LEFT(CAST(product_scheme_param AS CHAR), 100) AS psp
+                FROM application
+                WHERE mobile=%s AND group_user_id=%s AND sn=%s
+                """,
+                (r["mobile"], int(r["group_user_id"]), r["sn"]),
+            )
+            hit = cur.fetchone()
+        print("%sprobe pk=%s db=%s" % (label, r, hit), flush=True)
+
+
 def worker_run(spec: dict) -> Tuple[int, int]:
     label = "[%s/%s] " % (spec["worker_id"], spec["workers"])
     chunk = spec.get("plan_chunk") or []
@@ -184,6 +204,7 @@ def worker_run(spec: dict) -> Tuple[int, int]:
     tgt = connect_target(cfg, for_apply=True)
     ok = skip = 0
     try:
+        probe_sample(tgt, chunk, label)
         total_batches = (len(chunk) + batch_size - 1) // batch_size
         for bi in range(0, len(chunk), batch_size):
             part = chunk[bi : bi + batch_size]
@@ -204,7 +225,7 @@ def worker_run(spec: dict) -> Tuple[int, int]:
             skip += bskip
             if bno == 1 or bno % 20 == 0 or bno == total_batches:
                 print(
-                    "%sbatch %s/%s updated=%s skip=%s total_ok=%s"
+                    "%sbatch %s/%s matched=%s missing=%s total_matched=%s"
                     % (label, bno, total_batches, bok, bskip, ok),
                     flush=True,
                 )
@@ -213,7 +234,7 @@ def worker_run(spec: dict) -> Tuple[int, int]:
             tgt.close()
         except Exception:
             pass
-    print("%sdone ok=%s skip=%s" % (label, ok, skip), flush=True)
+    print("%sdone matched=%s missing=%s" % (label, ok, skip), flush=True)
     return ok, skip
 
 
