@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# 只用已有 /tmp/reconcile_*_plan.jsonl 写库（不再 load/plan）
+# 只用已有 /tmp/reconcile_*_plan_YYYYMMDD.jsonl 写库（不再 load/plan）
 #
 # Usage:
 #   ./apply_reconcile_plans.sh
+#   PLAN_DATE=20260714 ./apply_reconcile_plans.sh   # 指定某日；默认 latest=取最新 dated
 #   START_TABLE=loan ./apply_reconcile_plans.sh
 #   FILTER_DATES=1 ./apply_reconcile_plans.sh   # apply 前先清洗 application/loan 假日期 diff
 #   TABLES="loan application" ./apply_reconcile_plans.sh
 #
+# 解析顺序：PLAN_DATE 指定日 → 否则最新 reconcile_{table}_plan_YYYYMMDD.jsonl → 无日期旧文件
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -36,6 +38,7 @@ APPLY_WORKERS="${APPLY_WORKERS:-24}"
 APPLY_BATCH="${APPLY_BATCH:-1000}"
 START_TABLE="${START_TABLE:-user}"
 FILTER_DATES="${FILTER_DATES:-1}"
+PLAN_DATE="${PLAN_DATE:-latest}"
 MASTER_LOG="${MASTER_LOG:-$LOG_DIR/reconcile_apply_master.log}"
 
 DEFAULT_TABLES=(user user_info user_bankcard user_product application loan)
@@ -57,9 +60,47 @@ log() {
   echo "$msg" | tee -a "$MASTER_LOG"
 }
 
+resolve_plan() {
+  local table="$1"
+  local dated legacy latest
+  legacy="/tmp/reconcile_${table}_plan.jsonl"
+
+  # 显式指定日期（非 latest）
+  if [[ -n "${PLAN_DATE}" && "${PLAN_DATE}" != "latest" ]]; then
+    dated="/tmp/reconcile_${table}_plan_${PLAN_DATE}.jsonl"
+    if [[ -f "$dated" ]]; then
+      echo "$dated"
+      return 0
+    fi
+    if [[ -f "$legacy" ]]; then
+      echo "$legacy"
+      return 0
+    fi
+    echo "$dated"
+    return 1
+  fi
+
+  # 默认：按文件名日期取最新（YYYYMMDD 字典序）
+  latest="$(
+    ls -1 /tmp/reconcile_"${table}"_plan_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].jsonl 2>/dev/null \
+      | sort | tail -n 1 || true
+  )"
+  if [[ -n "$latest" && -f "$latest" ]]; then
+    echo "$latest"
+    return 0
+  fi
+  if [[ -f "$legacy" ]]; then
+    echo "$legacy"
+    return 0
+  fi
+  echo "/tmp/reconcile_${table}_plan_(latest).jsonl"
+  return 1
+}
+
 filter_one() {
   local table="$1"
-  local plan="/tmp/reconcile_${table}_plan.jsonl"
+  local plan
+  plan="$(resolve_plan "$table" || true)"
   if [[ ! -f "$plan" ]]; then
     return 0
   fi
@@ -72,7 +113,11 @@ filter_one() {
 
 apply_one() {
   local table="$1"
-  local plan="/tmp/reconcile_${table}_plan.jsonl"
+  local plan
+  if ! plan="$(resolve_plan "$table")"; then
+    log "${table}: skip (no plan ${plan} nor legacy undated)"
+    return 0
+  fi
   if [[ ! -f "$plan" ]]; then
     log "${table}: skip (no plan ${plan})"
     return 0
@@ -83,7 +128,7 @@ apply_one() {
     log "${table}: skip (empty plan)"
     return 0
   fi
-  log "${table}: APPLY rows=${n} workers=${APPLY_WORKERS} batch=${APPLY_BATCH}"
+  log "${table}: APPLY plan=${plan} rows=${n} workers=${APPLY_WORKERS} batch=${APPLY_BATCH}"
   "$PYTHON" "$HERE/reconcile_tables.py" \
     --env "$ENV" \
     --table "$table" \
@@ -96,7 +141,7 @@ apply_one() {
   log "${table}: APPLY done"
 }
 
-log "apply_reconcile_plans start PYTHON=$PYTHON ENV=$ENV START_TABLE=$START_TABLE FILTER_DATES=$FILTER_DATES"
+log "apply_reconcile_plans start PYTHON=$PYTHON ENV=$ENV START_TABLE=$START_TABLE FILTER_DATES=$FILTER_DATES PLAN_DATE=$PLAN_DATE"
 log "APPLY_WORKERS=$APPLY_WORKERS APPLY_BATCH=$APPLY_BATCH tables=${TABLES_ARR[*]}"
 
 started=0

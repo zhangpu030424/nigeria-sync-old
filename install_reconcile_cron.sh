@@ -46,7 +46,7 @@ if [[ -n "${MODE:-}" ]]; then
 fi
 # 可选透传常用变量到 cron 行
 ENV_PREFIX="$MODE_PREFIX"
-for k in TABLES START_TABLE FILTER_DATES APPLY_WORKERS APPLY_BATCH DRY_RUN SINCE_DATE LOG_DIR; do
+for k in TABLES START_TABLE FILTER_DATES APPLY_WORKERS APPLY_BATCH DRY_RUN SINCE_DATE LOG_DIR PLAN_DATE; do
   if [[ -n "${!k:-}" ]]; then
     ENV_PREFIX+="${k}=${!k} "
   fi

@@ -31,7 +31,7 @@ Usage:
   python3 reconcile_tables.py --env ./ng_migration.env --table user_info \\
     --phase plan --since-date 2026-01-01 \\
     --target-cache /tmp/reconcile_user_info_target.jsonl \\
-    --plan-file /tmp/reconcile_user_info_plan.jsonl \\
+    --plan-file /tmp/reconcile_user_info_plan_20260714.jsonl \\
     --log-dir /tmp/reconcile_logs
 """
 # 兼容服务器 Python 3.6+（勿使用 from __future__ import annotations，3.6 不支持）
@@ -254,10 +254,21 @@ def loan_key(row: dict) -> Tuple[str, int, int]:
     )
 
 
-def default_paths(table: str) -> Dict[str, str]:
+def plan_date_tag(plan_date: Optional[str] = None) -> str:
+    """统一为 YYYYMMDD；空则用当天本地日期。"""
+    s = (plan_date or "").strip().replace("-", "")
+    if not s:
+        return datetime.now().strftime("%Y%m%d")
+    if len(s) != 8 or not s.isdigit():
+        raise ValueError("plan_date must be YYYYMMDD or YYYY-MM-DD, got %r" % plan_date)
+    return s
+
+
+def default_paths(table: str, plan_date: Optional[str] = None) -> Dict[str, str]:
+    d = plan_date_tag(plan_date)
     return {
         "target_cache": f"/tmp/reconcile_{table}_target.jsonl",
-        "plan_file": f"/tmp/reconcile_{table}_plan.jsonl",
+        "plan_file": f"/tmp/reconcile_{table}_plan_{d}.jsonl",
     }
 
 
@@ -3915,7 +3926,7 @@ def run_all_tables(args: argparse.Namespace, cfg: Dict[str, Any]) -> int:
         table_args = argparse.Namespace(**vars(args))
         table_args.table = table
         table_args.phase = "all"
-        paths = default_paths(table)
+        paths = default_paths(table, getattr(args, "plan_date", None))
         table_args.target_cache = paths["target_cache"]
         table_args.plan_file = paths["plan_file"]
         table_args.from_cache = bool(getattr(args, "from_cache", False))
@@ -3967,6 +3978,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--max-target-user-id", type=int, default=DEFAULT_MAX_TARGET_USER_ID)
     p.add_argument("--target-cache", default="")
     p.add_argument("--plan-file", default="")
+    p.add_argument(
+        "--plan-date",
+        default="",
+        help="plan 文件日期后缀 YYYYMMDD（默认当天）；文件名 reconcile_{table}_plan_{date}.jsonl",
+    )
     p.add_argument("--log-dir", default="/tmp/reconcile_logs")
     p.add_argument("--from-cache", action="store_true", help="plan 阶段复用已有 target cache")
     p.add_argument("--load-workers", type=int, default=16)
@@ -4016,7 +4032,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("需要 --table 或 --all-tables", file=sys.stderr)
         return 2
 
-    paths = default_paths(args.table)
+    paths = default_paths(args.table, getattr(args, "plan_date", None))
     if not args.target_cache:
         args.target_cache = paths["target_cache"]
     if not args.plan_file:

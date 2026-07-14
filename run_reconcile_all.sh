@@ -25,6 +25,7 @@
 #   DRY_RUN          1=跳过 apply
 #   START_TABLE      从指定表开始（含）
 #   FROM_CACHE       1=plan 复用已有 /tmp/reconcile_*_target.jsonl
+#   PLAN_DATE        plan 文件日期后缀 YYYYMMDD，默认当天 → reconcile_{table}_plan_{date}.jsonl
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -69,6 +70,7 @@ LOOKUP_PARALLEL="${LOOKUP_PARALLEL:-2}"
 DRY_RUN="${DRY_RUN:-0}"
 START_TABLE="${START_TABLE:-user}"
 FROM_CACHE="${FROM_CACHE:-0}"
+PLAN_DATE="${PLAN_DATE:-$(date +%Y%m%d)}"
 MASTER_LOG="${MASTER_LOG:-$LOG_DIR/reconcile_all_master.log}"
 
 if [[ ! -f "$ENV" ]]; then
@@ -97,6 +99,7 @@ common_args=(
   --apply-batch "$APPLY_BATCH"
   --all-tables
   --start-table "$START_TABLE"
+  --plan-date "$PLAN_DATE"
   --phase all
 )
 
@@ -108,7 +111,7 @@ if [[ "$DRY_RUN" != "1" ]]; then
   common_args+=(--apply)
 fi
 
-log "reconcile_all start PYTHON=$PYTHON ($PY_VER) ENV=$ENV SINCE_DATE=$SINCE_DATE DRY_RUN=$DRY_RUN START_TABLE=$START_TABLE FROM_CACHE=$FROM_CACHE"
+log "reconcile_all start PYTHON=$PYTHON ($PY_VER) ENV=$ENV SINCE_DATE=$SINCE_DATE DRY_RUN=$DRY_RUN START_TABLE=$START_TABLE FROM_CACHE=$FROM_CACHE PLAN_DATE=$PLAN_DATE"
 log "LOAD_WORKERS=$LOAD_WORKERS SOURCE_WORKERS=$SOURCE_WORKERS SOURCE_BATCH=$SOURCE_BATCH PAGE_SIZE=$PAGE_SIZE LOOKUP_PARALLEL=$LOOKUP_PARALLEL"
 log "APPLY_WORKERS=$APPLY_WORKERS APPLY_BATCH=$APPLY_BATCH (single-process, VT/LUP kept, plan parallel)"
 
