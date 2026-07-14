@@ -18,6 +18,7 @@ Usage:
   python3 merge_audit_csv.py --dir /tmp --output-dir /tmp/merged --delete-source
 
   python3 merge_audit_csv.py --dir /tmp --families repair_loan_status20 --dry-run
+  python3 merge_audit_csv.py --dir /tmp --families repair_dup_loan_no,repair_loan_no_core_sn
 """
 import argparse
 import re
@@ -30,6 +31,9 @@ HERE = Path(__file__).resolve().parent
 # 识别文件名所属的审计「族」
 FAMILY_RULES = (
     ("repair_loan_status20", re.compile(r"^repair_loan_status20")),
+    ("repair_dup_loan_no", re.compile(r"^repair_dup_loan_no")),
+    ("repair_loan_no_core_sn", re.compile(r"^repair_loan_no_core_sn")),
+    ("repair_loan_plan", re.compile(r"^repair_loan_plan\.csv$")),
     ("backfill_delete_audit", re.compile(r"^backfill_delete_audit")),
     ("repair_drop_wrong_app_no", re.compile(r"^repair_drop_wrong_app_no")),
     ("repair_loan_app_no_market", re.compile(r"^repair_loan_app_no_market")),
