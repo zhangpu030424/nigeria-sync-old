@@ -1349,16 +1349,33 @@ def load_or_build_target_cache_by_key(
 
 
 def setup_preloads(cfg: Dict[str, Any], logger: ReconcileLogger, vt_preload: bool) -> None:
-    """VT / LUP 预加载进进程内存，plan 阶段全程保留不释放。"""
+    """VT / LUP 预加载进进程内存；仅 plan/all 需要（load-target 不翻 VT）。
+
+    同进程内再次调用会复用已加载的全局 store，不重新扫库。
+    """
     if vt_preload and cfg.get("vt_token_enable", True):
-        logger.log("VT preload start (kept in memory for whole run) ...")
-        vt_n = mig.preload_vt_token_store(cfg)
-        logger.log(f"VT preload done rows={vt_n}")
+        if mig._vt_global_store is not None:
+            logger.log(
+                "VT preload reuse rows={0} (kept in memory)".format(
+                    len(mig._vt_global_store)
+                )
+            )
+        else:
+            logger.log("VT preload start (kept in memory for whole run) ...")
+            vt_n = mig.preload_vt_token_store(cfg)
+            logger.log("VT preload done rows={0}".format(vt_n))
     elif not vt_preload:
         logger.log("VT preload skipped (--no-vt-preload); batch lookup per source chunk")
     if cfg.get("lup_preload", True):
-        lup_n = mig.preload_lup_store(cfg)
-        logger.log(f"LUP preload done rows={lup_n}")
+        if mig._lup_global_store is not None:
+            logger.log(
+                "LUP preload reuse rows={0} (kept in memory)".format(
+                    len(mig._lup_global_store)
+                )
+            )
+        else:
+            lup_n = mig.preload_lup_store(cfg)
+            logger.log("LUP preload done rows={0}".format(lup_n))
 
 
 def _emergency_contact_mobile_raw(item: Any) -> str:
@@ -1570,7 +1587,7 @@ def _run_reconcile_phases(
     phase = args.phase
     dry_run = not args.apply
 
-    if phase in ("load-target", "plan", "all"):
+    if phase in ("plan", "all"):
         setup_preloads(cfg, logger, args.vt_preload)
 
     target_by_key: Dict[Any, dict] = {}
@@ -1624,14 +1641,17 @@ def _run_reconcile_phases(
         plan = read_jsonl(plan_path)
         logger.log(f"loaded plan rows={len(plan)}")
 
-    if phase in ("apply", "all"):
-        if phase == "all" and not plan:
+    # phase=all 仅在显式 --apply 时写库；无 --apply 只出 plan（DRY_RUN）
+    if phase == "apply" or (phase == "all" and args.apply):
+        if not plan:
             logger.log("apply skipped: empty plan")
         else:
             apply_stats = apply_fn(
                 cfg, plan, args.apply_batch, args.apply_workers, dry_run, logger,
             )
             logger.log(f"apply stats={apply_stats}")
+    elif phase == "all" and not args.apply:
+        logger.log("apply skipped (no --apply / DRY_RUN)")
 
     logger.close()
     return 0
@@ -1927,7 +1947,7 @@ def _run_reconcile_phases_composite(
     phase = args.phase
     dry_run = not args.apply
 
-    if phase in ("load-target", "plan", "all") and need_vt:
+    if phase in ("plan", "all") and need_vt:
         setup_preloads(cfg, logger, args.vt_preload)
 
     target_by_key: Dict[Tuple[Any, ...], dict] = {}
@@ -1979,14 +1999,16 @@ def _run_reconcile_phases_composite(
         plan = read_jsonl(plan_path)
         logger.log(f"loaded plan rows={len(plan)}")
 
-    if phase in ("apply", "all"):
-        if phase == "all" and not plan:
+    if phase == "apply" or (phase == "all" and args.apply):
+        if not plan:
             logger.log("apply skipped: empty plan")
         else:
             apply_stats = apply_fn(
                 cfg, plan, args.apply_batch, args.apply_workers, dry_run, logger,
             )
             logger.log(f"apply stats={apply_stats}")
+    elif phase == "all" and not args.apply:
+        logger.log("apply skipped (no --apply / DRY_RUN)")
 
     logger.close()
     return 0
@@ -2438,7 +2460,7 @@ def run_application_reconcile(args: argparse.Namespace, cfg: Dict[str, Any]) -> 
         else since_date_to_ms(args.since_date)
     )
 
-    if phase in ("load-target", "plan", "all"):
+    if phase in ("plan", "all"):
         setup_preloads(cfg, logger, args.vt_preload)
 
     target_by_key: Dict[Tuple[Any, ...], dict] = {}
@@ -2490,14 +2512,16 @@ def run_application_reconcile(args: argparse.Namespace, cfg: Dict[str, Any]) -> 
         plan = read_jsonl(plan_path)
         logger.log(f"loaded plan rows={len(plan)}")
 
-    if phase in ("apply", "all"):
-        if phase == "all" and not plan:
+    if phase == "apply" or (phase == "all" and args.apply):
+        if not plan:
             logger.log("apply skipped: empty plan")
         else:
             apply_stats = apply_application_plan(
                 cfg, plan, args.apply_batch, args.apply_workers, dry_run, logger,
             )
             logger.log(f"apply stats={apply_stats}")
+    elif phase == "all" and not args.apply:
+        logger.log("apply skipped (no --apply / DRY_RUN)")
 
     logger.close()
     return 0
@@ -2935,7 +2959,7 @@ def run_loan_reconcile(args: argparse.Namespace, cfg: Dict[str, Any]) -> int:
         else since_date_to_ms(args.since_date)
     )
 
-    if phase in ("load-target", "plan", "all"):
+    if phase in ("plan", "all"):
         setup_preloads(cfg, logger, args.vt_preload)
 
     target_by_key: Dict[Tuple[Any, ...], dict] = {}
@@ -2988,14 +3012,16 @@ def run_loan_reconcile(args: argparse.Namespace, cfg: Dict[str, Any]) -> int:
         plan = read_jsonl(plan_path)
         logger.log(f"loaded plan rows={len(plan)}")
 
-    if phase in ("apply", "all"):
-        if phase == "all" and not plan:
+    if phase == "apply" or (phase == "all" and args.apply):
+        if not plan:
             logger.log("apply skipped: empty plan")
         else:
             apply_stats = apply_loan_plan(
                 cfg, plan, args.apply_batch, args.apply_workers, dry_run, logger,
             )
             logger.log(f"apply stats={apply_stats}")
+    elif phase == "all" and not args.apply:
+        logger.log("apply skipped (no --apply / DRY_RUN)")
 
     logger.close()
     return 0
@@ -3034,14 +3060,98 @@ def run_user_product_reconcile(args: argparse.Namespace, cfg: Dict[str, Any]) ->
     )
 
 
+def dispatch_table(args: argparse.Namespace, cfg: Dict[str, Any], table: str) -> int:
+    if table == "user":
+        return run_user_reconcile(args, cfg)
+    if table == "user_info":
+        return run_user_info_reconcile(args, cfg)
+    if table == "user_bankcard":
+        return run_user_bankcard_reconcile(args, cfg)
+    if table == "user_product":
+        return run_user_product_reconcile(args, cfg)
+    if table == "application":
+        return run_application_reconcile(args, cfg)
+    if table == "loan":
+        return run_loan_reconcile(args, cfg)
+    print(
+        "table={0} 尚未实现；已实现: {1}".format(table, ", ".join(SUPPORTED_TABLES)),
+        file=sys.stderr,
+    )
+    return 2
+
+
+def run_all_tables(args: argparse.Namespace, cfg: Dict[str, Any]) -> int:
+    """单进程顺序跑多表；VT/LUP 只加载一次，后续表复用内存。"""
+    start = getattr(args, "start_table", None) or SUPPORTED_TABLES[0]
+    if start not in SUPPORTED_TABLES:
+        print("unknown START_TABLE/start-table: {0}".format(start), file=sys.stderr)
+        return 2
+
+    Path(args.log_dir).mkdir(parents=True, exist_ok=True)
+    master = ReconcileLogger(Path(args.log_dir), "all")
+    started = False
+    overall_t0 = time.time()
+    master.log(
+        "reconcile_all start since={0} apply={1} start_table={2}".format(
+            args.since_date, bool(args.apply), start,
+        )
+    )
+    # 先一次性预加载，后续各表 setup_preloads 走 reuse
+    if args.vt_preload or cfg.get("lup_preload", True):
+        setup_preloads(cfg, master, args.vt_preload)
+
+    for table in SUPPORTED_TABLES:
+        if not started:
+            if table != start:
+                master.log("skip table={0} (before start_table={1})".format(table, start))
+                continue
+            started = True
+        t0 = time.time()
+        master.log("========== BEGIN table={0} ==========".format(table))
+        table_args = argparse.Namespace(**vars(args))
+        table_args.table = table
+        table_args.phase = "all"
+        paths = default_paths(table)
+        table_args.target_cache = paths["target_cache"]
+        table_args.plan_file = paths["plan_file"]
+        table_args.from_cache = False
+        rc = dispatch_table(table_args, cfg, table)
+        master.log(
+            "========== DONE table={0} rc={1} elapsed={2}s ==========".format(
+                table, rc, int(time.time() - t0),
+            )
+        )
+        if rc != 0:
+            master.log("reconcile_all aborted at table={0} rc={1}".format(table, rc))
+            master.close()
+            return rc
+
+    master.log(
+        "reconcile_all finished OK elapsed={0}s".format(int(time.time() - overall_t0))
+    )
+    master.close()
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description="Table-by-table source-target reconcile")
     p.add_argument("--env", default=str(HERE / "ng_migration.env"))
     p.add_argument(
         "--table",
-        required=True,
+        default="",
+        choices=SUPPORTED_TABLES + ("",),
+        help="目标表；与 --all-tables 二选一",
+    )
+    p.add_argument(
+        "--all-tables",
+        action="store_true",
+        help="单进程按顺序跑全部表；VT/LUP 只预加载一次并常驻",
+    )
+    p.add_argument(
+        "--start-table",
+        default="user",
         choices=SUPPORTED_TABLES,
-        help="目标表（已实现: user, user_info, user_bankcard, user_product, application, loan）",
+        help="--all-tables 时从该表开始（含）",
     )
     p.add_argument(
         "--phase",
@@ -3094,30 +3204,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     mig.ENV_FILE = env_path
     cfg = mig.load_env()
 
+    if args.all_tables:
+        return run_all_tables(args, cfg)
+
+    if not args.table:
+        print("需要 --table 或 --all-tables", file=sys.stderr)
+        return 2
+
     paths = default_paths(args.table)
     if not args.target_cache:
         args.target_cache = paths["target_cache"]
     if not args.plan_file:
         args.plan_file = paths["plan_file"]
 
-    if args.table == "user":
-        return run_user_reconcile(args, cfg)
-    if args.table == "user_info":
-        return run_user_info_reconcile(args, cfg)
-    if args.table == "user_bankcard":
-        return run_user_bankcard_reconcile(args, cfg)
-    if args.table == "user_product":
-        return run_user_product_reconcile(args, cfg)
-    if args.table == "application":
-        return run_application_reconcile(args, cfg)
-    if args.table == "loan":
-        return run_loan_reconcile(args, cfg)
-
-    print(
-        f"table={args.table} 尚未实现；已实现: {', '.join(SUPPORTED_TABLES)}",
-        file=sys.stderr,
-    )
-    return 2
+    return dispatch_table(args, cfg, args.table)
 
 
 if __name__ == "__main__":
