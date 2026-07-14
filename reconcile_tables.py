@@ -34,8 +34,7 @@ Usage:
     --plan-file /tmp/reconcile_user_info_plan.jsonl \\
     --log-dir /tmp/reconcile_logs
 """
-from __future__ import annotations
-
+# 兼容服务器 Python 3.6+（勿使用 from __future__ import annotations，3.6 不支持）
 import argparse
 import json
 import multiprocessing
@@ -45,7 +44,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import ng_migration_run as mig
 
@@ -163,7 +162,7 @@ target_created_time_ms = loan_created_time_ms
 def application_row_skip_reason(
     row: dict,
     exclude_app_ids: Tuple[int, ...],
-    exclude_app_set: Optional[set] = None,
+    exclude_app_set: Optional[Set[int]] = None,
 ) -> Optional[str]:
     """application 目标行内存过滤：app_id 排除，不在 SQL 执行。"""
     if not exclude_app_ids:
@@ -182,7 +181,7 @@ def loan_row_skip_reason(
     row: dict,
     exclude_app_ids: Tuple[int, ...],
     exclude_created_ms: Tuple[int, ...],
-    exclude_created_set: Optional[set] = None,
+    exclude_created_set: Optional[Set[int]] = None,
 ) -> Optional[str]:
     """loan 行内存过滤：app_id 前缀 + 指定 created_time(ms)，不在 SQL 执行。"""
     if application_no_matches_excluded_app(row.get("application_no"), exclude_app_ids):

@@ -27,6 +27,32 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 
+# 优先使用较新的 python3；服务器默认 python3 可能是 3.6
+resolve_python() {
+  if [[ -n "${PYTHON:-}" ]]; then
+    echo "$PYTHON"
+    return
+  fi
+  local c
+  for c in python3.11 python3.10 python3.9 python3.8 python3.7 python3; do
+    if command -v "$c" >/dev/null 2>&1; then
+      if "$c" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 6) else 1)' 2>/dev/null; then
+        echo "$c"
+        return
+      fi
+    fi
+  done
+  echo "python3"
+}
+
+PYTHON="$(resolve_python)"
+PY_VER="$("$PYTHON" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+# 本脚本仍支持 3.6；若未来依赖 3.7+ 语法再提高下限
+if ! "$PYTHON" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 6) else 1)'; then
+  echo "需要 Python >= 3.6，当前: $PYTHON ($PY_VER)" >&2
+  exit 1
+fi
+
 ENV="${ENV:-$HERE/ng_migration.env}"
 SINCE_DATE="${SINCE_DATE:-2026-01-01}"
 LOG_DIR="${LOG_DIR:-/tmp/reconcile_logs}"
@@ -76,14 +102,14 @@ run_one_table() {
   log "========== BEGIN table=${table} =========="
 
   log "${table}: phase load-target → ${cache}"
-  python3 "$HERE/reconcile_tables.py" \
+  "$PYTHON" "$HERE/reconcile_tables.py" \
     "${common_args[@]}" \
     --table "$table" \
     --phase load-target \
     --target-cache "$cache"
 
   log "${table}: phase plan → ${plan}"
-  python3 "$HERE/reconcile_tables.py" \
+  "$PYTHON" "$HERE/reconcile_tables.py" \
     "${common_args[@]}" \
     --table "$table" \
     --phase plan \
@@ -103,7 +129,7 @@ run_one_table() {
     log "${table}: skip apply (empty plan)"
   else
     log "${table}: phase apply (${APPLY_WORKERS} workers, batch=${APPLY_BATCH})"
-    python3 "$HERE/reconcile_tables.py" \
+    "$PYTHON" "$HERE/reconcile_tables.py" \
       "${common_args[@]}" \
       --table "$table" \
       --phase apply \
@@ -114,7 +140,7 @@ run_one_table() {
   log "========== DONE table=${table} elapsed=$(( $(date +%s) - t0 ))s =========="
 }
 
-log "reconcile_all start ENV=$ENV SINCE_DATE=$SINCE_DATE DRY_RUN=$DRY_RUN START_TABLE=$START_TABLE"
+log "reconcile_all start PYTHON=$PYTHON ($PY_VER) ENV=$ENV SINCE_DATE=$SINCE_DATE DRY_RUN=$DRY_RUN START_TABLE=$START_TABLE"
 log "LOG_DIR=$LOG_DIR APPLY_WORKERS=$APPLY_WORKERS APPLY_BATCH=$APPLY_BATCH"
 
 started=0
