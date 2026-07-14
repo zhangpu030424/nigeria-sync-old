@@ -424,6 +424,12 @@ def normalize_cell(col: str, val: Any) -> Any:
             return int(val) if val not in (None, "") else None
         except (TypeError, ValueError):
             return 0 if col != "paid_time" else None
+    # DATE / DATETIME：统一成 YYYY-MM-DD，避免 date vs str 假 diff
+    if col in (
+        "start_date", "due_date", "due_date_final", "paid_off_date",
+        "birthday",
+    ):
+        return normalize_date_value(val)
     if col in (
         "is_open", "is_default", "credit_amount", "unpaid_amount",
         "locked_amount", "available_amount", "is_test", "is_first_apply",
@@ -446,7 +452,36 @@ def normalize_cell(col: str, val: Any) -> Any:
         if col == "password":
             return s
         return s if s else None
+    # pymysql 常返回 date/datetime；其它列也尽量落到可比较标量
+    if isinstance(val, datetime):
+        return val.strftime("%Y-%m-%d %H:%M:%S")
+    if hasattr(val, "isoformat") and not isinstance(val, (str, bytes, int, float)):
+        try:
+            return str(val)
+        except Exception:
+            return val
     return val
+
+
+def normalize_date_value(val: Any) -> Optional[str]:
+    """把 date/datetime/字符串统一成 YYYY-MM-DD；空串 → None。"""
+    if val is None or val == "":
+        return None
+    if isinstance(val, datetime):
+        return val.strftime("%Y-%m-%d")
+    # datetime.date（pymysql）
+    if hasattr(val, "year") and hasattr(val, "month") and hasattr(val, "day"):
+        try:
+            return "{0:04d}-{1:02d}-{2:02d}".format(int(val.year), int(val.month), int(val.day))
+        except Exception:
+            pass
+    s = str(val).strip()
+    if not s or s.lower() in ("none", "null"):
+        return None
+    # "2026-04-11 00:00:00" / "2026-04-11"
+    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+        return s[:10]
+    return s
 
 
 def normalize_info_json(val: Any) -> Optional[str]:
