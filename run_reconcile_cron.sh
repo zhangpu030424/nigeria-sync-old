@@ -8,8 +8,8 @@
 #   LOCK_FILE          默认 /tmp/reconcile_cron.lock
 #   CRON_LOG           默认 /tmp/reconcile_logs/reconcile_cron.log
 #
-# crontab 示例（每天 02:00）：
-#   0 2 * * * /opt/ng-migration-old/nigeria-sync-old/run_reconcile_cron.sh
+# crontab 示例（每天 12:00）：
+#   0 12 * * * /opt/ng-migration-old/nigeria-sync-old/run_reconcile_cron.sh
 #
 # 或用 ./install_reconcile_cron.sh 安装
 set -euo pipefail

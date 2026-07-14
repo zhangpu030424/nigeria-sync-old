@@ -2,7 +2,7 @@
 # 安装 / 更新 crontab 条目，调用 run_reconcile_cron.sh
 #
 # Usage:
-#   ./install_reconcile_cron.sh                  # 默认每天 02:00，MODE=apply
+#   ./install_reconcile_cron.sh                  # 默认每天 12:00，MODE=apply
 #   ./install_reconcile_cron.sh --schedule '0 3 * * *'
 #   MODE=all ./install_reconcile_cron.sh         # 定时全量对账
 #   ./install_reconcile_cron.sh --remove         # 删除本脚本写入的条目
@@ -11,7 +11,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CRON_SH="$HERE/run_reconcile_cron.sh"
 MARKER="# nigeria-sync-reconcile-cron"
-SCHEDULE="0 2 * * *"
+SCHEDULE="0 12 * * *"
 DO_REMOVE=0
 
 while [[ $# -gt 0 ]]; do
