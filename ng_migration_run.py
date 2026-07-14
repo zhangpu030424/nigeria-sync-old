@@ -1947,8 +1947,13 @@ def _fetch_user_batch_lookups(
     lo: int,
     hi: int,
     prefix: str,
+    needed: Optional[Sequence[str]] = None,
 ) -> Tuple[List[Tuple[str, int, float]], Dict[str, Any]]:
-    """按本批 user 主键拉取依赖数据（先 user 再 keyed lookup，LOOKUP_PARALLEL 并行读源库）。"""
+    """按本批 user 主键拉取依赖数据（LOOKUP_PARALLEL 并行读源库）。
+
+    needed: 子集 {"ud","lup","uri","dac","prod"}；默认全拉（迁移链路兼容）。
+    reconcile 可按表裁剪，避免 bankcard/product 等白扫。
+    """
     timings: List[Tuple[str, int, float]] = []
     if not rows_user:
         return timings, _make_user_lookups([], [], [], [], [])
@@ -1957,24 +1962,45 @@ def _fetch_user_batch_lookups(
     app_mobile_pairs = keys["app_mobile_pairs"]
     device_ids = keys["device_ids"]
     lup_chunk = max(50, int(cfg.get("lup_pair_chunk", 400)))
-    lookup_tasks = [
-        ("mat_ud_sel", "ud_info", lambda c: _select_ud_rows_by_user_ids(c, user_ids)),
-        (
-            "mat_lup_sel", "lup_latest",
-            lambda c: _fetch_lup_by_app_mobile(c, app_mobile_pairs, lup_chunk),
-        ),
-        ("mat_uri_sel", "uri_latest", lambda c: _fetch_uri_by_user_ids(c, user_ids)),
-        ("mat_dac_sel", "dac_latest", lambda c: _fetch_dac_by_device_ids(c, device_ids)),
-        ("mat_prod_sel", "user_product", lambda c: _inline_mat_user_product(c, cfg, lo, hi)),
-    ]
-    parallel = max(1, int(cfg.get("lookup_parallel", 1)))
+    want = set(needed) if needed is not None else {"ud", "lup", "uri", "dac", "prod"}
+    lookup_tasks = []
+    if "ud" in want:
+        lookup_tasks.append(
+            ("mat_ud_sel", "ud_info", lambda c: _select_ud_rows_by_user_ids(c, user_ids))
+        )
+    if "lup" in want:
+        lookup_tasks.append(
+            (
+                "mat_lup_sel", "lup_latest",
+                lambda c: _fetch_lup_by_app_mobile(c, app_mobile_pairs, lup_chunk),
+            )
+        )
+    if "uri" in want:
+        lookup_tasks.append(
+            ("mat_uri_sel", "uri_latest", lambda c: _fetch_uri_by_user_ids(c, user_ids))
+        )
+    if "dac" in want:
+        lookup_tasks.append(
+            ("mat_dac_sel", "dac_latest", lambda c: _fetch_dac_by_device_ids(c, device_ids))
+        )
+    if "prod" in want:
+        lookup_tasks.append(
+            (
+                "mat_prod_sel", "user_product",
+                lambda c: _inline_mat_user_product(c, cfg, lo, hi, user_ids=user_ids),
+            )
+        )
+    if not lookup_tasks:
+        return timings, _make_user_lookups([], [], [], [], [])
 
-    if parallel <= 1:
-        ud_rows: List[dict] = []
-        lup_rows: List[dict] = []
-        uri_rows: List[dict] = []
-        dac_rows: List[dict] = []
-        prod_rows: List[dict] = []
+    parallel = max(1, int(cfg.get("lookup_parallel", 1)))
+    ud_rows: List[dict] = []
+    lup_rows: List[dict] = []
+    uri_rows: List[dict] = []
+    dac_rows: List[dict] = []
+    prod_rows: List[dict] = []
+
+    if parallel <= 1 or len(lookup_tasks) == 1:
         for step, perf_table, fetch_fn in lookup_tasks:
             t0 = time.perf_counter()
             rows = fetch_fn(src)
@@ -2004,11 +2030,11 @@ def _fetch_user_batch_lookups(
                 log_perf(prefix, perf_table, "source_select", len(rows), el)
                 timings.append((step, len(rows), el))
                 results[step] = rows
-        ud_rows = results["mat_ud_sel"]
-        lup_rows = results["mat_lup_sel"]
-        uri_rows = results["mat_uri_sel"]
-        dac_rows = results["mat_dac_sel"]
-        prod_rows = results["mat_prod_sel"]
+        ud_rows = results.get("mat_ud_sel") or []
+        lup_rows = results.get("mat_lup_sel") or []
+        uri_rows = results.get("mat_uri_sel") or []
+        dac_rows = results.get("mat_dac_sel") or []
+        prod_rows = results.get("mat_prod_sel") or []
 
     lookups = _make_user_lookups(ud_rows, lup_rows, uri_rows, dac_rows, prod_rows)
     return timings, lookups
@@ -2264,7 +2290,11 @@ def _fetch_app_lookup_maps(
     src,
     user_ids: List[int],
     sns: List[str],
+    need_repay: bool = True,
 ) -> Tuple[Dict[int, str], Dict[str, int]]:
+    """拉 bvn_map / repay_map。loan reconcile 只要 bvn 时传 need_repay=False。"""
+    if not need_repay:
+        return _fetch_bvn_map_from_source(src, user_ids), {}
     parallel = max(1, int(cfg.get("lookup_parallel", 1)))
     if parallel <= 1:
         return (
@@ -2719,8 +2749,40 @@ def _fetch_dac_by_device_ids(src, device_ids: List[int], chunk: int = 5000) -> L
     return out
 
 
-def _inline_mat_user_product(src, cfg: Dict[str, Any], lo: int, hi: int) -> List[dict]:
+def _inline_mat_user_product(
+    src,
+    cfg: Dict[str, Any],
+    lo: int,
+    hi: int,
+    user_ids: Optional[Sequence[int]] = None,
+    chunk: int = 5000,
+) -> List[dict]:
+    """拉本批 user 的 product；优先 userId IN（对齐本批用户），避免宽 id 窗空扫。"""
+    del cfg  # 保留签名兼容
     m = "ng_loan_market"
+    if user_ids:
+        uniq = list({int(u) for u in user_ids if u})
+        if not uniq:
+            return []
+        out: List[dict] = []
+        for i in range(0, len(uniq), chunk):
+            part = uniq[i:i + chunk]
+            ph = ",".join(["%s"] * len(part))
+            sql = f"""
+                SELECT pick.`userId` AS userId, pick.`productId` AS productId, a.amount
+                FROM (
+                    SELECT `userId`, `productId`, MAX(id) AS max_id
+                    FROM {m}.application
+                    WHERE `userId` IN ({ph})
+                      AND `productId` IS NOT NULL AND `productId` <> 0
+                    GROUP BY `userId`, `productId`
+                ) pick
+                INNER JOIN {m}.application a ON a.id = pick.max_id
+            """
+            with src.cursor() as cur:
+                cur.execute(sql, part)
+                out.extend(cur.fetchall())
+        return out
     sql = f"""
         SELECT pick.`userId` AS userId, pick.`productId` AS productId, a.amount
             FROM (

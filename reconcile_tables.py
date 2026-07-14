@@ -910,17 +910,20 @@ def _select_source_users_since(
     hi: int,
     max_user_id: int,
     exclude_app_ids: Tuple[int, ...] = DEFAULT_EXCLUDE_APP_IDS,
+    limit: Optional[int] = None,
 ) -> List[dict]:
+    """源 user：id>(lo,hi] 且 created>=since；limit 时 keyset 推进，跳过空 id 窗。"""
     m = "ng_loan_market"
     ex_ph = ",".join(["%s"] * len(exclude_app_ids)) if exclude_app_ids else ""
-    exclude_sql = f"AND u.`appId` NOT IN ({ex_ph})" if exclude_app_ids else ""
-    sql = f"""
+    exclude_sql = "AND u.`appId` NOT IN ({0})".format(ex_ph) if exclude_app_ids else ""
+    limit_sql = "LIMIT %s" if limit else ""
+    sql = """
         SELECT
             u.id AS user_id, u.`appId` AS app_id,
             u.mobile AS mobile_raw,
-            CASE WHEN u.mobile LIKE '+234%%' THEN u.mobile
-                 WHEN u.mobile LIKE '234%%' THEN CONCAT('+', u.mobile)
-                 WHEN u.mobile LIKE '0%%' THEN CONCAT('+234', SUBSTRING(u.mobile, 2))
+            CASE WHEN u.mobile LIKE '+234%' THEN u.mobile
+                 WHEN u.mobile LIKE '234%' THEN CONCAT('+', u.mobile)
+                 WHEN u.mobile LIKE '0%' THEN CONCAT('+234', SUBSTRING(u.mobile, 2))
                  ELSE CONCAT('+234', u.mobile) END AS mobile,
             ap.name AS app_name,
             CASE WHEN u.`isCancel` IN (1, '1') THEN UNIX_TIMESTAMP(u.updated) * 1000 ELSE 0 END AS closed_time,
@@ -936,10 +939,13 @@ def _select_source_users_since(
           AND u.id < %s
           {exclude_sql}
         ORDER BY u.id ASC
-    """
-    params: List[Any] = [since_date, lo, hi, max_user_id]
+        {limit_sql}
+    """.format(m=m, exclude_sql=exclude_sql, limit_sql=limit_sql)
+    params = [since_date, lo, hi, max_user_id]  # type: List[Any]
     if exclude_app_ids:
         params.extend(exclude_app_ids)
+    if limit:
+        params.append(int(limit))
     with src.cursor() as cur:
         cur.execute(sql, params)
         return list(cur.fetchall())
@@ -981,19 +987,27 @@ def build_expected_user_rows(
     max_user_id: int,
     vt: mig.VtTokenResolver,
     logger: ReconcileLogger,
+    limit: Optional[int] = None,
 ) -> Tuple[List[dict], Dict[str, int]]:
     stats = {
         "source_rows": 0,
         "vt_skip": 0,
         "built": 0,
+        "last_id": lo,
     }
-    raw_rows = _select_source_users_since(src, since_date, lo, hi, max_user_id)
+    raw_rows = _select_source_users_since(
+        src, since_date, lo, hi, max_user_id, limit=limit,
+    )
     stats["source_rows"] = len(raw_rows)
     if not raw_rows:
         return [], stats
+    stats["last_id"] = int(raw_rows[-1]["user_id"])
 
-    prefix = f"[plan {lo},{hi}]"
-    _, lookups = mig._fetch_user_batch_lookups(src, cfg, raw_rows, lo, hi, prefix)
+    prefix = "[plan {0},{1}]".format(lo, hi)
+    # user 表只需 lup+dac；mobile VT 来自 user 行本身
+    _, lookups = mig._fetch_user_batch_lookups(
+        src, cfg, raw_rows, lo, hi, prefix, needed=("lup", "dac"),
+    )
     mig._register_user_batch_vt(vt, raw_rows, lookups)
     vt.prefetch()
 
@@ -1055,15 +1069,18 @@ def _plan_user_span(
     }
     plan: List[dict] = []
     try:
-        lo = span_lo
-        while lo < span_hi:
-            hi = min(lo + source_batch, span_hi)
+        last_id = span_lo
+        while last_id < span_hi:
             stats["source_batches"] += 1
             expected_rows, batch_stats = build_expected_user_rows(
-                cfg, src, lo, hi, since_date, max_user_id, vt, logger,
+                cfg, src, last_id, span_hi, since_date, max_user_id, vt, logger,
+                limit=source_batch,
             )
+            nsrc = int(batch_stats.get("source_rows") or 0)
+            if nsrc <= 0:
+                break
             stats["vt_skip"] += batch_stats.get("vt_skip", 0)
-            stats["source_total"] += batch_stats.get("source_rows", 0)
+            stats["source_total"] += nsrc
             for exp in expected_rows:
                 pk = user_key(exp)
                 actual = target_by_key.get(pk)
@@ -1086,7 +1103,9 @@ def _plan_user_span(
                         "row": exp,
                     }
                 )
-            lo = hi
+            last_id = int(batch_stats.get("last_id") or last_id)
+            if nsrc < source_batch:
+                break
     finally:
         mig._close_mysql_conn(src)
     return plan, stats
@@ -1467,6 +1486,23 @@ def load_or_build_target_cache_by_key(
     return target_by_key
 
 
+
+def tune_source_lookup_parallel(cfg: Dict[str, Any], source_workers: int, logger=None) -> None:
+    """source_workers 高时压低 LOOKUP_PARALLEL，避免连接风暴。"""
+    sw = max(1, int(source_workers or 1))
+    cur = max(1, int(cfg.get("lookup_parallel") or 1))
+    if sw >= 6 and cur > 2:
+        cfg["lookup_parallel"] = 2
+    elif sw >= 4 and cur > 3:
+        cfg["lookup_parallel"] = 3
+    if logger is not None and int(cfg.get("lookup_parallel") or 1) != cur:
+        logger.log(
+            "tune LOOKUP_PARALLEL {0} -> {1} (source_workers={2})".format(
+                cur, cfg["lookup_parallel"], sw,
+            )
+        )
+
+
 def setup_preloads(cfg: Dict[str, Any], logger: ReconcileLogger, vt_preload: bool) -> None:
     """VT / LUP 预加载进进程内存；仅 plan/all 需要（load-target 不翻 VT）。
 
@@ -1585,15 +1621,21 @@ def build_expected_user_info_rows(
     max_user_id: int,
     vt: mig.VtTokenResolver,
     logger: ReconcileLogger,
+    limit: Optional[int] = None,
 ) -> Tuple[List[dict], Dict[str, int]]:
-    stats = {"source_rows": 0, "vt_skip": 0, "built": 0}
-    raw_rows = _select_source_users_since(src, since_date, lo, hi, max_user_id)
+    stats = {"source_rows": 0, "vt_skip": 0, "built": 0, "last_id": lo}
+    raw_rows = _select_source_users_since(
+        src, since_date, lo, hi, max_user_id, limit=limit,
+    )
     stats["source_rows"] = len(raw_rows)
     if not raw_rows:
         return [], stats
+    stats["last_id"] = int(raw_rows[-1]["user_id"])
 
-    prefix = f"[user_info plan {lo},{hi}]"
-    _, lookups = mig._fetch_user_batch_lookups(src, cfg, raw_rows, lo, hi, prefix)
+    prefix = "[user_info plan {0},{1}]".format(lo, hi)
+    _, lookups = mig._fetch_user_batch_lookups(
+        src, cfg, raw_rows, lo, hi, prefix, needed=("ud", "lup", "uri", "dac"),
+    )
     mig._register_user_batch_vt(vt, raw_rows, lookups)
     vt.prefetch()
 
@@ -1638,15 +1680,18 @@ def _plan_user_info_span(
     }
     plan: List[dict] = []
     try:
-        lo = span_lo
-        while lo < span_hi:
-            hi = min(lo + source_batch, span_hi)
+        last_id = span_lo
+        while last_id < span_hi:
             stats["source_batches"] += 1
             expected_rows, batch_stats = build_expected_user_info_rows(
-                cfg, src, lo, hi, since_date, max_user_id, vt, logger,
+                cfg, src, last_id, span_hi, since_date, max_user_id, vt, logger,
+                limit=source_batch,
             )
+            nsrc = int(batch_stats.get("source_rows") or 0)
+            if nsrc <= 0:
+                break
             stats["vt_skip"] += batch_stats.get("vt_skip", 0)
-            stats["source_total"] += batch_stats.get("source_rows", 0)
+            stats["source_total"] += nsrc
             for exp in expected_rows:
                 uid = int(exp["user_id"])
                 actual = target_by_id.get(uid)
@@ -1669,7 +1714,9 @@ def _plan_user_info_span(
                         "row": exp,
                     }
                 )
-            lo = hi
+            last_id = int(batch_stats.get("last_id") or last_id)
+            if nsrc < source_batch:
+                break
     finally:
         mig._close_mysql_conn(src)
     return plan, stats
@@ -1736,6 +1783,7 @@ def _run_reconcile_phases(
     dry_run = not args.apply
 
     if phase in ("plan", "all"):
+        tune_source_lookup_parallel(cfg, getattr(args, "source_workers", 8), logger)
         setup_preloads(cfg, logger, args.vt_preload)
 
     target_by_key: Dict[Any, dict] = {}
@@ -1814,11 +1862,17 @@ def _source_users_batch_stats(
     since_date: str,
     max_user_id: int,
     prefix: str,
+    needed=None,
+    limit: Optional[int] = None,
 ) -> Tuple[List[dict], Dict[str, Any], set]:
-    raw_rows = _select_source_users_since(src, since_date, lo, hi, max_user_id)
+    raw_rows = _select_source_users_since(
+        src, since_date, lo, hi, max_user_id, limit=limit,
+    )
     if not raw_rows:
         return [], {}, set()
-    _, lookups = mig._fetch_user_batch_lookups(src, cfg, raw_rows, lo, hi, prefix)
+    _, lookups = mig._fetch_user_batch_lookups(
+        src, cfg, raw_rows, lo, hi, prefix, needed=needed,
+    )
     user_ids = {int(r["user_id"]) for r in raw_rows}
     return raw_rows, lookups, user_ids
 
@@ -1832,15 +1886,18 @@ def build_expected_bankcard_rows(
     max_user_id: int,
     vt: mig.VtTokenResolver,
     logger: ReconcileLogger,
+    limit: Optional[int] = None,
 ) -> Tuple[List[dict], Dict[str, int]]:
-    stats = {"source_users": 0, "vt_skip": 0, "built": 0}
-    prefix = f"[bankcard plan {lo},{hi}]"
-    _, lookups, user_ids = _source_users_batch_stats(
+    stats = {"source_users": 0, "vt_skip": 0, "built": 0, "last_id": lo}
+    prefix = "[bankcard plan {0},{1}]".format(lo, hi)
+    raw_rows, lookups, user_ids = _source_users_batch_stats(
         cfg, src, lo, hi, since_date, max_user_id, prefix,
+        needed=("ud",), limit=limit,
     )
     stats["source_users"] = len(user_ids)
     if not user_ids:
         return [], stats
+    stats["last_id"] = int(raw_rows[-1]["user_id"])
 
     ud_by_user = lookups.get("ud_by_user") or {}
     for uid in user_ids:
@@ -1898,16 +1955,19 @@ def build_expected_user_product_rows(
     max_user_id: int,
     vt: mig.VtTokenResolver,
     logger: ReconcileLogger,
+    limit: Optional[int] = None,
 ) -> Tuple[List[dict], Dict[str, int]]:
     del vt  # user_product 无 VT 字段
-    stats = {"source_users": 0, "built": 0}
-    prefix = f"[user_product plan {lo},{hi}]"
-    _, lookups, user_ids = _source_users_batch_stats(
+    stats = {"source_users": 0, "built": 0, "last_id": lo}
+    prefix = "[user_product plan {0},{1}]".format(lo, hi)
+    raw_rows, lookups, user_ids = _source_users_batch_stats(
         cfg, src, lo, hi, since_date, max_user_id, prefix,
+        needed=("prod",), limit=limit,
     )
     stats["source_users"] = len(user_ids)
     if not user_ids:
         return [], stats
+    stats["last_id"] = int(raw_rows[-1]["user_id"])
     prod_src = [
         p for p in (lookups.get("prod_rows") or [])
         if int(p["userId"]) in user_ids
@@ -1944,15 +2004,18 @@ def _plan_composite_span(
     }
     plan: List[dict] = []
     try:
-        lo = span_lo
-        while lo < span_hi:
-            hi = min(lo + source_batch, span_hi)
+        last_id = span_lo
+        while last_id < span_hi:
             stats["source_batches"] += 1
             expected_rows, batch_stats = build_fn(
-                cfg, src, lo, hi, since_date, max_user_id, vt, logger,
+                cfg, src, last_id, span_hi, since_date, max_user_id, vt, logger,
+                limit=source_batch,
             )
+            nsrc = int(batch_stats.get("source_users") or 0)
+            if nsrc <= 0:
+                break
             stats["vt_skip"] += batch_stats.get("vt_skip", 0)
-            stats["source_total"] += batch_stats.get("source_users", 0)
+            stats["source_total"] += nsrc
             for exp in expected_rows:
                 pk = key_fn(exp)
                 actual = target_by_key.get(pk)
@@ -1978,7 +2041,9 @@ def _plan_composite_span(
                         "row": row_out,
                     }
                 )
-            lo = hi
+            last_id = int(batch_stats.get("last_id") or last_id)
+            if nsrc < source_batch:
+                break
     finally:
         mig._close_mysql_conn(src)
     return plan, stats
@@ -2137,8 +2202,10 @@ def _run_reconcile_phases_composite(
     phase = args.phase
     dry_run = not args.apply
 
-    if phase in ("plan", "all") and need_vt:
-        setup_preloads(cfg, logger, args.vt_preload)
+    if phase in ("plan", "all"):
+        tune_source_lookup_parallel(cfg, getattr(args, "source_workers", 8), logger)
+        if need_vt:
+            setup_preloads(cfg, logger, args.vt_preload)
 
     target_by_key: Dict[Tuple[Any, ...], dict] = {}
     if phase in ("load-target", "plan", "all"):
@@ -2209,73 +2276,182 @@ def _run_reconcile_phases_composite(
 # application
 # ---------------------------------------------------------------------------
 
+def _probe_created_time_bounds(
+    env_path: Path,
+    table: str,
+    since_ms: int,
+    exclude_app_ids: Tuple[int, ...] = (),
+) -> Tuple[int, int]:
+    """查目标表 created_time 实际 [min,max]，避免 CRC32 全表扫。"""
+    cfg = _worker_load_env(str(env_path))
+    tgt = mig.connect_target(cfg)
+    try:
+        exclude_sql = ""
+        params = [since_ms]  # type: List[Any]
+        if table == "application" and exclude_app_ids:
+            ex_ph = ",".join(["%s"] * len(exclude_app_ids))
+            exclude_sql = "AND app_id NOT IN ({0})".format(ex_ph)
+            params.extend(exclude_app_ids)
+        with tgt.cursor() as cur:
+            cur.execute(
+                """
+                SELECT MIN(created_time) AS min_t, MAX(created_time) AS max_t
+                FROM `{table}`
+                WHERE created_time >= %s
+                  {exclude_sql}
+                """.format(table=table, exclude_sql=exclude_sql),
+                params,
+            )
+            row = cur.fetchone() or {}
+        min_t = int(row.get("min_t") or 0)
+        max_t = int(row.get("max_t") or 0)
+        if min_t <= 0 or max_t <= 0 or max_t < min_t:
+            return 0, 0
+        return min_t, max_t
+    finally:
+        mig._close_mysql_conn(tgt)
+
+
+def _partition_created_time_span(
+    min_t: int, max_t: int, workers: int,
+) -> List[Tuple[int, int]]:
+    """将 [min_t, max_t] 切成连续 [lo, hi) 区间（最后一段 hi=max_t+1）。"""
+    workers = max(1, int(workers or 1))
+    if max_t < min_t:
+        return []
+    span = (max_t - min_t) + 1
+    workers = min(workers, span)
+    chunk = (span + workers - 1) // workers
+    out = []  # type: List[Tuple[int, int]]
+    lo = min_t
+    while lo <= max_t:
+        hi = min(lo + chunk, max_t + 1)
+        out.append((lo, hi))
+        lo = hi
+    return out
+
+
+def _fetch_page_with_mysql_retry(label, cfg, tgt, max_retries, execute_fn):
+    """execute_fn(cursor) -> batch；遇 2013/2006 重连重试。返回 (tgt, batch)。"""
+    batch = None
+    last_exc = None  # type: Optional[BaseException]
+    for attempt in range(max_retries):
+        try:
+            try:
+                tgt.ping(reconnect=True)
+            except Exception:
+                mig._close_mysql_conn(tgt)
+                tgt = mig.connect_target(cfg)
+            with tgt.cursor() as cur:
+                batch = execute_fn(cur)
+            return tgt, batch
+        except Exception as exc:
+            last_exc = exc
+            if not _is_mysql_lost_conn(exc) or attempt >= max_retries - 1:
+                raise
+            delay = min(8.0, 0.5 * (2 ** attempt))
+            print(
+                "{0} mysql lost conn retry {1}/{2} sleep={3:.1f}s err={4}".format(
+                    label, attempt + 1, max_retries, delay, exc,
+                ),
+                flush=True,
+            )
+            mig._close_mysql_conn(tgt)
+            time.sleep(delay)
+            tgt = mig.connect_target(cfg)
+    if last_exc is not None:
+        raise last_exc
+    return tgt, []
+
+
 def _load_target_application_shard(spec: dict) -> Tuple[int, List[dict], Dict[str, int]]:
     worker_id = int(spec["worker_id"])
     workers = int(spec["workers"])
-    since_ms = int(spec["since_ms"])
+    range_lo = int(spec["range_lo"])
+    range_hi = int(spec["range_hi"])
     page_size = int(spec["page_size"])
     env_path = str(spec["env_path"])
-    columns: List[str] = list(spec["columns"])
+    columns = list(spec["columns"])  # type: List[str]
     cols_sql = spec["cols_sql"]
-    exclude_app_ids: Tuple[int, ...] = tuple(spec["exclude_app_ids"])
+    exclude_app_ids = tuple(spec["exclude_app_ids"])  # type: Tuple[int, ...]
 
-    label = f"[target application {worker_id}/{workers}]"
+    label = "[target application {0}/{1}]".format(worker_id, workers)
     stats = {"scanned": 0}
-    rows: List[dict] = []
+    rows = []  # type: List[dict]
     cfg = _worker_load_env(env_path)
     tgt = mig.connect_target(cfg)
-    last_app_no = ""
     ex_ph = ",".join(["%s"] * len(exclude_app_ids)) if exclude_app_ids else ""
-    exclude_sql = f"AND app_id NOT IN ({ex_ph})" if exclude_app_ids else ""
+    exclude_sql = "AND app_id NOT IN ({0})".format(ex_ph) if exclude_app_ids else ""
+    max_retries = max(3, int(cfg.get("mysql_batch_retries") or 6))
+    last_ct = None  # type: Optional[int]
+    last_app_no = ""
     t0 = time.time()
     print(
-        f"{label} load start created_time_ms>={since_ms} "
-        f"exclude_app_ids={exclude_app_ids} (SQL NOT IN)",
+        "{0} load start created_time=[{1},{2}) page_size={3} exclude_app_ids={4}".format(
+            label, range_lo, range_hi, page_size, exclude_app_ids,
+        ),
         flush=True,
     )
     try:
         while True:
-            with tgt.cursor() as cur:
-                cur.execute(
-                    f"""
-                    SELECT {cols_sql}
-                    FROM `application`
-                    WHERE created_time >= %s
-                      {exclude_sql}
-                      AND application_no IS NOT NULL AND application_no <> ''
-                      AND MOD(CRC32(application_no), %s) = %s
-                      AND application_no > %s
-                    ORDER BY application_no ASC
-                    LIMIT %s
-                    """,
-                    (
-                        since_ms,
-                        *exclude_app_ids,
-                        workers,
-                        worker_id - 1,
-                        last_app_no,
-                        page_size,
-                    ),
-                )
-                batch = cur.fetchall()
+            def _exec(cur, _last_ct=last_ct, _last_app_no=last_app_no):
+                if _last_ct is None:
+                    cur.execute(
+                        """
+                        SELECT {cols_sql}
+                        FROM `application`
+                        WHERE created_time >= %s AND created_time < %s
+                          {exclude_sql}
+                          AND application_no IS NOT NULL AND application_no <> ''
+                        ORDER BY created_time ASC, application_no ASC
+                        LIMIT %s
+                        """.format(cols_sql=cols_sql, exclude_sql=exclude_sql),
+                        (range_lo, range_hi) + tuple(exclude_app_ids) + (page_size,),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT {cols_sql}
+                        FROM `application`
+                        WHERE created_time >= %s AND created_time < %s
+                          {exclude_sql}
+                          AND application_no IS NOT NULL AND application_no <> ''
+                          AND (
+                            created_time > %s
+                            OR (created_time = %s AND application_no > %s)
+                          )
+                        ORDER BY created_time ASC, application_no ASC
+                        LIMIT %s
+                        """.format(cols_sql=cols_sql, exclude_sql=exclude_sql),
+                        (range_lo, range_hi)
+                        + tuple(exclude_app_ids)
+                        + (_last_ct, _last_ct, _last_app_no, page_size),
+                    )
+                return cur.fetchall()
+
+            tgt, batch = _fetch_page_with_mysql_retry(
+                label, cfg, tgt, max_retries, _exec,
+            )
             if not batch:
                 break
             for row in batch:
                 rows.append({k: row[k] for k in columns})
-            last_app_no = str(batch[-1]["application_no"])
+            last_ct = int(batch[-1]["created_time"] or 0)
+            last_app_no = str(batch[-1]["application_no"] or "")
             stats["scanned"] = len(rows)
             if stats["scanned"] % 100_000 < page_size:
                 print(
-                    f"{label} progress rows={stats['scanned']} last={last_app_no} "
-                    f"elapsed={time.time()-t0:.1f}s",
+                    "{0} progress rows={1} last_ct={2} last={3} elapsed={4:.1f}s".format(
+                        label, stats["scanned"], last_ct, last_app_no, time.time() - t0,
+                    ),
                     flush=True,
                 )
             if len(batch) < page_size:
                 break
     finally:
-        tgt.close()
+        mig._close_mysql_conn(tgt)
     print(
-        f"{label} done rows={len(rows)} elapsed={time.time()-t0:.1f}s",
+        "{0} done rows={1} elapsed={2:.1f}s".format(label, len(rows), time.time() - t0),
         flush=True,
     )
     return worker_id, rows, stats
@@ -2290,27 +2466,42 @@ def parallel_load_target_applications(
     page_size: int,
     logger: ReconcileLogger,
 ) -> Dict[Tuple[Any, ...], dict]:
-    workers = max(1, min(load_workers, 32))
+    # CRC32 分片会拖垮目标库；改 created_time 区间（走索引），并发别过高
+    workers = max(1, min(int(load_workers or 1), 8))
+    page_size = max(1000, min(int(page_size or 50000), 50000))
+    min_t, max_t = _probe_created_time_bounds(
+        env_path, "application", since_ms, exclude_app_ids,
+    )
+    if min_t <= 0:
+        logger.log(
+            "load target application: no rows (created_time>={0})".format(since_ms)
+        )
+        return {}
+    spans = _partition_created_time_span(min_t, max_t, workers)
+    workers = len(spans)
     cols_sql = _target_cols_sql(columns)
     specs = [
         {
             "worker_id": i + 1,
             "workers": workers,
-            "since_ms": since_ms,
+            "range_lo": lo,
+            "range_hi": hi,
             "page_size": page_size,
             "env_path": str(env_path.resolve()),
             "columns": list(columns),
             "cols_sql": cols_sql,
             "exclude_app_ids": list(exclude_app_ids),
         }
-        for i in range(workers)
+        for i, (lo, hi) in enumerate(spans)
     ]
     logger.log(
-        f"load target application: workers={workers} created_time_ms>={since_ms} "
-        f"exclude_app_ids={exclude_app_ids} (SQL NOT IN) page_size={page_size}"
+        "load target application: workers={0} created_time=[{1},{2}] "
+        "exclude_app_ids={3} page_size={4} (time-range shards, no CRC32)".format(
+            workers, min_t, max_t, exclude_app_ids, page_size,
+        )
     )
     t0 = time.time()
-    merged: Dict[Tuple[Any, ...], dict] = {}
+    merged = {}  # type: Dict[Tuple[Any, ...], dict]
     if workers == 1:
         _, chunk, _ = _load_target_application_shard(specs[0])
         for row in chunk:
@@ -2323,8 +2514,9 @@ def parallel_load_target_applications(
             for row in chunk:
                 merged[application_key(row)] = row
     logger.log(
-        f"load target application done rows={len(merged)} "
-        f"elapsed={time.time()-t0:.1f}s"
+        "load target application done rows={0} elapsed={1:.1f}s".format(
+            len(merged), time.time() - t0,
+        )
     )
     return merged
 
@@ -2373,11 +2565,13 @@ def _select_application_source_since(
     hi: int,
     since_unix: int,
     exclude_app_ids: Tuple[int, ...],
+    limit: Optional[int] = None,
 ) -> List[dict]:
     m, c = "ng_loan_market", "ng_loan_core"
     ex_ph = ",".join(["%s"] * len(exclude_app_ids))
     sql = f"""
         SELECT
+            a.id AS src_id,
             a.applicationNo AS application_no,
             CASE WHEN a.mobile LIKE '+234%%' THEN a.mobile
                  WHEN a.mobile LIKE '234%%' THEN CONCAT('+', a.mobile)
@@ -2412,7 +2606,11 @@ def _select_application_source_since(
           AND a.id > %s AND a.id <= %s
         ORDER BY a.id ASC
     """
+    if limit:
+        sql = sql.rstrip() + "\n        LIMIT %s\n    "
     params: List[Any] = list(exclude_app_ids) + [since_unix, lo, hi]
+    if limit:
+        params.append(int(limit))
     with src.cursor() as cur:
         cur.execute(sql, params)
         return list(cur.fetchall())
@@ -2509,14 +2707,18 @@ def build_expected_application_rows(
     exclude_app_ids: Tuple[int, ...],
     vt: mig.VtTokenResolver,
     logger: ReconcileLogger,
+    limit: Optional[int] = None,
 ) -> Tuple[List[dict], Dict[str, int]]:
-    stats = {"source_rows": 0, "vt_skip": 0, "no_core_sn": 0, "built": 0}
+    stats = {
+        "source_rows": 0, "vt_skip": 0, "no_core_sn": 0, "built": 0, "last_id": lo,
+    }
     raw_rows = _select_application_source_since(
-        src, lo, hi, since_unix, exclude_app_ids,
+        src, lo, hi, since_unix, exclude_app_ids, limit=limit,
     )
     stats["source_rows"] = len(raw_rows)
     if not raw_rows:
         return [], stats
+    stats["last_id"] = int(raw_rows[-1].get("src_id") or lo)
 
     user_ids = [int(r["user_id"]) for r in raw_rows]
     sns = [str(r["application_no"]) for r in raw_rows if r.get("application_no")]
@@ -2565,16 +2767,19 @@ def _plan_application_span(
     }
     plan: List[dict] = []
     try:
-        lo = span_lo
-        while lo < span_hi:
-            hi = min(lo + source_batch, span_hi)
+        last_id = span_lo
+        while last_id < span_hi:
             stats["source_batches"] += 1
             expected_rows, batch_stats = build_expected_application_rows(
-                cfg, src, lo, hi, since_unix, exclude_app_ids, vt, logger,
+                cfg, src, last_id, span_hi, since_unix, exclude_app_ids, vt, logger,
+                limit=source_batch,
             )
+            nsrc = int(batch_stats.get("source_rows") or 0)
+            if nsrc <= 0:
+                break
             stats["vt_skip"] += batch_stats.get("vt_skip", 0)
             stats["no_core_sn"] += batch_stats.get("no_core_sn", 0)
-            stats["source_total"] += batch_stats.get("source_rows", 0)
+            stats["source_total"] += nsrc
             for exp in expected_rows:
                 pk = application_key(exp)
                 actual = target_by_key.get(pk)
@@ -2597,7 +2802,9 @@ def _plan_application_span(
                     "diff": diff,
                     "row": exp,
                 })
-            lo = hi
+            last_id = int(batch_stats.get("last_id") or last_id)
+            if nsrc < source_batch:
+                break
     finally:
         mig._close_mysql_conn(src)
     return plan, stats
@@ -2681,6 +2888,7 @@ def run_application_reconcile(args: argparse.Namespace, cfg: Dict[str, Any]) -> 
     )
 
     if phase in ("plan", "all"):
+        tune_source_lookup_parallel(cfg, getattr(args, "source_workers", 8), logger)
         setup_preloads(cfg, logger, args.vt_preload)
 
     target_by_key: Dict[Tuple[Any, ...], dict] = {}
@@ -2755,50 +2963,99 @@ def run_application_reconcile(args: argparse.Namespace, cfg: Dict[str, Any]) -> 
 def _load_target_loan_shard(spec: dict) -> Tuple[int, List[dict], Dict[str, int]]:
     worker_id = int(spec["worker_id"])
     workers = int(spec["workers"])
-    since_ms = int(spec["since_ms"])
+    range_lo = int(spec["range_lo"])
+    range_hi = int(spec["range_hi"])
     page_size = int(spec["page_size"])
     env_path = str(spec["env_path"])
-    columns: List[str] = list(spec["columns"])
+    columns = list(spec["columns"])  # type: List[str]
     cols_sql = spec["cols_sql"]
-    exclude_created_ms: Tuple[int, ...] = tuple(spec["exclude_created_ms"])
-    exclude_app_ids: Tuple[int, ...] = tuple(spec["exclude_app_ids"])
+    exclude_created_ms = tuple(spec["exclude_created_ms"])  # type: Tuple[int, ...]
+    exclude_app_ids = tuple(spec["exclude_app_ids"])  # type: Tuple[int, ...]
 
-    label = f"[target loan {worker_id}/{workers}]"
-    stats = {"scanned": 0, "skipped_excluded_app": 0, "skipped_excluded_created_ms": 0}
-    rows: List[dict] = []
+    label = "[target loan {0}/{1}]".format(worker_id, workers)
+    stats = {
+        "scanned": 0,
+        "skipped_excluded_app": 0,
+        "skipped_excluded_created_ms": 0,
+    }
+    rows = []  # type: List[dict]
     cfg = _worker_load_env(env_path)
     tgt = mig.connect_target(cfg)
+    exclude_created_set = (
+        set(int(x) for x in exclude_created_ms) if exclude_created_ms else set()
+    )
+    max_retries = max(3, int(cfg.get("mysql_batch_retries") or 6))
+    last_ct = None  # type: Optional[int]
     last_app_no = ""
-    exclude_created_set = set(int(x) for x in exclude_created_ms) if exclude_created_ms else set()
+    last_period = -1
+    last_roll = -1
     t0 = time.time()
     print(
-        f"{label} load start created_time_ms>={since_ms} exclude_app_ids={exclude_app_ids} "
-        f"exclude_created_ms={exclude_created_ms} (post-filter in memory)",
+        "{0} load start created_time=[{1},{2}) page_size={3} exclude_app_ids={4} "
+        "exclude_created_ms={5}".format(
+            label, range_lo, range_hi, page_size, exclude_app_ids, exclude_created_ms,
+        ),
         flush=True,
     )
     try:
         while True:
-            with tgt.cursor() as cur:
-                cur.execute(
-                    f"""
-                    SELECT {cols_sql}
-                    FROM `loan`
-                    WHERE created_time >= %s
-                      AND application_no IS NOT NULL AND application_no <> ''
-                      AND MOD(CRC32(application_no), %s) = %s
-                      AND application_no > %s
-                    ORDER BY application_no ASC, period ASC, roll_sequence ASC
-                    LIMIT %s
-                    """,
-                    (
-                        since_ms,
-                        workers,
-                        worker_id - 1,
-                        last_app_no,
-                        page_size,
-                    ),
-                )
-                batch = cur.fetchall()
+            def _exec(
+                cur,
+                _last_ct=last_ct,
+                _last_app_no=last_app_no,
+                _last_period=last_period,
+                _last_roll=last_roll,
+            ):
+                if _last_ct is None:
+                    cur.execute(
+                        """
+                        SELECT {cols_sql}
+                        FROM `loan`
+                        WHERE created_time >= %s AND created_time < %s
+                          AND application_no IS NOT NULL AND application_no <> ''
+                        ORDER BY created_time ASC, application_no ASC,
+                                 period ASC, roll_sequence ASC
+                        LIMIT %s
+                        """.format(cols_sql=cols_sql),
+                        (range_lo, range_hi, page_size),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT {cols_sql}
+                        FROM `loan`
+                        WHERE created_time >= %s AND created_time < %s
+                          AND application_no IS NOT NULL AND application_no <> ''
+                          AND (
+                            created_time > %s
+                            OR (created_time = %s AND application_no > %s)
+                            OR (
+                              created_time = %s AND application_no = %s
+                              AND period > %s
+                            )
+                            OR (
+                              created_time = %s AND application_no = %s
+                              AND period = %s AND roll_sequence > %s
+                            )
+                          )
+                        ORDER BY created_time ASC, application_no ASC,
+                                 period ASC, roll_sequence ASC
+                        LIMIT %s
+                        """.format(cols_sql=cols_sql),
+                        (
+                            range_lo, range_hi,
+                            _last_ct,
+                            _last_ct, _last_app_no,
+                            _last_ct, _last_app_no, _last_period,
+                            _last_ct, _last_app_no, _last_period, _last_roll,
+                            page_size,
+                        ),
+                    )
+                return cur.fetchall()
+
+            tgt, batch = _fetch_page_with_mysql_retry(
+                label, cfg, tgt, max_retries, _exec,
+            )
             if not batch:
                 break
             for row in batch:
@@ -2813,24 +3070,39 @@ def _load_target_loan_shard(spec: dict) -> Tuple[int, List[dict], Dict[str, int]
                     stats["skipped_excluded_created_ms"] += 1
                     continue
                 rows.append(item)
-            last_app_no = str(batch[-1]["application_no"])
+            last = batch[-1]
+            last_ct = int(last.get("created_time") or 0)
+            last_app_no = str(last.get("application_no") or "")
+            last_period = int(last.get("period") if last.get("period") is not None else 1)
+            last_roll = int(
+                last.get("roll_sequence") if last.get("roll_sequence") is not None else 0
+            )
             stats["scanned"] = len(rows)
             if stats["scanned"] % 100_000 < page_size:
                 print(
-                    f"{label} progress rows={stats['scanned']} "
-                    f"skipped_app={stats['skipped_excluded_app']} "
-                    f"skipped_created={stats['skipped_excluded_created_ms']} "
-                    f"last={last_app_no} elapsed={time.time()-t0:.1f}s",
+                    "{0} progress rows={1} skipped_app={2} skipped_created={3} "
+                    "last={4} elapsed={5:.1f}s".format(
+                        label,
+                        stats["scanned"],
+                        stats["skipped_excluded_app"],
+                        stats["skipped_excluded_created_ms"],
+                        last_app_no,
+                        time.time() - t0,
+                    ),
                     flush=True,
                 )
             if len(batch) < page_size:
                 break
     finally:
-        tgt.close()
+        mig._close_mysql_conn(tgt)
     print(
-        f"{label} done rows={len(rows)} skipped_app={stats['skipped_excluded_app']} "
-        f"skipped_created={stats['skipped_excluded_created_ms']} "
-        f"elapsed={time.time()-t0:.1f}s",
+        "{0} done rows={1} skipped_app={2} skipped_created={3} elapsed={4:.1f}s".format(
+            label,
+            len(rows),
+            stats["skipped_excluded_app"],
+            stats["skipped_excluded_created_ms"],
+            time.time() - t0,
+        ),
         flush=True,
     )
     return worker_id, rows, stats
@@ -2846,13 +3118,21 @@ def parallel_load_target_loans(
     page_size: int,
     logger: ReconcileLogger,
 ) -> Dict[Tuple[Any, ...], dict]:
-    workers = max(1, min(load_workers, 32))
+    workers = max(1, min(int(load_workers or 1), 8))
+    page_size = max(1000, min(int(page_size or 50000), 50000))
+    min_t, max_t = _probe_created_time_bounds(env_path, "loan", since_ms)
+    if min_t <= 0:
+        logger.log("load target loan: no rows (created_time>={0})".format(since_ms))
+        return {}
+    spans = _partition_created_time_span(min_t, max_t, workers)
+    workers = len(spans)
     cols_sql = _target_cols_sql(columns)
     specs = [
         {
             "worker_id": i + 1,
             "workers": workers,
-            "since_ms": since_ms,
+            "range_lo": lo,
+            "range_hi": hi,
             "page_size": page_size,
             "env_path": str(env_path.resolve()),
             "columns": list(columns),
@@ -2860,15 +3140,17 @@ def parallel_load_target_loans(
             "exclude_app_ids": list(exclude_app_ids),
             "exclude_created_ms": list(exclude_created_ms),
         }
-        for i in range(workers)
+        for i, (lo, hi) in enumerate(spans)
     ]
     logger.log(
-        f"load target loan: workers={workers} created_time_ms>={since_ms} "
-        f"exclude_app_ids={exclude_app_ids} exclude_created_ms={exclude_created_ms} "
-        f"(memory filter) page_size={page_size}"
+        "load target loan: workers={0} created_time=[{1},{2}] "
+        "exclude_app_ids={3} exclude_created_ms={4} page_size={5} "
+        "(time-range shards, no CRC32)".format(
+            workers, min_t, max_t, exclude_app_ids, exclude_created_ms, page_size,
+        )
     )
     t0 = time.time()
-    merged: Dict[Tuple[Any, ...], dict] = {}
+    merged = {}  # type: Dict[Tuple[Any, ...], dict]
     if workers == 1:
         _, chunk, _ = _load_target_loan_shard(specs[0])
         for row in chunk:
@@ -2881,7 +3163,9 @@ def parallel_load_target_loans(
             for row in chunk:
                 merged[loan_key(row)] = row
     logger.log(
-        f"load target loan done rows={len(merged)} elapsed={time.time()-t0:.1f}s"
+        "load target loan done rows={0} elapsed={1:.1f}s".format(
+            len(merged), time.time() - t0,
+        )
     )
     return merged
 
@@ -2939,12 +3223,14 @@ def _select_disbursed_application_source_since(
     hi: int,
     since_unix: int,
     exclude_app_ids: Tuple[int, ...],
+    limit: Optional[int] = None,
 ) -> List[dict]:
     """源库已放款单（disburseTime>0），applyDate >= since_unix。"""
     m, c = "ng_loan_market", "ng_loan_core"
     ex_ph = ",".join(["%s"] * len(exclude_app_ids))
     sql = f"""
         SELECT
+            a.id AS src_id,
             a.applicationNo AS application_no,
             CASE WHEN a.mobile LIKE '+234%%' THEN a.mobile
                  WHEN a.mobile LIKE '234%%' THEN CONCAT('+', a.mobile)
@@ -2980,7 +3266,11 @@ def _select_disbursed_application_source_since(
           AND a.id > %s AND a.id <= %s
         ORDER BY a.id ASC
     """
+    if limit:
+        sql = sql.rstrip() + "\n        LIMIT %s\n    "
     params: List[Any] = list(exclude_app_ids) + [since_unix, lo, hi]
+    if limit:
+        params.append(int(limit))
     with src.cursor() as cur:
         cur.execute(sql, params)
         return list(cur.fetchall())
@@ -3022,21 +3312,25 @@ def build_expected_loan_rows(
     exclude_app_ids: Tuple[int, ...],
     vt: mig.VtTokenResolver,
     logger: ReconcileLogger,
+    limit: Optional[int] = None,
 ) -> Tuple[List[dict], Dict[str, int]]:
     stats = {
         "source_rows": 0, "vt_skip": 0, "no_core_sn": 0,
-        "no_application_no": 0, "built": 0,
+        "no_application_no": 0, "built": 0, "last_id": lo,
     }
     raw_rows = _select_disbursed_application_source_since(
-        src, lo, hi, since_unix, exclude_app_ids,
+        src, lo, hi, since_unix, exclude_app_ids, limit=limit,
     )
     stats["source_rows"] = len(raw_rows)
     if not raw_rows:
         return [], stats
+    stats["last_id"] = int(raw_rows[-1].get("src_id") or lo)
 
     user_ids = [int(r["user_id"]) for r in raw_rows]
-    sns = [str(r["application_no"]) for r in raw_rows if r.get("application_no")]
-    bvn_map, _repay_map = mig._fetch_app_lookup_maps(cfg, src, user_ids, sns)
+    # loan 只要 bvn（VT 过滤）；repay_map 无用，跳过源库 repay 查询
+    bvn_map, _repay_map = mig._fetch_app_lookup_maps(
+        cfg, src, user_ids, [], need_repay=False,
+    )
     mig._register_app_batch_vt(vt, raw_rows, bvn_map)
     vt.prefetch()
 
@@ -3093,17 +3387,20 @@ def _plan_loan_span(
     }
     plan: List[dict] = []
     try:
-        lo = span_lo
-        while lo < span_hi:
-            hi = min(lo + source_batch, span_hi)
+        last_id = span_lo
+        while last_id < span_hi:
             stats["source_batches"] += 1
             expected_rows, batch_stats = build_expected_loan_rows(
-                cfg, src, lo, hi, since_unix, exclude_app_ids, vt, logger,
+                cfg, src, last_id, span_hi, since_unix, exclude_app_ids, vt, logger,
+                limit=source_batch,
             )
+            nsrc = int(batch_stats.get("source_rows") or 0)
+            if nsrc <= 0:
+                break
             stats["vt_skip"] += batch_stats.get("vt_skip", 0)
             stats["no_core_sn"] += batch_stats.get("no_core_sn", 0)
             stats["no_application_no"] += batch_stats.get("no_application_no", 0)
-            stats["source_total"] += batch_stats.get("source_rows", 0)
+            stats["source_total"] += nsrc
             for exp in expected_rows:
                 pk = loan_key(exp)
                 actual = target_by_key.get(pk)
@@ -3125,7 +3422,9 @@ def _plan_loan_span(
                     "diff": diff,
                     "row": exp,
                 })
-            lo = hi
+            last_id = int(batch_stats.get("last_id") or last_id)
+            if nsrc < source_batch:
+                break
     finally:
         mig._close_mysql_conn(src)
     return plan, stats
@@ -3211,6 +3510,7 @@ def run_loan_reconcile(args: argparse.Namespace, cfg: Dict[str, Any]) -> int:
     )
 
     if phase in ("plan", "all"):
+        tune_source_lookup_parallel(cfg, getattr(args, "source_workers", 8), logger)
         setup_preloads(cfg, logger, args.vt_preload)
 
     target_by_key: Dict[Tuple[Any, ...], dict] = {}
@@ -3349,6 +3649,7 @@ def run_all_tables(args: argparse.Namespace, cfg: Dict[str, Any]) -> int:
         )
     )
     # 先一次性预加载，后续各表 setup_preloads 走 reuse
+    tune_source_lookup_parallel(cfg, getattr(args, "source_workers", 8), master)
     if args.vt_preload or cfg.get("lup_preload", True):
         setup_preloads(cfg, master, args.vt_preload)
 
