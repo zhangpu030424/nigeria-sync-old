@@ -7,7 +7,7 @@
   - 目标库先并行加载到内存（可落盘 cache）
   - 源库按时间窗口拉取（默认 2026-01-01 起）
   - VT 字段：命中写 token，未命中跳过并记日志
-  - 一致跳过；缺失或字段不一致 → plan → apply（insert=INSERT，update=UPDATE WHERE 主键）
+  - 一致跳过；缺失或字段不一致 → plan → apply（insert=INSERT，update=JOIN 批量 UPDATE）
 
 目标库业务表 PK（与生产 DDL 一致）：
   user          PK (mobile, app_id, closed_time)     closed_time 毫秒 ms
@@ -19,7 +19,7 @@
   loan          PK (application_no, period, roll_sequence)  partition by application_no
                 idx loan_no（非主键；loan_no 可随 update 修正）
 
-  apply：insert=INSERT；update=UPDATE WHERE 表主键
+  apply：insert=INSERT；update=UPDATE JOIN (UNION ALL) WHERE 表主键（一批一条 SQL）
         默认 load=16 / source-workers=8 / source-batch=20000；apply 24 线程、每批 1000
 
 Usage:
@@ -39,6 +39,7 @@ import argparse
 import json
 import multiprocessing
 import os
+import random
 import sys
 import time
 import threading
@@ -1188,6 +1189,114 @@ def plan_user_table(
     return _run_parallel_id_spans(spans, workers, _shard, logger, "plan user")
 
 
+def _bulk_update_rows_by_pk_rowwise(
+    conn,
+    cfg: Dict[str, Any],
+    table: str,
+    pk_cols: Sequence[str],
+    update_cols: Sequence[str],
+    rows: List[dict],
+) -> Tuple[Any, int]:
+    """逐条 UPDATE（慢路径，仅 JOIN 批量失败时回退）。"""
+    if not rows or not update_cols:
+        return conn, 0
+    where_sql = " AND ".join(f"{mig._quote_col(c)}=%s" for c in pk_cols)
+    set_sql = ", ".join(f"{mig._quote_col(c)}=%s" for c in update_cols)
+    sql = f"UPDATE `{table}` SET {set_sql} WHERE {where_sql}"
+    affected = 0
+    for row in rows:
+        params = [row.get(c) for c in update_cols] + [row.get(c) for c in pk_cols]
+        conn = mig._ensure_mysql_conn(conn, cfg, "target")
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            affected += int(cur.rowcount or 0)
+    return conn, affected
+
+
+def _is_update_packet_too_large(exc: BaseException) -> bool:
+    if not isinstance(exc, pymysql.err.OperationalError) or not exc.args:
+        return False
+    code = exc.args[0]
+    # 1153 packet too large; 1390 too many placeholders
+    return code in (1153, 1390)
+
+
+def _bulk_update_one_join(
+    conn,
+    cfg: Dict[str, Any],
+    table: str,
+    pk_cols: Sequence[str],
+    update_cols: Sequence[str],
+    batch: List[dict],
+) -> Tuple[Any, int]:
+    """一批合成一条 UPDATE t JOIN (SELECT ... UNION ALL ...) x ON pk。"""
+    if not batch:
+        return conn, 0
+    # MySQL 要求 SELECT 列唯一；主键列放前，再拼更新列
+    select_cols: List[str] = []
+    seen = set()
+    for c in list(pk_cols) + list(update_cols):
+        if c in seen:
+            continue
+        seen.add(c)
+        select_cols.append(c)
+    one = "SELECT " + ", ".join(
+        "%s AS {0}".format(mig._quote_col(c)) for c in select_cols
+    )
+    derived = " UNION ALL ".join([one] * len(batch))
+    on_sql = " AND ".join(
+        "t.{0}=x.{0}".format(mig._quote_col(c)) for c in pk_cols
+    )
+    set_sql = ", ".join(
+        "t.{0}=x.{0}".format(mig._quote_col(c)) for c in update_cols
+    )
+    sql = (
+        "UPDATE `{0}` t INNER JOIN ({1}) x ON {2} SET {3}".format(
+            table, derived, on_sql, set_sql
+        )
+    )
+    params: List[Any] = []
+    for row in batch:
+        for c in select_cols:
+            params.append(row.get(c))
+
+    last_exc: Optional[BaseException] = None
+    for attempt in range(2):
+        try:
+            conn = mig._ensure_mysql_conn(conn, cfg, "target")
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                return conn, int(cur.rowcount or 0)
+        except Exception as exc:
+            last_exc = exc
+            if attempt == 0 and mig._is_transient_insert_error(exc):
+                conn = mig._reconnect_mysql(conn, cfg, "target")
+                time.sleep(0.1 + random.uniform(0, 0.05))
+                continue
+            break
+
+    assert last_exc is not None
+    # 包过大：对半拆；再不行逐行
+    if _is_update_packet_too_large(last_exc) and len(batch) > 1:
+        mid = len(batch) // 2
+        conn, n1 = _bulk_update_one_join(
+            conn, cfg, table, pk_cols, update_cols, batch[:mid],
+        )
+        conn, n2 = _bulk_update_one_join(
+            conn, cfg, table, pk_cols, update_cols, batch[mid:],
+        )
+        return conn, n1 + n2
+    if len(batch) > 1:
+        # 其它错误（死锁、临时唯一冲突等）回退逐行，尽量写完本批
+        try:
+            return _bulk_update_rows_by_pk_rowwise(
+                conn, cfg, table, pk_cols, update_cols, batch,
+            )
+        except Exception:
+            raise last_exc
+    raise last_exc
+
+
 def _bulk_update_rows_by_pk(
     conn,
     cfg: Dict[str, Any],
@@ -1197,24 +1306,17 @@ def _bulk_update_rows_by_pk(
     rows: List[dict],
     batch_size: int,
 ) -> Tuple[Any, int]:
-    """UPDATE ... SET ... WHERE 主键条件（不用 upsert）。"""
+    """按主键批量 UPDATE：每批一条 JOIN/UNION ALL（不用逐条 executemany）。"""
     if not rows or not update_cols:
         return conn, 0
-    where_sql = " AND ".join(f"{mig._quote_col(c)}=%s" for c in pk_cols)
-    set_sql = ", ".join(f"{mig._quote_col(c)}=%s" for c in update_cols)
-    sql = f"UPDATE `{table}` SET {set_sql} WHERE {where_sql}"
-    affected = 0
     batch_size = max(1, int(batch_size))
+    affected = 0
     for i in range(0, len(rows), batch_size):
         batch = rows[i:i + batch_size]
-        params = [
-            [row.get(c) for c in update_cols] + [row.get(c) for c in pk_cols]
-            for row in batch
-        ]
-        conn = mig._ensure_mysql_conn(conn, cfg, "target")
-        with conn.cursor() as cur:
-            cur.executemany(sql, params)
-            affected += int(cur.rowcount or 0)
+        conn, n = _bulk_update_one_join(
+            conn, cfg, table, pk_cols, update_cols, batch,
+        )
+        affected += n
     return conn, affected
 
 
