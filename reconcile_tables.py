@@ -46,6 +46,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+import pymysql
 import ng_migration_run as mig
 
 HERE = Path(__file__).resolve().parent
@@ -392,6 +393,49 @@ def _target_cols_sql(columns: Sequence[str]) -> str:
     return ", ".join(f"`{c}`" for c in columns)
 
 
+def _is_mysql_lost_conn(exc: BaseException) -> bool:
+    if isinstance(exc, (pymysql.err.OperationalError, pymysql.err.InterfaceError)):
+        code = exc.args[0] if exc.args else None
+        if code in (0, 2006, 2013, 2014, 2055):
+            return True
+        msg = str(exc).lower()
+        return "lost connection" in msg or "gone away" in msg
+    return False
+
+
+def _probe_max_user_id(
+    env_path: Path,
+    table: str,
+    max_user_id: int,
+    exclude_app_ids: Tuple[int, ...] = (),
+) -> int:
+    """查实际 MAX(user_id)，避免按 1 亿空段切分。"""
+    cfg = _worker_load_env(str(env_path))
+    tgt = mig.connect_target(cfg)
+    try:
+        exclude_sql = ""
+        params = [max_user_id]  # type: List[Any]
+        if table == "user" and exclude_app_ids:
+            ex_ph = ",".join(["%s"] * len(exclude_app_ids))
+            exclude_sql = "AND app_id NOT IN ({0})".format(ex_ph)
+            params.extend(exclude_app_ids)
+        with tgt.cursor() as cur:
+            cur.execute(
+                """
+                SELECT MAX(user_id) AS max_id
+                FROM `{table}`
+                WHERE user_id < %s
+                  {exclude_sql}
+                """.format(table=table, exclude_sql=exclude_sql),
+                params,
+            )
+            row = cur.fetchone() or {}
+        actual = int(row.get("max_id") or 0)
+        return max(0, min(actual + 1, max_user_id))
+    finally:
+        tgt.close()
+
+
 def _load_target_shard(spec: dict) -> Tuple[int, List[dict], Dict[str, int]]:
     worker_id = int(spec["worker_id"])
     workers = int(spec["workers"])
@@ -399,50 +443,80 @@ def _load_target_shard(spec: dict) -> Tuple[int, List[dict], Dict[str, int]]:
     page_size = int(spec["page_size"])
     env_path = str(spec["env_path"])
     table = str(spec["table"])
-    columns: List[str] = list(spec["columns"])
+    columns = list(spec["columns"])  # type: List[str]
     cols_sql = spec["cols_sql"]
-    exclude_app_ids: Tuple[int, ...] = tuple(spec.get("exclude_app_ids") or ())
+    exclude_app_ids = tuple(spec.get("exclude_app_ids") or ())  # type: Tuple[int, ...]
+    lo = int(spec.get("range_lo", 0))
+    hi = int(spec.get("range_hi", max_uid))
 
-    label = f"[target {table} {worker_id}/{workers}]"
+    label = "[target {0} {1}/{2}]".format(table, worker_id, workers)
     stats = {"scanned": 0}
-    rows: List[dict] = []
+    rows = []  # type: List[dict]
 
     cfg = _worker_load_env(env_path)
     tgt = mig.connect_target(cfg)
-    # MOD(user_id) 分片：数据在低段也不会只压在一个 worker
-    last_id = 0
-    shard = worker_id - 1
-    # user 表有 app_id：SQL 直接排除，少扫少传更快；user_info 无 app_id 不加此条件
+    last_id = max(0, lo - 1)
     exclude_sql = ""
-    exclude_params: List[Any] = []
+    exclude_params = []  # type: List[Any]
     if table == "user" and exclude_app_ids:
         ex_ph = ",".join(["%s"] * len(exclude_app_ids))
-        exclude_sql = f"AND app_id NOT IN ({ex_ph})"
+        exclude_sql = "AND app_id NOT IN ({0})".format(ex_ph)
         exclude_params = list(exclude_app_ids)
+    max_retries = max(3, int(cfg.get("mysql_batch_retries") or 6))
     t0 = time.time()
     print(
-        f"{label} load start max_user_id={max_uid} "
-        f"MOD(user_id,{workers})={shard} page_size={page_size} "
-        f"exclude_app_ids={exclude_app_ids if table == 'user' else '()'}",
+        "{0} load start range=[{1},{2}) page_size={3} exclude_app_ids={4}".format(
+            label, lo, hi, page_size,
+            exclude_app_ids if table == "user" else (),
+        ),
         flush=True,
     )
     try:
         while True:
-            with tgt.cursor() as cur:
-                cur.execute(
-                    f"""
-                    SELECT {cols_sql}
-                    FROM `{table}`
-                    WHERE user_id > %s
-                      AND user_id < %s
-                      AND MOD(user_id, %s) = %s
-                      {exclude_sql}
-                    ORDER BY user_id ASC
-                    LIMIT %s
-                    """,
-                    (last_id, max_uid, workers, shard, *exclude_params, page_size),
-                )
-                batch = cur.fetchall()
+            batch = None
+            last_exc = None  # type: Optional[BaseException]
+            for attempt in range(max_retries):
+                try:
+                    try:
+                        tgt.ping(reconnect=True)
+                    except Exception:
+                        mig._close_mysql_conn(tgt)
+                        tgt = mig.connect_target(cfg)
+                    with tgt.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT {cols_sql}
+                            FROM `{table}`
+                            WHERE user_id > %s
+                              AND user_id >= %s AND user_id < %s
+                              {exclude_sql}
+                            ORDER BY user_id ASC
+                            LIMIT %s
+                            """.format(
+                                cols_sql=cols_sql, table=table, exclude_sql=exclude_sql,
+                            ),
+                            (last_id, lo, hi) + tuple(exclude_params) + (page_size,),
+                        )
+                        batch = cur.fetchall()
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    if not _is_mysql_lost_conn(exc) or attempt >= max_retries - 1:
+                        raise
+                    delay = min(8.0, 0.5 * (2 ** attempt))
+                    print(
+                        "{0} mysql lost conn retry {1}/{2} sleep={3:.1f}s err={4}".format(
+                            label, attempt + 1, max_retries, delay, exc,
+                        ),
+                        flush=True,
+                    )
+                    mig._close_mysql_conn(tgt)
+                    time.sleep(delay)
+                    tgt = mig.connect_target(cfg)
+            if batch is None:
+                if last_exc is not None:
+                    raise last_exc
+                break
             if not batch:
                 break
             for row in batch:
@@ -451,16 +525,17 @@ def _load_target_shard(spec: dict) -> Tuple[int, List[dict], Dict[str, int]]:
             stats["scanned"] = len(rows)
             if stats["scanned"] % 100_000 < page_size:
                 print(
-                    f"{label} progress rows={stats['scanned']} last_id={last_id} "
-                    f"elapsed={time.time()-t0:.1f}s",
+                    "{0} progress rows={1} last_id={2} elapsed={3:.1f}s".format(
+                        label, stats["scanned"], last_id, time.time() - t0,
+                    ),
                     flush=True,
                 )
             if len(batch) < page_size:
                 break
     finally:
-        tgt.close()
+        mig._close_mysql_conn(tgt)
     print(
-        f"{label} done rows={len(rows)} elapsed={time.time()-t0:.1f}s",
+        "{0} done rows={1} elapsed={2:.1f}s".format(label, len(rows), time.time() - t0),
         flush=True,
     )
     return worker_id, rows, stats
@@ -478,26 +553,43 @@ def parallel_load_target_by_user_id(
 ) -> Dict[int, dict]:
     workers = max(1, min(load_workers, 32))
     cols_sql = _target_cols_sql(columns)
-    specs = [
-        {
-            "worker_id": i + 1,
-            "workers": workers,
-            "max_user_id": max_user_id,
-            "page_size": page_size,
-            "env_path": str(env_path.resolve()),
-            "table": table,
-            "columns": list(columns),
-            "cols_sql": cols_sql,
-            "exclude_app_ids": list(exclude_app_ids),
-        }
-        for i in range(workers)
-    ]
     logger.log(
-        f"load target {table}: workers={workers} max_user_id={max_user_id} "
-        f"page_size={page_size} exclude_app_ids={exclude_app_ids}"
+        "probe max user_id table={0} cap={1} exclude_app_ids={2}".format(
+            table, max_user_id, exclude_app_ids,
+        )
     )
+    effective_max = _probe_max_user_id(
+        env_path, table, max_user_id, exclude_app_ids=exclude_app_ids,
+    )
+    if effective_max <= 0:
+        logger.log("load target {0}: no rows (max_user_id probe=0)".format(table))
+        return {}
+    logger.log(
+        "load target {0}: workers={1} id_range=[0,{2}) page_size={3} exclude_app_ids={4}".format(
+            table, workers, effective_max, page_size, exclude_app_ids,
+        )
+    )
+    specs = []
+    for i in range(workers):
+        lo = (effective_max * i) // workers
+        hi = (effective_max * (i + 1)) // workers
+        specs.append(
+            {
+                "worker_id": i + 1,
+                "workers": workers,
+                "max_user_id": max_user_id,
+                "range_lo": lo,
+                "range_hi": hi,
+                "page_size": page_size,
+                "env_path": str(env_path.resolve()),
+                "table": table,
+                "columns": list(columns),
+                "cols_sql": cols_sql,
+                "exclude_app_ids": list(exclude_app_ids),
+            }
+        )
     t0 = time.time()
-    merged: Dict[int, dict] = {}
+    merged = {}  # type: Dict[int, dict]
     if workers == 1:
         _, rows, _ = _load_target_shard(specs[0])
         for row in rows:
@@ -510,7 +602,9 @@ def parallel_load_target_by_user_id(
             for row in chunk:
                 merged[int(row["user_id"])] = row
     logger.log(
-        f"load target {table} done rows={len(merged)} elapsed={time.time()-t0:.1f}s"
+        "load target {0} done rows={1} elapsed={2:.1f}s".format(
+            table, len(merged), time.time() - t0,
+        )
     )
     return merged
 
@@ -523,6 +617,26 @@ def product_key(row: dict) -> Tuple[int, str]:
     return (int(row["group_user_id"]), str(row["product_id"]))
 
 
+def _probe_max_group_user_id(env_path: Path, table: str, max_gid: int) -> int:
+    cfg = _worker_load_env(str(env_path))
+    tgt = mig.connect_target(cfg)
+    try:
+        with tgt.cursor() as cur:
+            cur.execute(
+                """
+                SELECT MAX(group_user_id) AS max_id
+                FROM `{0}`
+                WHERE group_user_id < %s
+                """.format(table),
+                (max_gid,),
+            )
+            row = cur.fetchone() or {}
+        actual = int(row.get("max_id") or 0)
+        return max(0, min(actual + 1, max_gid))
+    finally:
+        tgt.close()
+
+
 def _load_target_group_user_shard(spec: dict) -> Tuple[int, List[dict], Dict[str, int]]:
     worker_id = int(spec["worker_id"])
     workers = int(spec["workers"])
@@ -530,40 +644,70 @@ def _load_target_group_user_shard(spec: dict) -> Tuple[int, List[dict], Dict[str
     page_size = int(spec["page_size"])
     env_path = str(spec["env_path"])
     table = str(spec["table"])
-    columns: List[str] = list(spec["columns"])
+    columns = list(spec["columns"])  # type: List[str]
     cols_sql = spec["cols_sql"]
     order_tail = str(spec.get("order_tail") or "group_user_id ASC")
+    lo = int(spec.get("range_lo", 0))
+    hi = int(spec.get("range_hi", max_gid))
 
-    label = f"[target {table} gid {worker_id}/{workers}]"
+    label = "[target {0} gid {1}/{2}]".format(table, worker_id, workers)
     stats = {"scanned": 0}
-    rows: List[dict] = []
+    rows = []  # type: List[dict]
 
     cfg = _worker_load_env(env_path)
     tgt = mig.connect_target(cfg)
-    last_gid = 0
-    shard = worker_id - 1
+    last_gid = max(0, lo - 1)
+    max_retries = max(3, int(cfg.get("mysql_batch_retries") or 6))
     t0 = time.time()
     print(
-        f"{label} load start max_gid={max_gid} "
-        f"MOD(group_user_id,{workers})={shard} page_size={page_size}",
+        "{0} load start range=[{1},{2}) page_size={3}".format(label, lo, hi, page_size),
         flush=True,
     )
     try:
         while True:
-            with tgt.cursor() as cur:
-                cur.execute(
-                    f"""
-                    SELECT {cols_sql}
-                    FROM `{table}`
-                    WHERE group_user_id > %s
-                      AND group_user_id < %s
-                      AND MOD(group_user_id, %s) = %s
-                    ORDER BY {order_tail}
-                    LIMIT %s
-                    """,
-                    (last_gid, max_gid, workers, shard, page_size),
-                )
-                batch = cur.fetchall()
+            batch = None
+            last_exc = None  # type: Optional[BaseException]
+            for attempt in range(max_retries):
+                try:
+                    try:
+                        tgt.ping(reconnect=True)
+                    except Exception:
+                        mig._close_mysql_conn(tgt)
+                        tgt = mig.connect_target(cfg)
+                    with tgt.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT {cols_sql}
+                            FROM `{table}`
+                            WHERE group_user_id > %s
+                              AND group_user_id >= %s AND group_user_id < %s
+                            ORDER BY {order_tail}
+                            LIMIT %s
+                            """.format(
+                                cols_sql=cols_sql, table=table, order_tail=order_tail,
+                            ),
+                            (last_gid, lo, hi, page_size),
+                        )
+                        batch = cur.fetchall()
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    if not _is_mysql_lost_conn(exc) or attempt >= max_retries - 1:
+                        raise
+                    delay = min(8.0, 0.5 * (2 ** attempt))
+                    print(
+                        "{0} mysql lost conn retry {1}/{2} sleep={3:.1f}s err={4}".format(
+                            label, attempt + 1, max_retries, delay, exc,
+                        ),
+                        flush=True,
+                    )
+                    mig._close_mysql_conn(tgt)
+                    time.sleep(delay)
+                    tgt = mig.connect_target(cfg)
+            if batch is None:
+                if last_exc is not None:
+                    raise last_exc
+                break
             if not batch:
                 break
             for row in batch:
@@ -572,16 +716,17 @@ def _load_target_group_user_shard(spec: dict) -> Tuple[int, List[dict], Dict[str
             stats["scanned"] = len(rows)
             if stats["scanned"] % 100_000 < page_size:
                 print(
-                    f"{label} progress rows={stats['scanned']} last_gid={last_gid} "
-                    f"elapsed={time.time()-t0:.1f}s",
+                    "{0} progress rows={1} last_gid={2} elapsed={3:.1f}s".format(
+                        label, stats["scanned"], last_gid, time.time() - t0,
+                    ),
                     flush=True,
                 )
             if len(batch) < page_size:
                 break
     finally:
-        tgt.close()
+        mig._close_mysql_conn(tgt)
     print(
-        f"{label} done rows={len(rows)} elapsed={time.time()-t0:.1f}s",
+        "{0} done rows={1} elapsed={2:.1f}s".format(label, len(rows), time.time() - t0),
         flush=True,
     )
     return worker_id, rows, stats
@@ -599,44 +744,55 @@ def parallel_load_target_by_group_user_id(
 ) -> Dict[Tuple[Any, ...], dict]:
     workers = max(1, min(load_workers, 32))
     cols_sql = _target_cols_sql(columns)
-    specs = [
-        {
-            "worker_id": i + 1,
-            "workers": workers,
-            "max_group_user_id": max_group_user_id,
-            "page_size": page_size,
-            "env_path": str(env_path.resolve()),
-            "table": table,
-            "columns": list(columns),
-            "cols_sql": cols_sql,
-            "order_tail": order_tail,
-        }
-        for i in range(workers)
-    ]
+    logger.log("probe max group_user_id table={0} cap={1}".format(table, max_group_user_id))
+    effective_max = _probe_max_group_user_id(env_path, table, max_group_user_id)
+    if effective_max <= 0:
+        logger.log("load target {0}: no rows".format(table))
+        return {}
     logger.log(
-        f"load target {table}: workers={workers} group_user_id<{max_group_user_id} "
-        f"page_size={page_size}"
+        "load target {0}: workers={1} group_user_id_range=[0,{2}) page_size={3}".format(
+            table, workers, effective_max, page_size,
+        )
     )
+    specs = []
+    for i in range(workers):
+        lo = (effective_max * i) // workers
+        hi = (effective_max * (i + 1)) // workers
+        specs.append(
+            {
+                "worker_id": i + 1,
+                "workers": workers,
+                "max_group_user_id": max_group_user_id,
+                "range_lo": lo,
+                "range_hi": hi,
+                "page_size": page_size,
+                "env_path": str(env_path.resolve()),
+                "table": table,
+                "columns": list(columns),
+                "cols_sql": cols_sql,
+                "order_tail": order_tail,
+            }
+        )
     t0 = time.time()
-    merged: Dict[Tuple[Any, ...], dict] = {}
+    merged = {}  # type: Dict[Tuple[Any, ...], dict]
+    key_fn = bankcard_key if table == "user_bankcard" else product_key
     if workers == 1:
-        _, rows, _ = _load_target_group_user_shard(specs[0])
-        key_fn = bankcard_key if table == "user_bankcard" else product_key
-        for row in rows:
+        _, chunk, _ = _load_target_group_user_shard(specs[0])
+        for row in chunk:
             merged[key_fn(row)] = row
     else:
         ctx = multiprocessing.get_context("spawn")
         with ctx.Pool(processes=workers) as pool:
             parts = pool.map(_load_target_group_user_shard, specs)
-        key_fn = bankcard_key if table == "user_bankcard" else product_key
         for _, chunk, _ in sorted(parts, key=lambda x: x[0]):
             for row in chunk:
                 merged[key_fn(row)] = row
     logger.log(
-        f"load target {table} done rows={len(merged)} elapsed={time.time()-t0:.1f}s"
+        "load target {0} done rows={1} elapsed={2:.1f}s".format(
+            table, len(merged), time.time() - t0,
+        )
     )
     return merged
-
 
 def parallel_load_target_users(
     cfg: Dict[str, Any],
