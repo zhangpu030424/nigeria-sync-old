@@ -401,18 +401,31 @@ def _load_target_shard(spec: dict) -> Tuple[int, List[dict], Dict[str, int]]:
     table = str(spec["table"])
     columns: List[str] = list(spec["columns"])
     cols_sql = spec["cols_sql"]
+    exclude_app_ids: Tuple[int, ...] = tuple(spec.get("exclude_app_ids") or ())
 
-    lo = (max_uid * (worker_id - 1)) // workers
-    hi = (max_uid * worker_id) // workers
     label = f"[target {table} {worker_id}/{workers}]"
     stats = {"scanned": 0}
     rows: List[dict] = []
 
     cfg = _worker_load_env(env_path)
     tgt = mig.connect_target(cfg)
-    last_id = max(0, lo - 1)
+    # MOD(user_id) 分片：数据在低段也不会只压在一个 worker
+    last_id = 0
+    shard = worker_id - 1
+    # user 表有 app_id：SQL 直接排除，少扫少传更快；user_info 无 app_id 不加此条件
+    exclude_sql = ""
+    exclude_params: List[Any] = []
+    if table == "user" and exclude_app_ids:
+        ex_ph = ",".join(["%s"] * len(exclude_app_ids))
+        exclude_sql = f"AND app_id NOT IN ({ex_ph})"
+        exclude_params = list(exclude_app_ids)
     t0 = time.time()
-    print(f"{label} load range [{lo},{hi}) start", flush=True)
+    print(
+        f"{label} load start max_user_id={max_uid} "
+        f"MOD(user_id,{workers})={shard} page_size={page_size} "
+        f"exclude_app_ids={exclude_app_ids if table == 'user' else '()'}",
+        flush=True,
+    )
     try:
         while True:
             with tgt.cursor() as cur:
@@ -421,12 +434,13 @@ def _load_target_shard(spec: dict) -> Tuple[int, List[dict], Dict[str, int]]:
                     SELECT {cols_sql}
                     FROM `{table}`
                     WHERE user_id > %s
-                      AND user_id >= %s AND user_id < %s
                       AND user_id < %s
+                      AND MOD(user_id, %s) = %s
+                      {exclude_sql}
                     ORDER BY user_id ASC
                     LIMIT %s
                     """,
-                    (last_id, lo, hi, max_uid, page_size),
+                    (last_id, max_uid, workers, shard, *exclude_params, page_size),
                 )
                 batch = cur.fetchall()
             if not batch:
@@ -435,7 +449,7 @@ def _load_target_shard(spec: dict) -> Tuple[int, List[dict], Dict[str, int]]:
                 rows.append({k: row[k] for k in columns})
             last_id = int(batch[-1]["user_id"])
             stats["scanned"] = len(rows)
-            if stats["scanned"] % 200_000 < page_size:
+            if stats["scanned"] % 100_000 < page_size:
                 print(
                     f"{label} progress rows={stats['scanned']} last_id={last_id} "
                     f"elapsed={time.time()-t0:.1f}s",
@@ -460,6 +474,7 @@ def parallel_load_target_by_user_id(
     load_workers: int,
     page_size: int,
     logger: ReconcileLogger,
+    exclude_app_ids: Tuple[int, ...] = (),
 ) -> Dict[int, dict]:
     workers = max(1, min(load_workers, 32))
     cols_sql = _target_cols_sql(columns)
@@ -473,12 +488,13 @@ def parallel_load_target_by_user_id(
             "table": table,
             "columns": list(columns),
             "cols_sql": cols_sql,
+            "exclude_app_ids": list(exclude_app_ids),
         }
         for i in range(workers)
     ]
     logger.log(
         f"load target {table}: workers={workers} max_user_id={max_user_id} "
-        f"page_size={page_size}"
+        f"page_size={page_size} exclude_app_ids={exclude_app_ids}"
     )
     t0 = time.time()
     merged: Dict[int, dict] = {}
@@ -518,17 +534,20 @@ def _load_target_group_user_shard(spec: dict) -> Tuple[int, List[dict], Dict[str
     cols_sql = spec["cols_sql"]
     order_tail = str(spec.get("order_tail") or "group_user_id ASC")
 
-    lo = (max_gid * (worker_id - 1)) // workers
-    hi = (max_gid * worker_id) // workers
     label = f"[target {table} gid {worker_id}/{workers}]"
     stats = {"scanned": 0}
     rows: List[dict] = []
 
     cfg = _worker_load_env(env_path)
     tgt = mig.connect_target(cfg)
-    last_gid = max(0, lo - 1)
+    last_gid = 0
+    shard = worker_id - 1
     t0 = time.time()
-    print(f"{label} load range [{lo},{hi}) start", flush=True)
+    print(
+        f"{label} load start max_gid={max_gid} "
+        f"MOD(group_user_id,{workers})={shard} page_size={page_size}",
+        flush=True,
+    )
     try:
         while True:
             with tgt.cursor() as cur:
@@ -537,12 +556,12 @@ def _load_target_group_user_shard(spec: dict) -> Tuple[int, List[dict], Dict[str
                     SELECT {cols_sql}
                     FROM `{table}`
                     WHERE group_user_id > %s
-                      AND group_user_id >= %s AND group_user_id < %s
                       AND group_user_id < %s
+                      AND MOD(group_user_id, %s) = %s
                     ORDER BY {order_tail}
                     LIMIT %s
                     """,
-                    (last_gid, lo, hi, max_gid, page_size),
+                    (last_gid, max_gid, workers, shard, page_size),
                 )
                 batch = cur.fetchall()
             if not batch:
@@ -551,7 +570,7 @@ def _load_target_group_user_shard(spec: dict) -> Tuple[int, List[dict], Dict[str
                 rows.append({k: row[k] for k in columns})
             last_gid = int(batch[-1]["group_user_id"])
             stats["scanned"] = len(rows)
-            if stats["scanned"] % 200_000 < page_size:
+            if stats["scanned"] % 100_000 < page_size:
                 print(
                     f"{label} progress rows={stats['scanned']} last_gid={last_gid} "
                     f"elapsed={time.time()-t0:.1f}s",
@@ -626,9 +645,11 @@ def parallel_load_target_users(
     load_workers: int,
     page_size: int,
     logger: ReconcileLogger,
+    exclude_app_ids: Tuple[int, ...] = DEFAULT_EXCLUDE_APP_IDS,
 ) -> Dict[Tuple[Any, ...], dict]:
     by_uid = parallel_load_target_by_user_id(
-        env_path, "user", mig.USER_INSERT_COLS, max_user_id, load_workers, page_size, logger,
+        env_path, "user", mig.USER_INSERT_COLS, max_user_id,
+        load_workers, page_size, logger, exclude_app_ids=exclude_app_ids,
     )
     merged: Dict[Tuple[Any, ...], dict] = {}
     for row in by_uid.values():
@@ -643,8 +664,11 @@ def _select_source_users_since(
     lo: int,
     hi: int,
     max_user_id: int,
+    exclude_app_ids: Tuple[int, ...] = DEFAULT_EXCLUDE_APP_IDS,
 ) -> List[dict]:
     m = "ng_loan_market"
+    ex_ph = ",".join(["%s"] * len(exclude_app_ids)) if exclude_app_ids else ""
+    exclude_sql = f"AND u.`appId` NOT IN ({ex_ph})" if exclude_app_ids else ""
     sql = f"""
         SELECT
             u.id AS user_id, u.`appId` AS app_id,
@@ -665,25 +689,36 @@ def _select_source_users_since(
         WHERE u.created >= %s
           AND u.id > %s AND u.id <= %s
           AND u.id < %s
+          {exclude_sql}
         ORDER BY u.id ASC
     """
+    params: List[Any] = [since_date, lo, hi, max_user_id]
+    if exclude_app_ids:
+        params.extend(exclude_app_ids)
     with src.cursor() as cur:
-        cur.execute(sql, (since_date, lo, hi, max_user_id))
+        cur.execute(sql, params)
         return list(cur.fetchall())
 
 
 def _source_user_id_bounds(
-    src, since_date: str, max_user_id: int
+    src,
+    since_date: str,
+    max_user_id: int,
+    exclude_app_ids: Tuple[int, ...] = DEFAULT_EXCLUDE_APP_IDS,
 ) -> Tuple[int, int, int]:
     m = "ng_loan_market"
+    ex_ph = ",".join(["%s"] * len(exclude_app_ids)) if exclude_app_ids else ""
+    exclude_sql = f"AND u.`appId` NOT IN ({ex_ph})" if exclude_app_ids else ""
     with src.cursor() as cur:
         cur.execute(
             f"""
             SELECT MIN(u.id) AS min_id, MAX(u.id) AS max_id, COUNT(*) AS cnt
             FROM {m}.`user` u
             WHERE u.created >= %s AND u.id < %s
+              {exclude_sql}
             """,
-            (since_date, max_user_id),
+            (since_date, max_user_id, *exclude_app_ids) if exclude_app_ids
+            else (since_date, max_user_id),
         )
         row = cur.fetchone() or {}
     min_id = int(row.get("min_id") or 0)
@@ -1087,16 +1122,27 @@ def load_or_build_target_cache(
         logger.log(f"load target from cache {cache_path}")
         t0 = time.time()
         target_by_key: Dict[Any, dict] = {}
+        skipped = 0
+        exclude_set = set(DEFAULT_EXCLUDE_APP_IDS) if table == "user" else set()
         for row in read_jsonl(cache_path):
+            if exclude_set:
+                try:
+                    if int(row.get("app_id") or 0) in exclude_set:
+                        skipped += 1
+                        continue
+                except (TypeError, ValueError):
+                    pass
             target_by_key[key_fn(row)] = row
         logger.log(
-            f"cache loaded rows={len(target_by_key)} elapsed={time.time()-t0:.1f}s"
+            f"cache loaded rows={len(target_by_key)} skipped_excluded_app={skipped} "
+            f"elapsed={time.time()-t0:.1f}s"
         )
         return target_by_key
 
     if loader is None:
         target_by_key = parallel_load_target_by_user_id(
             env_path, table, columns, max_user_id, load_workers, page_size, logger,
+            exclude_app_ids=DEFAULT_EXCLUDE_APP_IDS if table == "user" else (),
         )
         if table == "user":
             target_by_key = {user_key(row): row for row in target_by_key.values()}
@@ -1805,16 +1851,17 @@ def _load_target_application_shard(spec: dict) -> Tuple[int, List[dict], Dict[st
     exclude_app_ids: Tuple[int, ...] = tuple(spec["exclude_app_ids"])
 
     label = f"[target application {worker_id}/{workers}]"
-    stats = {"scanned": 0, "skipped_excluded_app": 0}
+    stats = {"scanned": 0}
     rows: List[dict] = []
     cfg = _worker_load_env(env_path)
     tgt = mig.connect_target(cfg)
     last_app_no = ""
-    exclude_app_set = {int(x) for x in exclude_app_ids} if exclude_app_ids else set()
+    ex_ph = ",".join(["%s"] * len(exclude_app_ids)) if exclude_app_ids else ""
+    exclude_sql = f"AND app_id NOT IN ({ex_ph})" if exclude_app_ids else ""
     t0 = time.time()
     print(
         f"{label} load start created_time_ms>={since_ms} "
-        f"exclude_app_ids={exclude_app_ids} (post-filter in memory)",
+        f"exclude_app_ids={exclude_app_ids} (SQL NOT IN)",
         flush=True,
     )
     try:
@@ -1825,6 +1872,7 @@ def _load_target_application_shard(spec: dict) -> Tuple[int, List[dict], Dict[st
                     SELECT {cols_sql}
                     FROM `application`
                     WHERE created_time >= %s
+                      {exclude_sql}
                       AND application_no IS NOT NULL AND application_no <> ''
                       AND MOD(CRC32(application_no), %s) = %s
                       AND application_no > %s
@@ -1833,6 +1881,7 @@ def _load_target_application_shard(spec: dict) -> Tuple[int, List[dict], Dict[st
                     """,
                     (
                         since_ms,
+                        *exclude_app_ids,
                         workers,
                         worker_id - 1,
                         last_app_no,
@@ -1843,17 +1892,12 @@ def _load_target_application_shard(spec: dict) -> Tuple[int, List[dict], Dict[st
             if not batch:
                 break
             for row in batch:
-                item = {k: row[k] for k in columns}
-                if application_row_skip_reason(item, exclude_app_ids, exclude_app_set):
-                    stats["skipped_excluded_app"] += 1
-                    continue
-                rows.append(item)
+                rows.append({k: row[k] for k in columns})
             last_app_no = str(batch[-1]["application_no"])
             stats["scanned"] = len(rows)
             if stats["scanned"] % 100_000 < page_size:
                 print(
-                    f"{label} progress rows={stats['scanned']} "
-                    f"skipped_app={stats['skipped_excluded_app']} last={last_app_no} "
+                    f"{label} progress rows={stats['scanned']} last={last_app_no} "
                     f"elapsed={time.time()-t0:.1f}s",
                     flush=True,
                 )
@@ -1862,8 +1906,7 @@ def _load_target_application_shard(spec: dict) -> Tuple[int, List[dict], Dict[st
     finally:
         tgt.close()
     print(
-        f"{label} done rows={len(rows)} skipped_app={stats['skipped_excluded_app']} "
-        f"elapsed={time.time()-t0:.1f}s",
+        f"{label} done rows={len(rows)} elapsed={time.time()-t0:.1f}s",
         flush=True,
     )
     return worker_id, rows, stats
@@ -1895,7 +1938,7 @@ def parallel_load_target_applications(
     ]
     logger.log(
         f"load target application: workers={workers} created_time_ms>={since_ms} "
-        f"exclude_app_ids={exclude_app_ids} (memory filter) page_size={page_size}"
+        f"exclude_app_ids={exclude_app_ids} (SQL NOT IN) page_size={page_size}"
     )
     t0 = time.time()
     merged: Dict[Tuple[Any, ...], dict] = {}
