@@ -1189,6 +1189,57 @@ def plan_user_table(
     return _run_parallel_id_spans(spans, workers, _shard, logger, "plan user")
 
 
+def _safe_conn_rollback(conn) -> None:
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+
+
+def _log_apply_update_skip(
+    table: str,
+    pk_cols: Sequence[str],
+    row: dict,
+    exc: BaseException,
+) -> None:
+    pk = {c: row.get(c) for c in pk_cols}
+    # 金额越界等高频字段一并带上，方便对照源数据
+    extra = {}
+    for c in (
+        "total_amount", "loan_amount", "principal", "disbursed_amount",
+        "credit_limit", "paid_amount", "application_no", "sn",
+    ):
+        if c in row and c not in pk:
+            extra[c] = row.get(c)
+    code = exc.args[0] if getattr(exc, "args", None) else type(exc).__name__
+    detail = str(exc)
+    print(
+        "apply update skip table=%s pk=%s extra=%s err=%s detail=%s"
+        % (table, pk, extra, code, detail[:300]),
+        flush=True,
+    )
+    try:
+        payload = dict(pk)
+        payload.update(extra)
+        mig.skip_log(
+            "update_fail",
+            table=table,
+            error=code,
+            detail=detail,
+            data=mig._skip_row_payload(payload),
+        )
+    except Exception:
+        pass
+
+
+def _is_row_data_error(exc: BaseException) -> bool:
+    """单行数据/约束问题：可拆批或跳过，不应中断整次 apply。"""
+    return isinstance(
+        exc,
+        (pymysql.err.DataError, pymysql.err.IntegrityError, pymysql.err.Warning),
+    )
+
+
 def _bulk_update_rows_by_pk_rowwise(
     conn,
     cfg: Dict[str, Any],
@@ -1197,7 +1248,7 @@ def _bulk_update_rows_by_pk_rowwise(
     update_cols: Sequence[str],
     rows: List[dict],
 ) -> Tuple[Any, int]:
-    """逐条 UPDATE（慢路径，仅 JOIN 批量失败时回退）。"""
+    """逐条 UPDATE（慢路径，仅 JOIN 批量失败时回退）；坏行跳过继续。"""
     if not rows or not update_cols:
         return conn, 0
     where_sql = " AND ".join(f"{mig._quote_col(c)}=%s" for c in pk_cols)
@@ -1206,10 +1257,19 @@ def _bulk_update_rows_by_pk_rowwise(
     affected = 0
     for row in rows:
         params = [row.get(c) for c in update_cols] + [row.get(c) for c in pk_cols]
-        conn = mig._ensure_mysql_conn(conn, cfg, "target")
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            affected += int(cur.rowcount or 0)
+        try:
+            conn = mig._ensure_mysql_conn(conn, cfg, "target")
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                affected += int(cur.rowcount or 0)
+        except Exception as exc:
+            _safe_conn_rollback(conn)
+            if mig._is_deadlock_error(exc):
+                raise
+            if mig._should_skip_row_on_error(exc) or _is_row_data_error(exc):
+                _log_apply_update_skip(table, pk_cols, row, exc)
+                continue
+            raise
     return conn, affected
 
 
@@ -1269,6 +1329,9 @@ def _bulk_update_one_join(
                 return conn, int(cur.rowcount or 0)
         except Exception as exc:
             last_exc = exc
+            _safe_conn_rollback(conn)
+            if mig._is_deadlock_error(exc):
+                raise
             if attempt == 0 and mig._is_transient_insert_error(exc):
                 conn = mig._reconnect_mysql(conn, cfg, "target")
                 time.sleep(0.1 + random.uniform(0, 0.05))
@@ -1276,8 +1339,10 @@ def _bulk_update_one_join(
             break
 
     assert last_exc is not None
-    # 包过大：对半拆；再不行逐行
-    if _is_update_packet_too_large(last_exc) and len(batch) > 1:
+    # 包过大 / 数据越界：对半拆，隔离坏行
+    if (
+        _is_update_packet_too_large(last_exc) or _is_row_data_error(last_exc)
+    ) and len(batch) > 1:
         mid = len(batch) // 2
         conn, n1 = _bulk_update_one_join(
             conn, cfg, table, pk_cols, update_cols, batch[:mid],
@@ -1287,13 +1352,14 @@ def _bulk_update_one_join(
         )
         return conn, n1 + n2
     if len(batch) > 1:
-        # 其它错误（死锁、临时唯一冲突等）回退逐行，尽量写完本批
-        try:
-            return _bulk_update_rows_by_pk_rowwise(
-                conn, cfg, table, pk_cols, update_cols, batch,
-            )
-        except Exception:
-            raise last_exc
+        # 其它错误回退逐行（内部会跳过可跳过错误）
+        return _bulk_update_rows_by_pk_rowwise(
+            conn, cfg, table, pk_cols, update_cols, batch,
+        )
+    # 单行仍失败：可跳过则记日志，否则抛出
+    if mig._should_skip_row_on_error(last_exc) or _is_row_data_error(last_exc):
+        _log_apply_update_skip(table, pk_cols, batch[0], last_exc)
+        return conn, 0
     raise last_exc
 
 
@@ -1434,6 +1500,41 @@ def _parallel_apply_batches(
     return total_affected, len(specs)
 
 
+# 金额类列：写入前负数置 0（目标列多为 UNSIGNED，负值会 1264）
+AMOUNT_CLAMP_COLS = frozenset({
+    "credit_limit", "loan_amount", "principal", "total_amount", "disbursed_amount",
+    "interest", "admin_fee", "service_fee", "tax_fee", "penalty_amount",
+    "reduction_amount", "paid_amount",
+    "credit_amount", "unpaid_amount", "locked_amount", "available_amount",
+})
+
+
+def _clamp_negative_amounts(row: dict) -> dict:
+    """就地：金额字段 < 0 → 0。"""
+    if not row:
+        return row
+    for c in AMOUNT_CLAMP_COLS:
+        if c not in row:
+            continue
+        v = row.get(c)
+        if v is None or isinstance(v, bool):
+            continue
+        try:
+            if isinstance(v, int):
+                if v < 0:
+                    row[c] = 0
+            elif isinstance(v, float):
+                if v < 0:
+                    row[c] = 0.0
+            else:
+                # Decimal / 数字字符串
+                if float(v) < 0:
+                    row[c] = 0
+        except (TypeError, ValueError):
+            continue
+    return row
+
+
 def _apply_reconcile_plan(
     cfg: Dict[str, Any],
     plan: List[dict],
@@ -1451,8 +1552,14 @@ def _apply_reconcile_plan(
     if not plan:
         return stats
 
-    inserts = [p["row"] for p in plan if p.get("action") == "insert"]
-    updates = [p["row"] for p in plan if p.get("action") == "update"]
+    inserts = [
+        _clamp_negative_amounts(p["row"])
+        for p in plan if p.get("action") == "insert"
+    ]
+    updates = [
+        _clamp_negative_amounts(p["row"])
+        for p in plan if p.get("action") == "update"
+    ]
     stats["insert"] = len(inserts)
     stats["update"] = len(updates)
     batch_size = max(1, int(batch_size))
