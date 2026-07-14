@@ -20,7 +20,7 @@
                 idx loan_no（非主键；loan_no 可随 update 修正）
 
   apply：insert=INSERT；update=UPDATE WHERE 表主键
-        默认 15 线程、每批 500（--apply-workers / --apply-batch）
+        默认 load=16 / source-workers=8 / source-batch=20000；apply 24 线程、每批 1000
 
 Usage:
   # user 表
@@ -41,6 +41,7 @@ import multiprocessing
 import os
 import sys
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -281,25 +282,34 @@ class ReconcileLogger:
         self.vt_skip_path = log_dir / f"vt_skip_{table}.jsonl"
         self.apply_path = log_dir / f"apply_{table}.jsonl"
         self._main_fp = self.main_path.open("a", encoding="utf-8")
+        self._lock = threading.Lock()
 
     def close(self) -> None:
-        self._main_fp.close()
+        with self._lock:
+            self._main_fp.close()
 
     def log(self, msg: str) -> None:
         line = f"[{_now_ts()}] {msg}"
         print(line, flush=True)
-        self._main_fp.write(line + "\n")
-        self._main_fp.flush()
+        with self._lock:
+            self._main_fp.write(line + "\n")
+            self._main_fp.flush()
 
     def vt_skip(self, record: dict) -> None:
-        record = {**record, "ts": _now_ts()}
-        with self.vt_skip_path.open("a", encoding="utf-8") as fp:
-            fp.write(json.dumps(record, ensure_ascii=False) + "\n")
+        record = dict(record)
+        record["ts"] = _now_ts()
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+        with self._lock:
+            with self.vt_skip_path.open("a", encoding="utf-8") as fp:
+                fp.write(line)
 
     def apply_audit(self, record: dict) -> None:
-        record = {**record, "ts": _now_ts()}
-        with self.apply_path.open("a", encoding="utf-8") as fp:
-            fp.write(json.dumps(record, ensure_ascii=False) + "\n")
+        record = dict(record)
+        record["ts"] = _now_ts()
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+        with self._lock:
+            with self.apply_path.open("a", encoding="utf-8") as fp:
+                fp.write(line)
 
 
 def write_jsonl(path: Path, rows: Iterable[dict]) -> int:
@@ -320,6 +330,85 @@ def read_jsonl(path: Path) -> List[dict]:
                 out.append(json.loads(line))
     return out
 
+
+
+
+def _partition_id_span(min_id: int, max_id: int, workers: int) -> List[Tuple[int, int]]:
+    """将 (min_id-1, max_id] 切成连续 (lo, hi] 区间，供 plan 并行。"""
+    workers = max(1, int(workers or 1))
+    lo0 = int(min_id) - 1
+    span = int(max_id) - lo0
+    if span <= 0:
+        return []
+    workers = min(workers, span)
+    chunk = (span + workers - 1) // workers
+    out: List[Tuple[int, int]] = []
+    lo = lo0
+    while lo < max_id:
+        hi = min(lo + chunk, max_id)
+        out.append((lo, hi))
+        lo = hi
+    return out
+
+
+def _make_vt_resolver(cfg: Dict[str, Any], conn=None):
+    if conn is None:
+        conn = mig.connect_source(cfg)
+    return mig.VtTokenResolver(
+        conn,
+        enabled=cfg.get("vt_token_enable", True),
+        chunk=cfg.get("vt_token_chunk", 2000),
+        vt_db=cfg.get("vt_token_db", "ng_loan_market"),
+    )
+
+
+def _merge_stats(parts: List[Dict[str, int]]) -> Dict[str, int]:
+    if not parts:
+        return {}
+    out: Dict[str, int] = {}
+    for part in parts:
+        for k, v in part.items():
+            if isinstance(v, int):
+                out[k] = out.get(k, 0) + int(v)
+            else:
+                out[k] = v  # type: ignore
+    return out
+
+
+def _run_parallel_id_spans(
+    spans: List[Tuple[int, int]],
+    workers: int,
+    shard_fn,
+    logger: "ReconcileLogger",
+    label: str,
+) -> Tuple[List[dict], Dict[str, int]]:
+    """对多个 id 区间并行执行 shard_fn(lo, hi) -> (plan, stats)。"""
+    if not spans:
+        return [], {}
+    workers = max(1, min(int(workers or 1), len(spans)))
+    if workers == 1 or len(spans) == 1:
+        plan, stats = shard_fn(spans[0][0], spans[0][1])
+        return plan, stats
+
+    logger.log(
+        "{0} parallel spans={1} workers={2}".format(label, len(spans), workers)
+    )
+    plans: List[dict] = []
+    stats_parts: List[Dict[str, int]] = []
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = [pool.submit(shard_fn, lo, hi) for lo, hi in spans]
+        for fut in as_completed(futs):
+            part_plan, part_stats = fut.result()
+            plans.extend(part_plan)
+            stats_parts.append(part_stats)
+            done += 1
+            logger.log(
+                "{0} shard {1}/{2} plan_rows={3} stats={4}".format(
+                    label, done, len(spans), len(part_plan), part_stats,
+                )
+            )
+    return plans, _merge_stats(stats_parts)
 
 def normalize_cell(col: str, val: Any) -> Any:
     if val is None:
@@ -944,16 +1033,18 @@ def build_expected_user_rows(
     return built, stats
 
 
-def plan_user_table(
+def _plan_user_span(
     cfg: Dict[str, Any],
     target_by_key: Dict[Tuple[Any, ...], dict],
     since_date: str,
     max_user_id: int,
     source_batch: int,
-    vt: mig.VtTokenResolver,
     logger: ReconcileLogger,
+    span_lo: int,
+    span_hi: int,
 ) -> Tuple[List[dict], Dict[str, int]]:
     src = mig.connect_source(cfg)
+    vt = _make_vt_resolver(cfg, src)
     stats = {
         "source_total": 0,
         "skip_ok": 0,
@@ -964,23 +1055,15 @@ def plan_user_table(
     }
     plan: List[dict] = []
     try:
-        min_id, max_id, cnt = _source_user_id_bounds(src, since_date, max_user_id)
-        logger.log(
-            f"source user since={since_date}: count={cnt} id=[{min_id},{max_id}]"
-        )
-        if cnt <= 0:
-            return plan, stats
-
-        lo = min_id - 1
-        while lo < max_id:
-            hi = min(lo + source_batch, max_id)
+        lo = span_lo
+        while lo < span_hi:
+            hi = min(lo + source_batch, span_hi)
             stats["source_batches"] += 1
             expected_rows, batch_stats = build_expected_user_rows(
                 cfg, src, lo, hi, since_date, max_user_id, vt, logger,
             )
             stats["vt_skip"] += batch_stats.get("vt_skip", 0)
             stats["source_total"] += batch_stats.get("source_rows", 0)
-
             for exp in expected_rows:
                 pk = user_key(exp)
                 actual = target_by_key.get(pk)
@@ -1004,15 +1087,51 @@ def plan_user_table(
                     }
                 )
             lo = hi
-            if stats["source_batches"] % 20 == 0:
-                logger.log(
-                    f"plan progress batches={stats['source_batches']} "
-                    f"ok={stats['skip_ok']} insert={stats['plan_insert']} "
-                    f"update={stats['plan_update']} vt_skip={stats['vt_skip']}"
-                )
     finally:
         mig._close_mysql_conn(src)
     return plan, stats
+
+
+def plan_user_table(
+    cfg: Dict[str, Any],
+    target_by_key: Dict[Tuple[Any, ...], dict],
+    since_date: str,
+    max_user_id: int,
+    source_batch: int,
+    vt: mig.VtTokenResolver,
+    logger: ReconcileLogger,
+    source_workers: int = 1,
+) -> Tuple[List[dict], Dict[str, int]]:
+    src = mig.connect_source(cfg)
+    try:
+        min_id, max_id, cnt = _source_user_id_bounds(src, since_date, max_user_id)
+        logger.log(
+            "source user since={0}: count={1} id=[{2},{3}]".format(
+                since_date, cnt, min_id, max_id,
+            )
+        )
+        if cnt <= 0:
+            return [], {
+                "source_total": 0, "skip_ok": 0, "plan_insert": 0,
+                "plan_update": 0, "vt_skip": 0, "source_batches": 0,
+            }
+    finally:
+        mig._close_mysql_conn(src)
+
+    workers = max(1, int(source_workers or 1))
+    spans = _partition_id_span(min_id, max_id, workers)
+    logger.log(
+        "plan user workers={0} batch={1} spans={2}".format(
+            workers, source_batch, len(spans),
+        )
+    )
+
+    def _shard(lo, hi):
+        return _plan_user_span(
+            cfg, target_by_key, since_date, max_user_id, source_batch, logger, lo, hi,
+        )
+
+    return _run_parallel_id_spans(spans, workers, _shard, logger, "plan user")
 
 
 def _bulk_update_rows_by_pk(
@@ -1497,16 +1616,18 @@ def build_expected_user_info_rows(
     return built, stats
 
 
-def plan_user_info_table(
+def _plan_user_info_span(
     cfg: Dict[str, Any],
     target_by_id: Dict[int, dict],
     since_date: str,
     max_user_id: int,
     source_batch: int,
-    vt: mig.VtTokenResolver,
     logger: ReconcileLogger,
+    span_lo: int,
+    span_hi: int,
 ) -> Tuple[List[dict], Dict[str, int]]:
     src = mig.connect_source(cfg)
+    vt = _make_vt_resolver(cfg, src)
     stats = {
         "source_total": 0,
         "skip_ok": 0,
@@ -1517,24 +1638,15 @@ def plan_user_info_table(
     }
     plan: List[dict] = []
     try:
-        min_id, max_id, cnt = _source_user_id_bounds(src, since_date, max_user_id)
-        logger.log(
-            f"source user_info (via user.created>={since_date}): count={cnt} "
-            f"id=[{min_id},{max_id}]"
-        )
-        if cnt <= 0:
-            return plan, stats
-
-        lo = min_id - 1
-        while lo < max_id:
-            hi = min(lo + source_batch, max_id)
+        lo = span_lo
+        while lo < span_hi:
+            hi = min(lo + source_batch, span_hi)
             stats["source_batches"] += 1
             expected_rows, batch_stats = build_expected_user_info_rows(
                 cfg, src, lo, hi, since_date, max_user_id, vt, logger,
             )
             stats["vt_skip"] += batch_stats.get("vt_skip", 0)
             stats["source_total"] += batch_stats.get("source_rows", 0)
-
             for exp in expected_rows:
                 uid = int(exp["user_id"])
                 actual = target_by_id.get(uid)
@@ -1558,15 +1670,51 @@ def plan_user_info_table(
                     }
                 )
             lo = hi
-            if stats["source_batches"] % 20 == 0:
-                logger.log(
-                    f"plan progress batches={stats['source_batches']} "
-                    f"ok={stats['skip_ok']} insert={stats['plan_insert']} "
-                    f"update={stats['plan_update']} vt_skip={stats['vt_skip']}"
-                )
     finally:
         mig._close_mysql_conn(src)
     return plan, stats
+
+
+def plan_user_info_table(
+    cfg: Dict[str, Any],
+    target_by_id: Dict[int, dict],
+    since_date: str,
+    max_user_id: int,
+    source_batch: int,
+    vt: mig.VtTokenResolver,
+    logger: ReconcileLogger,
+    source_workers: int = 1,
+) -> Tuple[List[dict], Dict[str, int]]:
+    src = mig.connect_source(cfg)
+    try:
+        min_id, max_id, cnt = _source_user_id_bounds(src, since_date, max_user_id)
+        logger.log(
+            "source user_info (via user.created>={0}): count={1} id=[{2},{3}]".format(
+                since_date, cnt, min_id, max_id,
+            )
+        )
+        if cnt <= 0:
+            return [], {
+                "source_total": 0, "skip_ok": 0, "plan_insert": 0,
+                "plan_update": 0, "vt_skip": 0, "source_batches": 0,
+            }
+    finally:
+        mig._close_mysql_conn(src)
+
+    workers = max(1, int(source_workers or 1))
+    spans = _partition_id_span(min_id, max_id, workers)
+    logger.log(
+        "plan user_info workers={0} batch={1} spans={2}".format(
+            workers, source_batch, len(spans),
+        )
+    )
+
+    def _shard(lo, hi):
+        return _plan_user_info_span(
+            cfg, target_by_id, since_date, max_user_id, source_batch, logger, lo, hi,
+        )
+
+    return _run_parallel_id_spans(spans, workers, _shard, logger, "plan user_info")
 
 
 def _run_reconcile_phases(
@@ -1625,6 +1773,7 @@ def _run_reconcile_phases(
         plan, plan_stats = plan_fn(
             cfg, target_by_key, args.since_date, args.max_target_user_id,
             args.source_batch, vt, logger,
+            source_workers=args.source_workers,
         )
         mig._close_mysql_conn(vt.conn)
         n = write_jsonl(plan_path, plan)
@@ -1769,7 +1918,7 @@ def build_expected_user_product_rows(
     return built, stats
 
 
-def _plan_composite_table(
+def _plan_composite_span(
     cfg: Dict[str, Any],
     target_by_key: Dict[Tuple[Any, ...], dict],
     since_date: str,
@@ -1780,9 +1929,11 @@ def _plan_composite_table(
     key_fn,
     build_fn,
     logger: ReconcileLogger,
-    vt: mig.VtTokenResolver,
+    span_lo: int,
+    span_hi: int,
 ) -> Tuple[List[dict], Dict[str, int]]:
     src = mig.connect_source(cfg)
+    vt = _make_vt_resolver(cfg, src)
     stats = {
         "source_total": 0,
         "skip_ok": 0,
@@ -1793,23 +1944,15 @@ def _plan_composite_table(
     }
     plan: List[dict] = []
     try:
-        min_id, max_id, cnt = _source_user_id_bounds(src, since_date, max_user_id)
-        logger.log(
-            f"source {table} (user.created>={since_date}): users={cnt} id=[{min_id},{max_id}]"
-        )
-        if cnt <= 0:
-            return plan, stats
-
-        lo = min_id - 1
-        while lo < max_id:
-            hi = min(lo + source_batch, max_id)
+        lo = span_lo
+        while lo < span_hi:
+            hi = min(lo + source_batch, span_hi)
             stats["source_batches"] += 1
             expected_rows, batch_stats = build_fn(
                 cfg, src, lo, hi, since_date, max_user_id, vt, logger,
             )
             stats["vt_skip"] += batch_stats.get("vt_skip", 0)
             stats["source_total"] += batch_stats.get("source_users", 0)
-
             for exp in expected_rows:
                 pk = key_fn(exp)
                 actual = target_by_key.get(pk)
@@ -1836,15 +1979,58 @@ def _plan_composite_table(
                     }
                 )
             lo = hi
-            if stats["source_batches"] % 20 == 0:
-                logger.log(
-                    f"plan progress batches={stats['source_batches']} "
-                    f"ok={stats['skip_ok']} insert={stats['plan_insert']} "
-                    f"update={stats['plan_update']} vt_skip={stats['vt_skip']}"
-                )
     finally:
         mig._close_mysql_conn(src)
     return plan, stats
+
+
+def _plan_composite_table(
+    cfg: Dict[str, Any],
+    target_by_key: Dict[Tuple[Any, ...], dict],
+    since_date: str,
+    max_user_id: int,
+    source_batch: int,
+    table: str,
+    compare_cols: Sequence[str],
+    key_fn,
+    build_fn,
+    logger: ReconcileLogger,
+    vt: mig.VtTokenResolver,
+    source_workers: int = 1,
+) -> Tuple[List[dict], Dict[str, int]]:
+    src = mig.connect_source(cfg)
+    try:
+        min_id, max_id, cnt = _source_user_id_bounds(src, since_date, max_user_id)
+        logger.log(
+            "source {0} (user.created>={1}): users={2} id=[{3},{4}]".format(
+                table, since_date, cnt, min_id, max_id,
+            )
+        )
+        if cnt <= 0:
+            return [], {
+                "source_total": 0, "skip_ok": 0, "plan_insert": 0,
+                "plan_update": 0, "vt_skip": 0, "source_batches": 0,
+            }
+    finally:
+        mig._close_mysql_conn(src)
+
+    workers = max(1, int(source_workers or 1))
+    spans = _partition_id_span(min_id, max_id, workers)
+    logger.log(
+        "plan {0} workers={1} batch={2} spans={3}".format(
+            table, workers, source_batch, len(spans),
+        )
+    )
+
+    def _shard(lo, hi):
+        return _plan_composite_span(
+            cfg, target_by_key, since_date, max_user_id, source_batch,
+            table, compare_cols, key_fn, build_fn, logger, lo, hi,
+        )
+
+    return _run_parallel_id_spans(
+        spans, workers, _shard, logger, "plan {0}".format(table),
+    )
 
 
 def plan_user_bankcard_table(
@@ -1855,11 +2041,13 @@ def plan_user_bankcard_table(
     source_batch: int,
     vt: mig.VtTokenResolver,
     logger: ReconcileLogger,
+    source_workers: int = 1,
 ) -> Tuple[List[dict], Dict[str, int]]:
     return _plan_composite_table(
         cfg, target_by_key, since_date, max_user_id, source_batch,
         "user_bankcard", BANKCARD_COMPARE_COLS, bankcard_key,
         build_expected_bankcard_rows, logger, vt,
+        source_workers=source_workers,
     )
 
 
@@ -1871,11 +2059,13 @@ def plan_user_product_table(
     source_batch: int,
     vt: mig.VtTokenResolver,
     logger: ReconcileLogger,
+    source_workers: int = 1,
 ) -> Tuple[List[dict], Dict[str, int]]:
     return _plan_composite_table(
         cfg, target_by_key, since_date, max_user_id, source_batch,
         "user_product", PRODUCT_COMPARE_COLS, product_key,
         build_expected_user_product_rows, logger, vt,
+        source_workers=source_workers,
     )
 
 
@@ -1983,6 +2173,7 @@ def _run_reconcile_phases_composite(
         plan, plan_stats = plan_fn(
             cfg, target_by_key, args.since_date, args.max_target_user_id,
             args.source_batch, vt, logger,
+            source_workers=args.source_workers,
         )
         mig._close_mysql_conn(vt.conn)
         n = write_jsonl(plan_path, plan)
@@ -2351,17 +2542,18 @@ def build_expected_application_rows(
     return built, stats
 
 
-def plan_application_table(
+def _plan_application_span(
     cfg: Dict[str, Any],
     target_by_key: Dict[Tuple[Any, ...], dict],
-    since_date: str,
+    since_unix: int,
     exclude_app_ids: Tuple[int, ...],
     source_batch: int,
-    vt: mig.VtTokenResolver,
     logger: ReconcileLogger,
+    span_lo: int,
+    span_hi: int,
 ) -> Tuple[List[dict], Dict[str, int]]:
-    since_unix = since_date_to_unix(since_date)
     src = mig.connect_source(cfg)
+    vt = _make_vt_resolver(cfg, src)
     stats = {
         "source_total": 0,
         "skip_ok": 0,
@@ -2373,19 +2565,9 @@ def plan_application_table(
     }
     plan: List[dict] = []
     try:
-        min_id, max_id, cnt = _source_application_id_bounds(
-            src, since_unix, exclude_app_ids,
-        )
-        logger.log(
-            f"source application applyDate>={since_date}: count={cnt} "
-            f"id=[{min_id},{max_id}] exclude_app_ids={exclude_app_ids}"
-        )
-        if cnt <= 0:
-            return plan, stats
-
-        lo = min_id - 1
-        while lo < max_id:
-            hi = min(lo + source_batch, max_id)
+        lo = span_lo
+        while lo < span_hi:
+            hi = min(lo + source_batch, span_hi)
             stats["source_batches"] += 1
             expected_rows, batch_stats = build_expected_application_rows(
                 cfg, src, lo, hi, since_unix, exclude_app_ids, vt, logger,
@@ -2393,7 +2575,6 @@ def plan_application_table(
             stats["vt_skip"] += batch_stats.get("vt_skip", 0)
             stats["no_core_sn"] += batch_stats.get("no_core_sn", 0)
             stats["source_total"] += batch_stats.get("source_rows", 0)
-
             for exp in expected_rows:
                 pk = application_key(exp)
                 actual = target_by_key.get(pk)
@@ -2417,16 +2598,55 @@ def plan_application_table(
                     "row": exp,
                 })
             lo = hi
-            if stats["source_batches"] % 20 == 0:
-                logger.log(
-                    f"plan progress batches={stats['source_batches']} "
-                    f"ok={stats['skip_ok']} insert={stats['plan_insert']} "
-                    f"update={stats['plan_update']} vt_skip={stats['vt_skip']} "
-                    f"no_core_sn={stats['no_core_sn']}"
-                )
     finally:
         mig._close_mysql_conn(src)
     return plan, stats
+
+
+def plan_application_table(
+    cfg: Dict[str, Any],
+    target_by_key: Dict[Tuple[Any, ...], dict],
+    since_date: str,
+    exclude_app_ids: Tuple[int, ...],
+    source_batch: int,
+    vt: mig.VtTokenResolver,
+    logger: ReconcileLogger,
+    source_workers: int = 1,
+) -> Tuple[List[dict], Dict[str, int]]:
+    since_unix = since_date_to_unix(since_date)
+    src = mig.connect_source(cfg)
+    try:
+        min_id, max_id, cnt = _source_application_id_bounds(
+            src, since_unix, exclude_app_ids,
+        )
+        logger.log(
+            "source application applyDate>={0}: count={1} id=[{2},{3}] exclude_app_ids={4}".format(
+                since_date, cnt, min_id, max_id, exclude_app_ids,
+            )
+        )
+        if cnt <= 0:
+            return [], {
+                "source_total": 0, "skip_ok": 0, "plan_insert": 0,
+                "plan_update": 0, "vt_skip": 0, "no_core_sn": 0, "source_batches": 0,
+            }
+    finally:
+        mig._close_mysql_conn(src)
+
+    workers = max(1, int(source_workers or 1))
+    spans = _partition_id_span(min_id, max_id, workers)
+    logger.log(
+        "plan application workers={0} batch={1} spans={2}".format(
+            workers, source_batch, len(spans),
+        )
+    )
+
+    def _shard(lo, hi):
+        return _plan_application_span(
+            cfg, target_by_key, since_unix, exclude_app_ids,
+            source_batch, logger, lo, hi,
+        )
+
+    return _run_parallel_id_spans(spans, workers, _shard, logger, "plan application")
 
 
 def apply_application_plan(
@@ -2496,6 +2716,7 @@ def run_application_reconcile(args: argparse.Namespace, cfg: Dict[str, Any]) -> 
         plan, plan_stats = plan_application_table(
             cfg, target_by_key, args.since_date, exclude_app_ids,
             args.source_batch, vt, logger,
+            source_workers=args.source_workers,
         )
         mig._close_mysql_conn(vt.conn)
         n = write_jsonl(plan_path, plan)
@@ -2848,17 +3069,18 @@ def build_expected_loan_rows(
     return built, stats
 
 
-def plan_loan_table(
+def _plan_loan_span(
     cfg: Dict[str, Any],
     target_by_key: Dict[Tuple[Any, ...], dict],
-    since_date: str,
+    since_unix: int,
     exclude_app_ids: Tuple[int, ...],
     source_batch: int,
-    vt: mig.VtTokenResolver,
     logger: ReconcileLogger,
+    span_lo: int,
+    span_hi: int,
 ) -> Tuple[List[dict], Dict[str, int]]:
-    since_unix = since_date_to_unix(since_date)
     src = mig.connect_source(cfg)
+    vt = _make_vt_resolver(cfg, src)
     stats = {
         "source_total": 0,
         "skip_ok": 0,
@@ -2871,19 +3093,9 @@ def plan_loan_table(
     }
     plan: List[dict] = []
     try:
-        min_id, max_id, cnt = _source_disbursed_application_id_bounds(
-            src, since_unix, exclude_app_ids,
-        )
-        logger.log(
-            f"source loan (disbursed applyDate>={since_date}): count={cnt} "
-            f"id=[{min_id},{max_id}] exclude_app_ids={exclude_app_ids}"
-        )
-        if cnt <= 0:
-            return plan, stats
-
-        lo = min_id - 1
-        while lo < max_id:
-            hi = min(lo + source_batch, max_id)
+        lo = span_lo
+        while lo < span_hi:
+            hi = min(lo + source_batch, span_hi)
             stats["source_batches"] += 1
             expected_rows, batch_stats = build_expected_loan_rows(
                 cfg, src, lo, hi, since_unix, exclude_app_ids, vt, logger,
@@ -2892,7 +3104,6 @@ def plan_loan_table(
             stats["no_core_sn"] += batch_stats.get("no_core_sn", 0)
             stats["no_application_no"] += batch_stats.get("no_application_no", 0)
             stats["source_total"] += batch_stats.get("source_rows", 0)
-
             for exp in expected_rows:
                 pk = loan_key(exp)
                 actual = target_by_key.get(pk)
@@ -2915,16 +3126,56 @@ def plan_loan_table(
                     "row": exp,
                 })
             lo = hi
-            if stats["source_batches"] % 20 == 0:
-                logger.log(
-                    f"plan progress batches={stats['source_batches']} "
-                    f"ok={stats['skip_ok']} insert={stats['plan_insert']} "
-                    f"update={stats['plan_update']} vt_skip={stats['vt_skip']} "
-                    f"no_core_sn={stats['no_core_sn']}"
-                )
     finally:
         mig._close_mysql_conn(src)
     return plan, stats
+
+
+def plan_loan_table(
+    cfg: Dict[str, Any],
+    target_by_key: Dict[Tuple[Any, ...], dict],
+    since_date: str,
+    exclude_app_ids: Tuple[int, ...],
+    source_batch: int,
+    vt: mig.VtTokenResolver,
+    logger: ReconcileLogger,
+    source_workers: int = 1,
+) -> Tuple[List[dict], Dict[str, int]]:
+    since_unix = since_date_to_unix(since_date)
+    src = mig.connect_source(cfg)
+    try:
+        min_id, max_id, cnt = _source_disbursed_application_id_bounds(
+            src, since_unix, exclude_app_ids,
+        )
+        logger.log(
+            "source loan (disbursed applyDate>={0}): count={1} id=[{2},{3}] exclude_app_ids={4}".format(
+                since_date, cnt, min_id, max_id, exclude_app_ids,
+            )
+        )
+        if cnt <= 0:
+            return [], {
+                "source_total": 0, "skip_ok": 0, "plan_insert": 0,
+                "plan_update": 0, "vt_skip": 0, "no_core_sn": 0,
+                "no_application_no": 0, "source_batches": 0,
+            }
+    finally:
+        mig._close_mysql_conn(src)
+
+    workers = max(1, int(source_workers or 1))
+    spans = _partition_id_span(min_id, max_id, workers)
+    logger.log(
+        "plan loan workers={0} batch={1} spans={2}".format(
+            workers, source_batch, len(spans),
+        )
+    )
+
+    def _shard(lo, hi):
+        return _plan_loan_span(
+            cfg, target_by_key, since_unix, exclude_app_ids,
+            source_batch, logger, lo, hi,
+        )
+
+    return _run_parallel_id_spans(spans, workers, _shard, logger, "plan loan")
 
 
 def apply_loan_plan(
@@ -2996,6 +3247,7 @@ def run_loan_reconcile(args: argparse.Namespace, cfg: Dict[str, Any]) -> int:
         plan, plan_stats = plan_loan_table(
             cfg, target_by_key, args.since_date, exclude_app_ids,
             args.source_batch, vt, logger,
+            source_workers=args.source_workers,
         )
         mig._close_mysql_conn(vt.conn)
         n = write_jsonl(plan_path, plan)
@@ -3114,7 +3366,7 @@ def run_all_tables(args: argparse.Namespace, cfg: Dict[str, Any]) -> int:
         paths = default_paths(table)
         table_args.target_cache = paths["target_cache"]
         table_args.plan_file = paths["plan_file"]
-        table_args.from_cache = False
+        table_args.from_cache = bool(getattr(args, "from_cache", False))
         rc = dispatch_table(table_args, cfg, table)
         master.log(
             "========== DONE table={0} rc={1} elapsed={2}s ==========".format(
@@ -3165,12 +3417,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--plan-file", default="")
     p.add_argument("--log-dir", default="/tmp/reconcile_logs")
     p.add_argument("--from-cache", action="store_true", help="plan 阶段复用已有 target cache")
-    p.add_argument("--load-workers", type=int, default=8)
-    p.add_argument("--source-workers", type=int, default=4)
-    p.add_argument("--page-size", type=int, default=50000)
-    p.add_argument("--source-batch", type=int, default=5000)
-    p.add_argument("--apply-batch", type=int, default=500, help="apply 每批行数")
-    p.add_argument("--apply-workers", type=int, default=15, help="apply 并行线程数")
+    p.add_argument("--load-workers", type=int, default=16)
+    p.add_argument("--source-workers", type=int, default=8,
+                    help="plan 源库 id 区间并行线程数（吃空闲 CPU）")
+    p.add_argument("--page-size", type=int, default=100000)
+    p.add_argument("--source-batch", type=int, default=20000)
+    p.add_argument("--apply-batch", type=int, default=1000, help="apply 每批行数")
+    p.add_argument("--apply-workers", type=int, default=24, help="apply 并行线程数")
     p.add_argument("--vt-preload", dest="vt_preload", action="store_true", default=True)
     p.add_argument("--no-vt-preload", dest="vt_preload", action="store_false")
     p.add_argument(
