@@ -2282,9 +2282,10 @@ def _probe_created_time_bounds(
     since_ms: int,
     exclude_app_ids: Tuple[int, ...] = (),
 ) -> Tuple[int, int]:
-    """查目标表 created_time 实际 [min,max]，避免 CRC32 全表扫。"""
+    """可选探测；大表 MIN/MAX 易 2013，加载路径请优先用 _created_time_load_span。"""
     cfg = _worker_load_env(str(env_path))
     tgt = mig.connect_target(cfg)
+    max_retries = max(3, int(cfg.get("mysql_batch_retries") or 6))
     try:
         exclude_sql = ""
         params = [since_ms]  # type: List[Any]
@@ -2292,7 +2293,8 @@ def _probe_created_time_bounds(
             ex_ph = ",".join(["%s"] * len(exclude_app_ids))
             exclude_sql = "AND app_id NOT IN ({0})".format(ex_ph)
             params.extend(exclude_app_ids)
-        with tgt.cursor() as cur:
+
+        def _exec(cur):
             cur.execute(
                 """
                 SELECT MIN(created_time) AS min_t, MAX(created_time) AS max_t
@@ -2302,14 +2304,29 @@ def _probe_created_time_bounds(
                 """.format(table=table, exclude_sql=exclude_sql),
                 params,
             )
-            row = cur.fetchone() or {}
-        min_t = int(row.get("min_t") or 0)
-        max_t = int(row.get("max_t") or 0)
+            return cur.fetchone() or {}
+
+        tgt, row = _fetch_page_with_mysql_retry(
+            "[probe {0} created_time]".format(table),
+            cfg,
+            tgt,
+            max_retries,
+            _exec,
+        )
+        min_t = int((row or {}).get("min_t") or 0)
+        max_t = int((row or {}).get("max_t") or 0)
         if min_t <= 0 or max_t <= 0 or max_t < min_t:
             return 0, 0
         return min_t, max_t
     finally:
         mig._close_mysql_conn(tgt)
+
+
+def _created_time_load_span(since_ms: int) -> Tuple[int, int]:
+    """不查 MIN/MAX：用 since_ms ~ now+1天 做时间分片（避免探测拖垮目标库）。"""
+    min_t = max(0, int(since_ms or 0))
+    max_t = max(min_t, int(time.time() * 1000) + 86400000)
+    return min_t, max_t
 
 
 def _partition_created_time_span(
@@ -2466,17 +2483,10 @@ def parallel_load_target_applications(
     page_size: int,
     logger: ReconcileLogger,
 ) -> Dict[Tuple[Any, ...], dict]:
-    # CRC32 分片会拖垮目标库；改 created_time 区间（走索引），并发别过高
-    workers = max(1, min(int(load_workers or 1), 8))
-    page_size = max(1000, min(int(page_size or 50000), 50000))
-    min_t, max_t = _probe_created_time_bounds(
-        env_path, "application", since_ms, exclude_app_ids,
-    )
-    if min_t <= 0:
-        logger.log(
-            "load target application: no rows (created_time>={0})".format(since_ms)
-        )
-        return {}
+    # 不探测 MIN/MAX（大表聚合易 2013）；since~now 时间分片 + 走 created_time 索引
+    workers = max(1, min(int(load_workers or 1), 6))
+    page_size = max(1000, min(int(page_size or 50000), 30000))
+    min_t, max_t = _created_time_load_span(since_ms)
     spans = _partition_created_time_span(min_t, max_t, workers)
     workers = len(spans)
     cols_sql = _target_cols_sql(columns)
@@ -2496,7 +2506,7 @@ def parallel_load_target_applications(
     ]
     logger.log(
         "load target application: workers={0} created_time=[{1},{2}] "
-        "exclude_app_ids={3} page_size={4} (time-range shards, no CRC32)".format(
+        "exclude_app_ids={3} page_size={4} (time-range, no MIN/MAX probe)".format(
             workers, min_t, max_t, exclude_app_ids, page_size,
         )
     )
@@ -3118,12 +3128,9 @@ def parallel_load_target_loans(
     page_size: int,
     logger: ReconcileLogger,
 ) -> Dict[Tuple[Any, ...], dict]:
-    workers = max(1, min(int(load_workers or 1), 8))
-    page_size = max(1000, min(int(page_size or 50000), 50000))
-    min_t, max_t = _probe_created_time_bounds(env_path, "loan", since_ms)
-    if min_t <= 0:
-        logger.log("load target loan: no rows (created_time>={0})".format(since_ms))
-        return {}
+    workers = max(1, min(int(load_workers or 1), 6))
+    page_size = max(1000, min(int(page_size or 50000), 30000))
+    min_t, max_t = _created_time_load_span(since_ms)
     spans = _partition_created_time_span(min_t, max_t, workers)
     workers = len(spans)
     cols_sql = _target_cols_sql(columns)
@@ -3145,7 +3152,7 @@ def parallel_load_target_loans(
     logger.log(
         "load target loan: workers={0} created_time=[{1},{2}] "
         "exclude_app_ids={3} exclude_created_ms={4} page_size={5} "
-        "(time-range shards, no CRC32)".format(
+        "(time-range, no MIN/MAX probe)".format(
             workers, min_t, max_t, exclude_app_ids, exclude_created_ms, page_size,
         )
     )
