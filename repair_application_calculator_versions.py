@@ -25,7 +25,7 @@ import argparse
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pymysql
 from pymysql.cursors import DictCursor
