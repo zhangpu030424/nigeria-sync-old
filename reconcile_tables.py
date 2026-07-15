@@ -968,9 +968,9 @@ def _select_source_users_since(
         SELECT
             u.id AS user_id, u.`appId` AS app_id,
             u.mobile AS mobile_raw,
-            CASE WHEN u.mobile LIKE '+234%' THEN u.mobile
-                 WHEN u.mobile LIKE '234%' THEN CONCAT('+', u.mobile)
-                 WHEN u.mobile LIKE '0%' THEN CONCAT('+234', SUBSTRING(u.mobile, 2))
+            CASE WHEN u.mobile LIKE '+234%%' THEN u.mobile
+                 WHEN u.mobile LIKE '234%%' THEN CONCAT('+', u.mobile)
+                 WHEN u.mobile LIKE '0%%' THEN CONCAT('+234', SUBSTRING(u.mobile, 2))
                  ELSE CONCAT('+234', u.mobile) END AS mobile,
             ap.name AS app_name,
             CASE WHEN u.`isCancel` IN (1, '1') THEN UNIX_TIMESTAMP(u.updated) * 1000 ELSE 0 END AS closed_time,
