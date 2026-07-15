@@ -6,28 +6,25 @@
   repay_calculator_version    = 50
   rollover_calculator_version = 49
 
-按主键 (mobile, group_user_id, sn) keyset 推进，避免全表 COUNT /
-「UPDATE WHERE 版本不等 LIMIT」越跑越慢。
+按 CRC32(mobile) 分片多进程：每进程独立读 + UPDATE。
+默认 --workers 16。
 
 Usage:
-  # 直接写库（推荐）
   python3 repair_application_calculator_versions.py --env ./ng_migration.env --apply
-
-  # 先看列是否存在 + 抽样
+  python3 repair_application_calculator_versions.py --env ./ng_migration.env --apply --workers 16 --batch 2000
   python3 repair_application_calculator_versions.py --env ./ng_migration.env --probe
-
-  # 可选全表统计（大表很慢，默认不做）
-  python3 repair_application_calculator_versions.py --env ./ng_migration.env --count
 """
 from __future__ import print_function
 
 import argparse
+import multiprocessing
 import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pymysql
+from pymysql.constants import CLIENT
 from pymysql.cursors import DictCursor
 
 HERE = Path(__file__).resolve().parent
@@ -68,6 +65,28 @@ def connect_target(cfg: Dict[str, str]):
         read_timeout=600,
         write_timeout=600,
         autocommit=False,
+        # rowcount = matched rows（值未变也计数），便于看进度
+        client_flag=CLIENT.FOUND_ROWS,
+    )
+
+
+def _as_int(val: Any, default: int = -999999) -> int:
+    if val is None or val == "":
+        return default
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        try:
+            return int(float(val))
+        except (TypeError, ValueError):
+            return default
+
+
+def row_needs_update(row: dict, v_prod: int, v_repay: int, v_roll: int) -> bool:
+    return (
+        _as_int(row.get("product_calculator_version")) != v_prod
+        or _as_int(row.get("repay_calculator_version")) != v_repay
+        or _as_int(row.get("rollover_calculator_version")) != v_roll
     )
 
 
@@ -141,25 +160,49 @@ def fetch_pk_batch(
     conn,
     batch: int,
     last: Optional[Tuple[str, Any, str]],
+    shard_id: int = 0,
+    shards: int = 1,
 ) -> List[dict]:
-    """按主键顺序取下一批 PK，不带版本条件（保证匀速推进）。"""
+    """按主键顺序取下一批行；shards>1 时 CRC32(mobile)%shards=shard_id。"""
+    cols = (
+        "mobile, group_user_id, sn, "
+        "product_calculator_version, repay_calculator_version, "
+        "rollover_calculator_version"
+    )
+    shard_clause = ""
+    shard_params = []  # type: List[Any]
+    if int(shards) > 1:
+        # 仅给 pymysql：%% → SQL 的 %；勿再经 str.format
+        shard_clause = "CRC32(mobile) %% %s = %s"
+
     if last is None:
+        if shard_clause:
+            where = "WHERE " + shard_clause
+            params = [int(shards), int(shard_id), int(batch)]
+        else:
+            where = ""
+            params = [int(batch)]
         sql = (
-            "SELECT mobile, group_user_id, sn FROM application "
-            "ORDER BY mobile, group_user_id, sn LIMIT %s"
+            "SELECT " + cols + " FROM application " + where
+            + " ORDER BY mobile, group_user_id, sn LIMIT %s"
         )
-        params = (int(batch),)  # type: Tuple
     else:
-        # (mobile, group_user_id, sn) > last
-        sql = (
-            "SELECT mobile, group_user_id, sn FROM application "
-            "WHERE mobile > %s "
-            "   OR (mobile = %s AND group_user_id > %s) "
-            "   OR (mobile = %s AND group_user_id = %s AND sn > %s) "
-            "ORDER BY mobile, group_user_id, sn LIMIT %s"
+        key_clause = (
+            "(mobile > %s "
+            " OR (mobile = %s AND group_user_id > %s) "
+            " OR (mobile = %s AND group_user_id = %s AND sn > %s))"
         )
         m, g, s = last
-        params = (m, m, g, m, g, s, int(batch))
+        if shard_clause:
+            where = "WHERE " + shard_clause + " AND " + key_clause
+            params = [int(shards), int(shard_id), m, m, g, m, g, s, int(batch)]
+        else:
+            where = "WHERE " + key_clause
+            params = [m, m, g, m, g, s, int(batch)]
+        sql = (
+            "SELECT " + cols + " FROM application " + where
+            + " ORDER BY mobile, group_user_id, sn LIMIT %s"
+        )
     with conn.cursor() as cur:
         cur.execute(sql, params)
         return list(cur.fetchall())
@@ -199,68 +242,180 @@ def apply_keyset(
     v_prod: int,
     v_repay: int,
     v_roll: int,
-) -> int:
+    shard_id: int = 0,
+    shards: int = 1,
+    label: str = "",
+) -> Dict[str, int]:
     session_opts(conn)
     last = None  # type: Optional[Tuple[str, Any, str]]
     round_no = 0
     scanned = 0
-    affected_total = 0
+    need_total = 0
+    changed_total = 0
     t0 = time.time()
+    prefix = ("[%s] " % label) if label else ""
     print(
-        "start keyset update batch=%s (no full COUNT; progress every batch)"
-        % batch,
+        "%sstart keyset shard=%s/%s batch=%s target=(%s,%s,%s)"
+        % (prefix, shard_id, shards, batch, v_prod, v_repay, v_roll),
         flush=True,
     )
     while True:
         round_no += 1
         t_batch = time.time()
         try:
-            rows = fetch_pk_batch(conn, batch, last)
+            rows = fetch_pk_batch(conn, batch, last, shard_id, shards)
         except Exception as exc:
-            print("select failed: %s ; reconnect..." % exc, flush=True)
+            print("%sselect failed: %s ; reconnect..." % (prefix, exc), flush=True)
             conn.ping(reconnect=True)
             session_opts(conn)
-            rows = fetch_pk_batch(conn, batch, last)
+            rows = fetch_pk_batch(conn, batch, last, shard_id, shards)
         if not rows:
             break
-        try:
-            n = update_pk_batch(conn, rows, v_prod, v_repay, v_roll)
-            conn.commit()
-        except Exception as exc:
+
+        need_rows = [r for r in rows if row_needs_update(r, v_prod, v_repay, v_roll)]
+        sample = rows[0]
+        n = 0
+        if need_rows:
             try:
-                conn.rollback()
-            except Exception:
-                pass
-            print("update failed batch=%s: %s" % (round_no, exc), flush=True)
-            raise
+                n = update_pk_batch(conn, need_rows, v_prod, v_repay, v_roll)
+                conn.commit()
+            except Exception as exc:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                print("%supdate failed batch=%s: %s" % (prefix, round_no, exc), flush=True)
+                raise
+
         scanned += len(rows)
-        affected_total += n
+        need_total += len(need_rows)
+        changed_total += n
         last_row = rows[-1]
         last = (
             str(last_row["mobile"]),
             last_row["group_user_id"],
             str(last_row["sn"]),
         )
-        print(
-            "batch=%s scanned=%s affected=%s total_affected=%s "
-            "last_mobile=%s elapsed=%.1fs batch_secs=%.2fs"
-            % (
-                round_no,
-                scanned,
-                n,
-                affected_total,
-                last[0][:24],
-                time.time() - t0,
-                time.time() - t_batch,
-            ),
-            flush=True,
-        )
+        # 多进程时每 10 批打一行，避免刷屏；单进程每批都打
+        if shards <= 1 or round_no == 1 or round_no % 10 == 0 or len(rows) < batch:
+            print(
+                "%sbatch=%s scanned=%s need=%s changed=%s "
+                "need_total=%s changed_total=%s "
+                "sample_ver=(%s,%s,%s) last_mobile=%s "
+                "elapsed=%.1fs batch_secs=%.2fs"
+                % (
+                    prefix,
+                    round_no,
+                    scanned,
+                    len(need_rows),
+                    n,
+                    need_total,
+                    changed_total,
+                    sample.get("product_calculator_version"),
+                    sample.get("repay_calculator_version"),
+                    sample.get("rollover_calculator_version"),
+                    str(last[0])[:24],
+                    time.time() - t0,
+                    time.time() - t_batch,
+                ),
+                flush=True,
+            )
     print(
-        "done scanned=%s affected=%s elapsed=%.1fs"
-        % (scanned, affected_total, time.time() - t0),
+        "%sdone scanned=%s need_total=%s changed_total=%s elapsed=%.1fs"
+        % (prefix, scanned, need_total, changed_total, time.time() - t0),
         flush=True,
     )
-    return affected_total
+    return {
+        "scanned": scanned,
+        "need_total": need_total,
+        "changed_total": changed_total,
+    }
+
+
+def _worker_apply(spec: dict) -> Dict[str, int]:
+    """跨进程 worker：每进程独立连接，负责一个 CRC32 分片。"""
+    cfg = spec["cfg"]
+    conn = connect_target(cfg)
+    try:
+        return apply_keyset(
+            conn,
+            int(spec["batch"]),
+            int(spec["product"]),
+            int(spec["repay"]),
+            int(spec["rollover"]),
+            shard_id=int(spec["shard_id"]),
+            shards=int(spec["shards"]),
+            label=str(spec["label"]),
+        )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def apply_parallel(
+    cfg: Dict[str, str],
+    workers: int,
+    batch: int,
+    v_prod: int,
+    v_repay: int,
+    v_roll: int,
+) -> Dict[str, int]:
+    workers = max(1, int(workers))
+    batch = max(100, int(batch))
+    if workers == 1:
+        conn = connect_target(cfg)
+        try:
+            return apply_keyset(
+                conn, batch, v_prod, v_repay, v_roll,
+                shard_id=0, shards=1, label="w0",
+            )
+        finally:
+            conn.close()
+
+    specs = []
+    for i in range(workers):
+        specs.append({
+            "cfg": cfg,
+            "batch": batch,
+            "product": v_prod,
+            "repay": v_repay,
+            "rollover": v_roll,
+            "shard_id": i,
+            "shards": workers,
+            "label": "w%s" % i,
+        })
+    print(
+        "parallel apply workers=%s batch=%s (CRC32(mobile) %% %s)"
+        % (workers, batch, workers),
+        flush=True,
+    )
+    t0 = time.time()
+    ctx = multiprocessing.get_context("spawn")
+    with ctx.Pool(processes=workers) as pool:
+        results = pool.map(_worker_apply, specs)
+    total = {"scanned": 0, "need_total": 0, "changed_total": 0}
+    for r in results:
+        total["scanned"] += int(r.get("scanned") or 0)
+        total["need_total"] += int(r.get("need_total") or 0)
+        total["changed_total"] += int(r.get("changed_total") or 0)
+    print(
+        "all workers done scanned=%s need_total=%s changed_total=%s elapsed=%.1fs"
+        % (
+            total["scanned"],
+            total["need_total"],
+            total["changed_total"],
+            time.time() - t0,
+        ),
+        flush=True,
+    )
+    if total["scanned"] > 0 and total["need_total"] == 0:
+        print(
+            "NOTE: 扫描范围内三列已全是目标值，无需再改。可用 --probe 看分布。",
+            flush=True,
+        )
+    return total
 
 
 def count_stats(conn, v_prod: int, v_repay: int, v_roll: int) -> Tuple[int, int]:
@@ -292,6 +447,10 @@ def main(argv=None) -> int:
     p.add_argument("--probe", action="store_true", help="检查列 + GROUP BY 抽样")
     p.add_argument("--count", action="store_true", help="全表 COUNT（很慢）")
     p.add_argument("--batch", type=int, default=2000, help="每批行数，默认 2000")
+    p.add_argument(
+        "--workers", type=int, default=16,
+        help="并发进程数（CRC32 分片读写），默认 16",
+    )
     p.add_argument("--product", type=int, default=DEFAULTS["product_calculator_version"])
     p.add_argument("--repay", type=int, default=DEFAULTS["repay_calculator_version"])
     p.add_argument("--rollover", type=int, default=DEFAULTS["rollover_calculator_version"])
@@ -306,7 +465,7 @@ def main(argv=None) -> int:
     conn = connect_target(cfg)
     try:
         print(
-            "target=%s:%s/%s set product=%s repay=%s rollover=%s"
+            "target=%s:%s/%s set product=%s repay=%s rollover=%s workers=%s"
             % (
                 cfg.get("TARGET_HOST"),
                 cfg.get("TARGET_PORT", "3306"),
@@ -314,6 +473,7 @@ def main(argv=None) -> int:
                 args.product,
                 args.repay,
                 args.rollover,
+                args.workers,
             ),
             flush=True,
         )
@@ -329,23 +489,26 @@ def main(argv=None) -> int:
             if not args.apply:
                 print("dry-run / probe only (add --apply to write)", flush=True)
                 return 0
-
-        apply_keyset(
-            conn,
-            max(100, int(args.batch)),
-            args.product,
-            args.repay,
-            args.rollover,
-        )
-        return 0
-    except Exception as exc:
-        print("ERROR: %s" % exc, file=sys.stderr, flush=True)
-        return 1
     finally:
         try:
             conn.close()
         except Exception:
             pass
+
+    if args.apply:
+        try:
+            apply_parallel(
+                cfg,
+                max(1, int(args.workers)),
+                max(100, int(args.batch)),
+                args.product,
+                args.repay,
+                args.rollover,
+            )
+        except Exception as exc:
+            print("ERROR: %s" % exc, file=sys.stderr, flush=True)
+            return 1
+    return 0
 
 
 if __name__ == "__main__":
