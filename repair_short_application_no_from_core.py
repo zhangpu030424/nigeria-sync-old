@@ -43,6 +43,17 @@ from pymysql.cursors import DictCursor
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_MIN_SUFFIX_LEN = 15
+_TRANSIENT_ERRNOS = frozenset({0, 1159, 1205, 2006, 2013, 2014, 2055})
+
+
+def _is_transient_mysql_error(exc: BaseException) -> bool:
+    if isinstance(exc, pymysql.err.InterfaceError):
+        return True
+    if isinstance(exc, pymysql.err.OperationalError):
+        if not exc.args:
+            return True
+        return exc.args[0] in _TRANSIENT_ERRNOS
+    return False
 
 
 def load_env(path: Path) -> Dict[str, str]:
@@ -145,21 +156,92 @@ def _chunk_list(items: Sequence[str], size: int) -> List[List[str]]:
     return [list(items[i:i + n]) for i in range(0, len(items), n)]
 
 
-def _lookup_target_app_nos_batch(cfg: Dict[str, str], app_nos: List[str]) -> set:
-    """单连接查一批 application_no 是否存在。"""
+def _lookup_target_app_nos_with_conn(tgt, app_nos: List[str]) -> set:
     found = set()
     if not app_nos:
         return found
+    ph = ",".join(["%s"] * len(app_nos))
+    with tgt.cursor() as cur:
+        cur.execute(
+            "SELECT application_no FROM application WHERE application_no IN ({0})".format(ph),
+            app_nos,
+        )
+        for row in cur.fetchall():
+            found.add(str(row.get("application_no") or "").strip())
+    return found
+
+
+def _lookup_target_app_nos_batch(cfg: Dict[str, str], app_nos: List[str]) -> set:
+    """单批查询；断线重试，仍失败则对半拆。"""
+    if not app_nos:
+        return set()
+    last_exc = None  # type: Optional[BaseException]
+    for attempt in range(4):
+        tgt = connect_target(cfg)
+        try:
+            return _lookup_target_app_nos_with_conn(tgt, app_nos)
+        except Exception as exc:
+            last_exc = exc
+            try:
+                tgt.ping(reconnect=True)
+            except Exception:
+                pass
+            if attempt < 3 and _is_transient_mysql_error(exc):
+                time.sleep(1.0 + attempt * 2.0)
+                continue
+            break
+        finally:
+            try:
+                tgt.close()
+            except Exception:
+                pass
+    if len(app_nos) > 1:
+        mid = len(app_nos) // 2
+        left = _lookup_target_app_nos_batch(cfg, app_nos[:mid])
+        right = _lookup_target_app_nos_batch(cfg, app_nos[mid:])
+        left.update(right)
+        return left
+    if last_exc is not None:
+        raise last_exc
+    return set()
+
+
+def _lookup_worker_chunks(cfg: Dict[str, str], chunks: List[List[str]], wid: int) -> set:
+    """单 worker 单连接顺序查多批，避免 16 路同时打爆目标库。"""
+    found = set()
+    if not chunks:
+        return found
     tgt = connect_target(cfg)
+    total = len(chunks)
     try:
-        ph = ",".join(["%s"] * len(app_nos))
-        with tgt.cursor() as cur:
-            cur.execute(
-                "SELECT application_no FROM application WHERE application_no IN ({0})".format(ph),
-                app_nos,
-            )
-            for row in cur.fetchall():
-                found.add(str(row.get("application_no") or "").strip())
+        for i, chunk in enumerate(chunks, 1):
+            for attempt in range(4):
+                try:
+                    tgt.ping(reconnect=True)
+                    found.update(_lookup_target_app_nos_with_conn(tgt, chunk))
+                    break
+                except Exception as exc:
+                    try:
+                        tgt.rollback()
+                    except Exception:
+                        pass
+                    if attempt < 3 and _is_transient_mysql_error(exc):
+                        time.sleep(1.0 + attempt * 2.0)
+                        try:
+                            tgt.ping(reconnect=True)
+                        except Exception:
+                            tgt = connect_target(cfg)
+                        continue
+                    # 单连接仍失败 → 拆半递归（新连接）
+                    part = _lookup_target_app_nos_batch(cfg, chunk)
+                    found.update(part)
+                    break
+            if i == 1 or i % 10 == 0 or i == total:
+                print(
+                    "  [w%s] progress batches=%s/%s found=%s"
+                    % (wid, i, total, len(found)),
+                    flush=True,
+                )
     finally:
         try:
             tgt.close()
@@ -171,49 +253,50 @@ def _lookup_target_app_nos_batch(cfg: Dict[str, str], app_nos: List[str]) -> set
 def target_has_application_nos(
     cfg: Dict[str, str],
     app_nos: Sequence[str],
-    workers: int = 16,
-    batch_size: int = 500,
+    workers: int = 8,
+    batch_size: int = 200,
 ) -> set:
-    """多线程分批查目标库长号是否已存在。"""
+    """多 worker 分批查目标库长号是否已存在（每 worker 单连接顺序查）。"""
     uniq = sorted({str(x).strip() for x in app_nos if str(x).strip()})
     if not uniq:
         return set()
-    workers = max(1, min(int(workers), 32))
-    batch_size = max(50, int(batch_size))
+    workers = max(1, min(int(workers), 16))
+    batch_size = max(50, min(int(batch_size), 500))
     chunks = _chunk_list(uniq, batch_size)
     found = set()
-    done_batches = 0
     t0 = time.time()
     print(
         "lookup target existing long application_no: uniq=%s batches=%s workers=%s batch=%s ..."
         % (len(uniq), len(chunks), workers, batch_size),
         flush=True,
     )
-    if workers == 1 or len(chunks) <= 1:
-        for i, chunk in enumerate(chunks, 1):
-            found.update(_lookup_target_app_nos_batch(cfg, chunk))
-            if i == 1 or i % 20 == 0 or i == len(chunks):
-                print(
-                    "  lookup progress batches=%s/%s found=%s elapsed=%.1fs"
-                    % (i, len(chunks), len(found), time.time() - t0),
-                    flush=True,
-                )
+    if workers == 1:
+        found.update(_lookup_worker_chunks(cfg, chunks, 0))
+        print(
+            "  lookup done found=%s elapsed=%.1fs"
+            % (len(found), time.time() - t0),
+            flush=True,
+        )
         return found
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(_lookup_target_app_nos_batch, cfg, chunk): len(chunk)
-            for chunk in chunks
-        }
-        for fut in as_completed(futures):
+    # 把 batch 均分给 worker，每 worker 内顺序查
+    worker_chunks = [[] for _ in range(workers)]  # type: List[List[List[str]]]
+    for i, chunk in enumerate(chunks):
+        worker_chunks[i % workers].append(chunk)
+    worker_chunks = [c for c in worker_chunks if c]
+
+    with ThreadPoolExecutor(max_workers=len(worker_chunks)) as pool:
+        futs = [
+            pool.submit(_lookup_worker_chunks, cfg, wc, i)
+            for i, wc in enumerate(worker_chunks)
+        ]
+        for fut in as_completed(futs):
             found.update(fut.result())
-            done_batches += 1
-            if done_batches == 1 or done_batches % 20 == 0 or done_batches == len(chunks):
-                print(
-                    "  lookup progress batches=%s/%s found=%s elapsed=%.1fs"
-                    % (done_batches, len(chunks), len(found), time.time() - t0),
-                    flush=True,
-                )
+    print(
+        "  lookup done found=%s elapsed=%.1fs"
+        % (len(found), time.time() - t0),
+        flush=True,
+    )
     return found
 
 
@@ -551,12 +634,12 @@ def main(argv=None) -> int:
     p.add_argument("--apply-only", action="store_true", help="只用已有 plan 写库")
     p.add_argument("--workers", type=int, default=8, help="apply 写库并发")
     p.add_argument(
-        "--lookup-workers", type=int, default=16,
-        help="plan 阶段查源/目标库并发，默认 16",
+        "--lookup-workers", type=int, default=8,
+        help="plan 阶段查目标库并发 worker（每 worker 单连接顺序查），默认 8",
     )
     p.add_argument(
-        "--lookup-batch", type=int, default=500,
-        help="plan 阶段每批 IN 条数，默认 500",
+        "--lookup-batch", type=int, default=200,
+        help="plan 阶段每批 IN 条数，默认 200",
     )
     p.add_argument("--batch", type=int, default=200, help="apply 日志切分粒度")
     p.add_argument(
