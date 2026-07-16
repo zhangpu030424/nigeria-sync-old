@@ -140,61 +140,160 @@ def load_short_applications(tgt, min_suffix_len: int) -> List[dict]:
     return out
 
 
-def fetch_ext_sn_by_core_sn(src, core_sns: Sequence[str]) -> Dict[str, List[str]]:
-    """core.sn -> [ext_sn, ...]（正常一对一；多条记列表）。"""
-    uniq = sorted({str(x).strip() for x in core_sns if str(x).strip()})
-    out = {}  # type: Dict[str, List[str]]
-    if not uniq:
-        return out
-    c = "ng_loan_core"
-    chunk = 500
-    for i in range(0, len(uniq), chunk):
-        part = uniq[i:i + chunk]
-        ph = ",".join(["%s"] * len(part))
-        sql = (
-            "SELECT sn, ext_sn FROM `{0}`.application "
-            "WHERE sn IN ({1}) "
-            "AND ext_sn IS NOT NULL AND ext_sn <> ''"
-        ).format(c, ph)
-        with src.cursor() as cur:
-            cur.execute(sql, part)
-            for row in cur.fetchall():
-                sn = str(row.get("sn") or "").strip()
-                ext = str(row.get("ext_sn") or "").strip()
-                if not sn or not ext:
-                    continue
-                out.setdefault(sn, [])
-                if ext not in out[sn]:
-                    out[sn].append(ext)
-    return out
+def _chunk_list(items: Sequence[str], size: int) -> List[List[str]]:
+    n = max(1, int(size))
+    return [list(items[i:i + n]) for i in range(0, len(items), n)]
 
 
-def target_has_application_no(tgt, application_no: str) -> bool:
-    with tgt.cursor() as cur:
-        cur.execute(
-            "SELECT 1 AS ok FROM application WHERE application_no=%s LIMIT 1",
-            (application_no,),
-        )
-        return cur.fetchone() is not None
-
-
-def target_has_application_nos(tgt, app_nos: Sequence[str]) -> set:
-    uniq = sorted({str(x).strip() for x in app_nos if str(x).strip()})
+def _lookup_target_app_nos_batch(cfg: Dict[str, str], app_nos: List[str]) -> set:
+    """单连接查一批 application_no 是否存在。"""
     found = set()
-    if not uniq:
+    if not app_nos:
         return found
-    chunk = 500
-    for i in range(0, len(uniq), chunk):
-        part = uniq[i:i + chunk]
-        ph = ",".join(["%s"] * len(part))
+    tgt = connect_target(cfg)
+    try:
+        ph = ",".join(["%s"] * len(app_nos))
         with tgt.cursor() as cur:
             cur.execute(
                 "SELECT application_no FROM application WHERE application_no IN ({0})".format(ph),
-                part,
+                app_nos,
             )
             for row in cur.fetchall():
                 found.add(str(row.get("application_no") or "").strip())
+    finally:
+        try:
+            tgt.close()
+        except Exception:
+            pass
     return found
+
+
+def target_has_application_nos(
+    cfg: Dict[str, str],
+    app_nos: Sequence[str],
+    workers: int = 16,
+    batch_size: int = 500,
+) -> set:
+    """多线程分批查目标库长号是否已存在。"""
+    uniq = sorted({str(x).strip() for x in app_nos if str(x).strip()})
+    if not uniq:
+        return set()
+    workers = max(1, min(int(workers), 32))
+    batch_size = max(50, int(batch_size))
+    chunks = _chunk_list(uniq, batch_size)
+    found = set()
+    done_batches = 0
+    t0 = time.time()
+    print(
+        "lookup target existing long application_no: uniq=%s batches=%s workers=%s batch=%s ..."
+        % (len(uniq), len(chunks), workers, batch_size),
+        flush=True,
+    )
+    if workers == 1 or len(chunks) <= 1:
+        for i, chunk in enumerate(chunks, 1):
+            found.update(_lookup_target_app_nos_batch(cfg, chunk))
+            if i == 1 or i % 20 == 0 or i == len(chunks):
+                print(
+                    "  lookup progress batches=%s/%s found=%s elapsed=%.1fs"
+                    % (i, len(chunks), len(found), time.time() - t0),
+                    flush=True,
+                )
+        return found
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_lookup_target_app_nos_batch, cfg, chunk): len(chunk)
+            for chunk in chunks
+        }
+        for fut in as_completed(futures):
+            found.update(fut.result())
+            done_batches += 1
+            if done_batches == 1 or done_batches % 20 == 0 or done_batches == len(chunks):
+                print(
+                    "  lookup progress batches=%s/%s found=%s elapsed=%.1fs"
+                    % (done_batches, len(chunks), len(found), time.time() - t0),
+                    flush=True,
+                )
+    return found
+
+
+def fetch_ext_sn_by_core_sn(
+    cfg: Dict[str, str],
+    core_sns: Sequence[str],
+    workers: int = 8,
+    batch_size: int = 500,
+) -> Dict[str, List[str]]:
+    """core.sn -> [ext_sn, ...]；多线程分批查源库。"""
+    uniq = sorted({str(x).strip() for x in core_sns if str(x).strip()})
+    if not uniq:
+        return {}
+    workers = max(1, min(int(workers), 16))
+    batch_size = max(50, int(batch_size))
+    chunks = _chunk_list(uniq, batch_size)
+    c = "ng_loan_core"
+
+    def _one_batch(part: List[str]) -> Dict[str, List[str]]:
+        local = {}  # type: Dict[str, List[str]]
+        if not part:
+            return local
+        src = connect_source(cfg)
+        try:
+            ph = ",".join(["%s"] * len(part))
+            sql = (
+                "SELECT sn, ext_sn FROM `{0}`.application "
+                "WHERE sn IN ({1}) "
+                "AND ext_sn IS NOT NULL AND ext_sn <> ''"
+            ).format(c, ph)
+            with src.cursor() as cur:
+                cur.execute(sql, part)
+                for row in cur.fetchall():
+                    sn = str(row.get("sn") or "").strip()
+                    ext = str(row.get("ext_sn") or "").strip()
+                    if not sn or not ext:
+                        continue
+                    local.setdefault(sn, [])
+                    if ext not in local[sn]:
+                        local[sn].append(ext)
+        finally:
+            try:
+                src.close()
+            except Exception:
+                pass
+        return local
+
+    out = {}  # type: Dict[str, List[str]]
+    t0 = time.time()
+    print(
+        "lookup source ext_sn: uniq=%s batches=%s workers=%s ..."
+        % (len(uniq), len(chunks), workers),
+        flush=True,
+    )
+    done = 0
+    if workers == 1 or len(chunks) <= 1:
+        for chunk in chunks:
+            part = _one_batch(chunk)
+            for k, v in part.items():
+                out.setdefault(k, [])
+                for x in v:
+                    if x not in out[k]:
+                        out[k].append(x)
+            done += 1
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for part in pool.map(_one_batch, chunks):
+                for k, v in part.items():
+                    out.setdefault(k, [])
+                    for x in v:
+                        if x not in out[k]:
+                            out[k].append(x)
+                done += 1
+                if done == 1 or done % 20 == 0 or done == len(chunks):
+                    print(
+                        "  source progress batches=%s/%s mapped=%s elapsed=%.1fs"
+                        % (done, len(chunks), len(out), time.time() - t0),
+                        flush=True,
+                    )
+    return out
 
 
 def build_plan(
@@ -204,7 +303,9 @@ def build_plan(
 ) -> Tuple[List[dict], Counter]:
     plan = []  # type: List[dict]
     stats = Counter()  # type: Counter
-    for row in short_rows:
+    total = len(short_rows)
+    t0 = time.time()
+    for i, row in enumerate(short_rows, 1):
         stats["short_total"] += 1
         short_sn = row["short_sn"] or app_suffix(row["application_no"])
         if not short_sn:
@@ -244,7 +345,6 @@ def build_plan(
             stats["skip_bad_app_id"] += 1
             continue
         if good_app_no == row["application_no"]:
-            # 后缀已是长号但 CHAR_LENGTH 误判？跳过
             stats["skip_already_good"] += 1
             continue
         if good_app_no in existing_long:
@@ -253,7 +353,7 @@ def build_plan(
         else:
             action = "update"
             stats["plan_update"] += 1
-            existing_long.add(good_app_no)  # 同批后续短号撞上时改删
+            existing_long.add(good_app_no)
         plan.append({
             "action": action,
             "reason": "long_exists" if action == "delete" else "long_missing",
@@ -267,6 +367,12 @@ def build_plan(
             "good_sn": ext_sn,
             "app_id": row["app_id"],
         })
+        if i == 1 or i % 10000 == 0 or i == total:
+            print(
+                "  build_plan progress %s/%s elapsed=%.1fs"
+                % (i, total, time.time() - t0),
+                flush=True,
+            )
     return plan, stats
 
 
@@ -443,8 +549,16 @@ def main(argv=None) -> int:
     p.add_argument("--min-suffix-len", type=int, default=DEFAULT_MIN_SUFFIX_LEN)
     p.add_argument("--apply", action="store_true", help="生成 plan 后写库")
     p.add_argument("--apply-only", action="store_true", help="只用已有 plan 写库")
-    p.add_argument("--workers", type=int, default=8)
-    p.add_argument("--batch", type=int, default=200, help="仅用于日志切分；实际按行提交")
+    p.add_argument("--workers", type=int, default=8, help="apply 写库并发")
+    p.add_argument(
+        "--lookup-workers", type=int, default=16,
+        help="plan 阶段查源/目标库并发，默认 16",
+    )
+    p.add_argument(
+        "--lookup-batch", type=int, default=500,
+        help="plan 阶段每批 IN 条数，默认 500",
+    )
+    p.add_argument("--batch", type=int, default=200, help="apply 日志切分粒度")
     p.add_argument(
         "--no-fix-loan",
         action="store_true",
@@ -462,7 +576,6 @@ def main(argv=None) -> int:
 
     if not args.apply_only:
         tgt = connect_target(cfg)
-        src = connect_source(cfg)
         try:
             print(
                 "scan short application_no suffix_len < %s ..."
@@ -476,34 +589,46 @@ def main(argv=None) -> int:
                 flush=True,
             )
             core_sns = [r["short_sn"] for r in short_rows]
-            print("lookup core.application by sn=%s ..." % len(set(core_sns)), flush=True)
             t1 = time.time()
-            ext_map = fetch_ext_sn_by_core_sn(src, core_sns)
+            ext_map = fetch_ext_sn_by_core_sn(
+                cfg, core_sns,
+                workers=args.lookup_workers,
+                batch_size=args.lookup_batch,
+            )
             print(
                 "mapped core_sn=%s elapsed=%.1fs"
                 % (len(ext_map), time.time() - t1),
                 flush=True,
             )
 
-            # 预生成全部候选长号，批量查目标是否存在
+            print("build candidate long application_no ...", flush=True)
+            t2 = time.time()
             candidates = []
             for row in short_rows:
                 exts = ext_map.get(row["short_sn"]) or []
                 if len(exts) == 1:
                     candidates.append(format_application_no(row.get("app_id"), exts[0]))
-            existing_long = target_has_application_nos(tgt, candidates)
+            print(
+                "candidates=%s elapsed=%.1fs"
+                % (len(candidates), time.time() - t2),
+                flush=True,
+            )
+            existing_long = target_has_application_nos(
+                cfg, candidates,
+                workers=args.lookup_workers,
+                batch_size=args.lookup_batch,
+            )
             print("existing long application_no=%s" % len(existing_long), flush=True)
 
+            print("build plan ...", flush=True)
+            t3 = time.time()
             plan, stats = build_plan(short_rows, ext_map, existing_long)
+            print("build plan done elapsed=%.1fs" % (time.time() - t3), flush=True)
             n = write_jsonl(plan_path, plan)
             print("plan written %s rows=%s stats=%s" % (plan_path, n, dict(stats)), flush=True)
         finally:
             try:
                 tgt.close()
-            except Exception:
-                pass
-            try:
-                src.close()
             except Exception:
                 pass
     else:
