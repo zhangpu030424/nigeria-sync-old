@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS cdc_uri (
 );
 
 CREATE TABLE IF NOT EXISTS dim_user_info_bundle (
-    user_id BIGINT, full_name STRING, id_number_token STRING, password STRING,
+    user_id DECIMAL(20, 0), full_name STRING, id_number_token STRING, password STRING,
     registration_ip STRING, install_channel STRING, app_name STRING, app_id BIGINT, reg_time BIGINT,
     bvn_raw STRING,
     email STRING, birthday STRING, gender BIGINT,
@@ -72,30 +72,76 @@ CREATE TABLE IF NOT EXISTS sink_user_info (
 );
 
 CREATE TEMPORARY VIEW v_ui_triggers AS
-SELECT id AS user_id, proc_time FROM cdc_user WHERE id IS NOT NULL
+SELECT CAST(id AS DECIMAL(20, 0)) AS user_id, proc_time FROM cdc_user WHERE id IS NOT NULL
 UNION ALL
-SELECT `userId` AS user_id, proc_time FROM cdc_user_data WHERE `userId` IS NOT NULL
+SELECT CAST(`userId` AS DECIMAL(20, 0)) AS user_id, proc_time FROM cdc_user_data WHERE `userId` IS NOT NULL
 UNION ALL
-SELECT `userId` AS user_id, proc_time FROM cdc_uri WHERE `userId` IS NOT NULL;
+SELECT CAST(`userId` AS DECIMAL(20, 0)) AS user_id, proc_time FROM cdc_uri WHERE `userId` IS NOT NULL;
 
+-- JSON 标量字符串：空白 → null；转义双引号与反斜杠
+-- 结构对齐 ng_migration_run._build_user_info_json（emergency_contacts 增量暂写 []）
 INSERT INTO sink_user_info
 SELECT
-    b.user_id,
+    CAST(b.user_id AS BIGINT),
     COALESCE(
         NULLIF(TRIM(b.id_number_token), ''),
         CASE WHEN b.bvn_raw IS NOT NULL AND TRIM(b.bvn_raw) <> '' THEN vt_tokenize(TRIM(b.bvn_raw)) ELSE '' END
     ) AS id_number,
-    TRIM(b.full_name) AS full_name,
+    NULLIF(TRIM(b.full_name), '') AS full_name,
     b.password,
     '' AS live_image,
     '' AS id_card,
     CONCAT(
-        '{"full_name":', CASE WHEN b.full_name IS NULL THEN 'null' ELSE CONCAT('"', REPLACE(b.full_name, '"', '\\"'), '"') END,
-        ',"registration_ip":', CASE WHEN b.registration_ip IS NULL THEN 'null' ELSE CONCAT('"', b.registration_ip, '"') END,
-        ',"registration_time":', CASE WHEN b.reg_time IS NULL THEN 'null' ELSE CAST(b.reg_time AS STRING) END,
-        ',"install_source":', CASE WHEN b.install_channel IS NULL THEN 'null' ELSE CONCAT('"', b.install_channel, '"') END,
-        ',"app":{"name":', CASE WHEN b.app_name IS NULL THEN 'null' ELSE CONCAT('"', b.app_name, '"') END,
-        ',"app_id":', CASE WHEN b.app_id IS NULL THEN 'null' ELSE CONCAT('"', CAST(b.app_id AS STRING), '"') END, ',"version":null}}'
+        '{',
+        '"full_name":', CASE WHEN b.full_name IS NULL OR TRIM(b.full_name) = '' THEN 'null'
+            ELSE CONCAT('"', REPLACE(REPLACE(TRIM(b.full_name), '\\', '\\\\'), '"', '\\"'), '"') END,
+        ',"email":', CASE WHEN b.email IS NULL OR TRIM(b.email) = '' THEN 'null'
+            ELSE CONCAT('"', REPLACE(REPLACE(TRIM(b.email), '\\', '\\\\'), '"', '\\"'), '"') END,
+        ',"birthday":', CASE WHEN b.birthday IS NULL OR TRIM(b.birthday) = '' THEN 'null'
+            ELSE CONCAT('"', REPLACE(REPLACE(TRIM(b.birthday), '\\', '\\\\'), '"', '\\"'), '"') END,
+        ',"gender":', CASE WHEN b.gender IS NULL THEN 'null' ELSE CAST(b.gender AS STRING) END,
+        ',"id_card":null',
+        ',"live_image":null',
+        ',"face_similarity":null',
+        ',"address":{',
+            '"province":', CASE WHEN b.addressState IS NULL OR TRIM(b.addressState) = '' THEN 'null'
+                ELSE CONCAT('"', REPLACE(REPLACE(TRIM(b.addressState), '\\', '\\\\'), '"', '\\"'), '"') END,
+            ',"city":', CASE WHEN b.addressDistrict IS NULL OR TRIM(b.addressDistrict) = '' THEN 'null'
+                ELSE CONCAT('"', REPLACE(REPLACE(TRIM(b.addressDistrict), '\\', '\\\\'), '"', '\\"'), '"') END,
+            ',"district":null',
+            ',"village":null',
+            ',"detail":', CASE WHEN b.address IS NULL OR TRIM(b.address) = '' THEN 'null'
+                ELSE CONCAT('"', REPLACE(REPLACE(TRIM(b.address), '\\', '\\\\'), '"', '\\"'), '"') END,
+        '}',
+        ',"company":', CASE WHEN b.company IS NULL OR TRIM(b.company) = '' THEN 'null'
+            ELSE CONCAT('"', REPLACE(REPLACE(TRIM(b.company), '\\', '\\\\'), '"', '\\"'), '"') END,
+        ',"education":', CASE WHEN b.education IS NULL THEN 'null' ELSE CAST(b.education AS STRING) END,
+        ',"loan_purpose":null',
+        ',"marital":', CASE WHEN b.marital IS NULL THEN 'null' ELSE CAST(b.marital AS STRING) END,
+        ',"job_type":null',
+        ',"profession":', CASE WHEN b.profession IS NULL OR TRIM(b.profession) = '' THEN 'null'
+            ELSE CONCAT('"', REPLACE(REPLACE(TRIM(b.profession), '\\', '\\\\'), '"', '\\"'), '"') END,
+        ',"religion":null',
+        ',"salary":', CASE WHEN b.salary IS NULL OR TRIM(b.salary) = '' THEN 'null'
+            ELSE CONCAT('"', REPLACE(REPLACE(TRIM(b.salary), '\\', '\\\\'), '"', '\\"'), '"') END,
+        ',"emergency_contacts":[]',
+        ',"registration_ip":', CASE WHEN b.registration_ip IS NULL OR TRIM(b.registration_ip) = '' THEN 'null'
+            ELSE CONCAT('"', REPLACE(REPLACE(TRIM(b.registration_ip), '\\', '\\\\'), '"', '\\"'), '"') END,
+        ',"registration_time":', CASE WHEN b.reg_time IS NULL OR b.reg_time = 0 THEN 'null' ELSE CAST(b.reg_time AS STRING) END,
+        ',"children_num":', CASE WHEN b.numberOfChildren IS NULL THEN 'null' ELSE CAST(b.numberOfChildren AS STRING) END,
+        ',"pay_cycle":', CASE WHEN b.payCycle IS NULL THEN 'null' ELSE CAST(b.payCycle AS STRING) END,
+        ',"salary_day":', CASE WHEN b.salaryDay IS NULL THEN 'null' ELSE CAST(b.salaryDay AS STRING) END,
+        ',"survey":{"survey_loan_cnt":null,"survey_outstanding_cnt":null,"survey_overdue_max_days":null,"survey_overdue_6m":null,"survey_loan_amt_total":null}',
+        ',"app":{',
+            '"name":', CASE WHEN b.app_name IS NULL OR TRIM(b.app_name) = '' THEN 'null'
+                ELSE CONCAT('"', REPLACE(REPLACE(TRIM(b.app_name), '\\', '\\\\'), '"', '\\"'), '"') END,
+            ',"app_id":', CASE WHEN b.app_id IS NULL THEN 'null' ELSE CONCAT('"', CAST(b.app_id AS STRING), '"') END,
+            ',"version":null',
+        '}',
+        ',"install_source":', CASE WHEN b.install_channel IS NULL OR TRIM(b.install_channel) = '' THEN 'null'
+            ELSE CONCAT('"', REPLACE(REPLACE(TRIM(b.install_channel), '\\', '\\\\'), '"', '\\"'), '"') END,
+        ',"credit_limit":null',
+        '}'
     ) AS info
 FROM v_ui_triggers AS t
 INNER JOIN dim_user_info_bundle FOR SYSTEM_TIME AS OF t.proc_time AS b

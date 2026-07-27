@@ -75,7 +75,7 @@ CREATE TABLE IF NOT EXISTS cdc_user_data (
 );
 
 CREATE TABLE IF NOT EXISTS dim_app_bundle (
-    app_row_id BIGINT,
+    app_row_id DECIMAL(20, 0),
     market_no STRING,
     application_no STRING,
     mobile_norm STRING,
@@ -121,11 +121,11 @@ CREATE TABLE IF NOT EXISTS dim_app_bundle (
 
 CREATE TABLE IF NOT EXISTS dim_market_app_by_no (
     applicationNo STRING,
-    app_row_id BIGINT,
+    app_row_id DECIMAL(20, 0),
     PRIMARY KEY (applicationNo) NOT ENFORCED
 ) WITH (
     'connector' = 'jdbc',
-    'url' = 'jdbc:mysql://${MARKET_MYSQL_HOST}:${MARKET_MYSQL_PORT}/${MARKET_MYSQL_DATABASE}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Africa/Lagos',
+    'url' = 'jdbc:mysql://${MARKET_MYSQL_HOST}:${MARKET_MYSQL_PORT}/${MARKET_MYSQL_DATABASE}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Africa/Lagos&tinyInt1isBit=false',
     'table-name' = 'market_app_id_by_no_lookup',
     'username' = '${MARKET_MYSQL_USER}',
     'password' = '${MARKET_MYSQL_PASSWORD}',
@@ -134,12 +134,12 @@ CREATE TABLE IF NOT EXISTS dim_market_app_by_no (
 );
 
 CREATE TABLE IF NOT EXISTS dim_apps_by_user (
-    app_row_id BIGINT,
-    user_id BIGINT,
+    app_row_id DECIMAL(20, 0),
+    user_id DECIMAL(20, 0),
     PRIMARY KEY (app_row_id) NOT ENFORCED
 ) WITH (
     'connector' = 'jdbc',
-    'url' = 'jdbc:mysql://${MARKET_MYSQL_HOST}:${MARKET_MYSQL_PORT}/${MARKET_MYSQL_DATABASE}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Africa/Lagos',
+    'url' = 'jdbc:mysql://${MARKET_MYSQL_HOST}:${MARKET_MYSQL_PORT}/${MARKET_MYSQL_DATABASE}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Africa/Lagos&tinyInt1isBit=false',
     'table-name' = 'market_app_ids_by_user_lookup',
     'username' = '${MARKET_MYSQL_USER}',
     'password' = '${MARKET_MYSQL_PASSWORD}',
@@ -202,7 +202,7 @@ CREATE TABLE IF NOT EXISTS sink_application (
 );
 
 CREATE TEMPORARY VIEW v_app_triggers AS
-SELECT id AS app_row_id, proc_time FROM cdc_market_app WHERE id IS NOT NULL
+SELECT CAST(id AS DECIMAL(20, 0)) AS app_row_id, proc_time FROM cdc_market_app WHERE id IS NOT NULL
 UNION ALL
 SELECT m.app_row_id, c.proc_time
 FROM cdc_core_app AS c
@@ -213,7 +213,7 @@ UNION ALL
 SELECT a.app_row_id, ud.proc_time
 FROM cdc_user_data AS ud
 INNER JOIN dim_apps_by_user FOR SYSTEM_TIME AS OF ud.proc_time AS a
-    ON a.user_id = ud.`userId`;
+    ON a.user_id = CAST(ud.`userId` AS DECIMAL(20, 0));
 
 INSERT INTO sink_application
 SELECT
@@ -254,7 +254,7 @@ SELECT
     50 AS repay_calculator_version,
     49 AS rollover_calculator_version,
     '{"product_scheme_id":"PROD-002-D7"}' AS product_scheme_param,
-    b.term,
+    CAST(b.term AS INT) AS term,
     1 AS periods,
     1 AS repayment_method,
     CONCAT(

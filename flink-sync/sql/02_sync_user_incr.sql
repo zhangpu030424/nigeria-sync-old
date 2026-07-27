@@ -78,7 +78,7 @@ CREATE TABLE IF NOT EXISTS cdc_dac (
 );
 
 CREATE TABLE IF NOT EXISTS dim_user_row (
-    id BIGINT,
+    id DECIMAL(20, 0),
     app_id BIGINT,
     mobile_norm STRING,
     mobile_token STRING,
@@ -106,7 +106,7 @@ CREATE TABLE IF NOT EXISTS dim_user_row (
 CREATE TABLE IF NOT EXISTS dim_users_by_app_mobile (
     app_id BIGINT,
     mobile_raw STRING,
-    user_id BIGINT,
+    user_id DECIMAL(20, 0),
     PRIMARY KEY (app_id, mobile_raw) NOT ENFORCED
 ) WITH (
     'connector' = 'jdbc',
@@ -119,8 +119,8 @@ CREATE TABLE IF NOT EXISTS dim_users_by_app_mobile (
 );
 
 CREATE TABLE IF NOT EXISTS dim_users_by_device (
-    device_id BIGINT,
-    user_id BIGINT,
+    device_id DECIMAL(20, 0),
+    user_id DECIMAL(20, 0),
     PRIMARY KEY (device_id) NOT ENFORCED
 ) WITH (
     'connector' = 'jdbc',
@@ -163,7 +163,7 @@ CREATE TABLE IF NOT EXISTS sink_user (
 );
 
 CREATE TEMPORARY VIEW v_user_triggers AS
-SELECT id AS user_id, proc_time FROM cdc_user WHERE id IS NOT NULL
+SELECT CAST(id AS DECIMAL(20, 0)) AS user_id, proc_time FROM cdc_user WHERE id IS NOT NULL
 UNION ALL
 SELECT m.user_id, l.proc_time
 FROM cdc_lup AS l
@@ -173,14 +173,14 @@ UNION ALL
 SELECT d.user_id, c.proc_time
 FROM cdc_dac AS c
 INNER JOIN dim_users_by_device FOR SYSTEM_TIME AS OF c.proc_time AS d
-    ON d.device_id = c.`deviceId`;
+    ON d.device_id = CAST(c.`deviceId` AS DECIMAL(20, 0));
 
 INSERT INTO sink_user
 SELECT
-    u.id,
+    CAST(u.id AS BIGINT),
     u.app_id,
-    u.id AS group_user_id,
-    u.id AS info_user_id,
+    CAST(u.id AS BIGINT) AS group_user_id,
+    CAST(u.id AS BIGINT) AS info_user_id,
     CASE
         WHEN u.mobile_token IS NOT NULL AND TRIM(u.mobile_token) <> '' THEN u.mobile_token
         WHEN u.mobile_norm IS NULL OR TRIM(u.mobile_norm) = '' THEN CAST(NULL AS STRING)

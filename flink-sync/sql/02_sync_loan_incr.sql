@@ -1,4 +1,5 @@
 -- 增量 loan：core repay_plan / repay_record + market application CDC
+-- unsigned bigint 在 JDBC 返回 BigInteger；Lookup 视图 CAST DECIMAL + Flink DECIMAL(20,0)
 SET 'parallelism.default' = '${FLINK_PARALLELISM}';
 SET 'table.exec.mini-batch.enabled' = 'true';
 SET 'table.exec.mini-batch.allow-latency' = '200ms';
@@ -10,7 +11,7 @@ SET 'execution.checkpointing.tolerable-failed-checkpoints' = '10';
 SET 'execution.checkpointing.unaligned' = 'true';
 
 CREATE TABLE IF NOT EXISTS cdc_repay_plan (
-    sn STRING,
+    sn DECIMAL(20, 0),
     plan_sn BIGINT,
     proc_time AS PROCTIME(),
     PRIMARY KEY (sn, plan_sn) NOT ENFORCED
@@ -32,7 +33,7 @@ CREATE TABLE IF NOT EXISTS cdc_repay_plan (
 
 CREATE TABLE IF NOT EXISTS cdc_repay_record (
     id BIGINT,
-    sn STRING,
+    sn DECIMAL(20, 0),
     proc_time AS PROCTIME(),
     PRIMARY KEY (id) NOT ENFORCED
 ) WITH (
@@ -52,7 +53,7 @@ CREATE TABLE IF NOT EXISTS cdc_repay_record (
 );
 
 CREATE TABLE IF NOT EXISTS cdc_market_app_disburse (
-    id BIGINT,
+    id DECIMAL(20, 0),
     proc_time AS PROCTIME(),
     PRIMARY KEY (id) NOT ENFORCED
 ) WITH (
@@ -72,10 +73,9 @@ CREATE TABLE IF NOT EXISTS cdc_market_app_disburse (
 );
 
 CREATE TABLE IF NOT EXISTS dim_loan_bundle (
-    sn STRING,
+    sn DECIMAL(20, 0),
     application_no STRING,
     loan_no STRING,
-    -- period/roll_sequence/rp_status 用 BIGINT：JDBC 对 CAST SIGNED 返回 Long
     `period` BIGINT,
     roll_sequence BIGINT,
     start_date BIGINT,
@@ -102,8 +102,8 @@ CREATE TABLE IF NOT EXISTS dim_loan_bundle (
 );
 
 CREATE TABLE IF NOT EXISTS dim_core_sn_by_market_app (
-    id BIGINT,
-    core_sn STRING,
+    id DECIMAL(20, 0),
+    core_sn DECIMAL(20, 0),
     PRIMARY KEY (id) NOT ENFORCED
 ) WITH (
     'connector' = 'jdbc',
@@ -156,7 +156,7 @@ SELECT m.core_sn AS sn, a.proc_time
 FROM cdc_market_app_disburse AS a
 INNER JOIN dim_core_sn_by_market_app FOR SYSTEM_TIME AS OF a.proc_time AS m
     ON m.id = a.id
-WHERE m.core_sn IS NOT NULL AND TRIM(m.core_sn) <> '';
+WHERE m.core_sn IS NOT NULL;
 
 INSERT INTO sink_loan
 SELECT

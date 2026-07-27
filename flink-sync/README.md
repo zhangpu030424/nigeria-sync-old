@@ -119,6 +119,8 @@ docker exec ng-sync-flink-jobmanager ./bin/flink list -r
 
 ## 注意事项
 
+- **源库约束**：仅部署 `CREATE OR REPLACE VIEW`，不使用存储过程，**不改源表结构**（无 ALTER/索引/生成列）；`deploy-source-ddl.sh --force` 只重建视图。
+- **unsigned 主键**：`user.id` / `repay_plan.sn` 等为 `bigint unsigned`；Lookup 视图用裸列走主键，Flink 侧 `DECIMAL(20,0)` 承接 JDBC `BigInteger`，避免 ClassCast。
 - `application` 需 market 与 core 均建档（有 `core_sn`）才写入；core 晚到会由 core.application CDC 触发补全。
-- `user_info.info` JSON 当前为简化版；复杂 emergency_contacts 等可后续在视图层补全。
+- `user_info.info` JSON 已对齐迁移脚本固定 key；`emergency_contacts` 增量暂写 `[]`（VT 格式化可后续补）。
 - 生产建议配合 `run_reconcile_cron.sh` 作延迟一致性兜底，而非单独依赖 Flink。

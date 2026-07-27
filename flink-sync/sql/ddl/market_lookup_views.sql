@@ -1,7 +1,8 @@
 -- ng_loan_market 增量 Lookup 视图（Flink JDBC Lookup 点查优化版）
+-- 约束: 仅 CREATE/REPLACE VIEW，不用存储过程，不改源表结构（无 ALTER/索引/生成列）
 -- 原则:
---   1. 数值列 CAST AS SIGNED，避免 JDBC BigInteger → Flink BIGINT ClassCast
---   2. 禁止视图内全表 GROUP BY 物化；Latest 行用相关子查询 MAX(id)（WHERE user_id=? 时可走索引）
+--   1. 点查主键列用裸列（u.id / rp.sn），Flink 侧 DECIMAL(20,0) 承接 unsigned → 可走主键
+--   2. 其它有符号数值 CAST AS SIGNED；禁止视图内全表 GROUP BY
 -- 部署: ./scripts/deploy-source-ddl.sh --force
 
 SET SESSION wait_timeout = 28800;
@@ -10,20 +11,20 @@ SET SESSION wait_timeout = 28800;
 CREATE OR REPLACE VIEW users_by_app_mobile_lookup AS
 SELECT u.`appId`                   AS app_id,
        u.mobile                    AS mobile_raw,
-       CAST(u.id AS SIGNED)        AS user_id
+       u.id                        AS user_id
 FROM `user` u
 WHERE u.id IS NOT NULL;
 
 -- ---------- 辅助：deviceId → user_id（dac CDC 触发）----------
 CREATE OR REPLACE VIEW users_by_device_lookup AS
-SELECT CAST(u.`deviceId` AS SIGNED) AS device_id,
-       CAST(u.id AS SIGNED)          AS user_id
+SELECT u.`deviceId`                AS device_id,
+       u.id                        AS user_id
 FROM `user` u
 WHERE u.`deviceId` IS NOT NULL AND u.`deviceId` > 0;
 
--- ---------- user 增量 Lookup（Flink: WHERE id = ?；对齐 nigeria-flink-sync 裸 id + CHAR）----------
+-- ---------- user 增量 Lookup（Flink: WHERE id = ?；裸 id 走主键）----------
 CREATE OR REPLACE VIEW user_incr_lookup AS
-SELECT CAST(u.id AS SIGNED)                                      AS id,
+SELECT u.id                                                      AS id,
        CAST(u.`appId` AS SIGNED)                                     AS app_id,
        CASE
            WHEN u.mobile LIKE '+234%' THEN u.mobile
@@ -67,12 +68,11 @@ FROM `user` u
 -- ---------- user_info 增量 bundle Lookup（Flink: WHERE user_id = ?）----------
 -- 勿 JOIN vt_token_cache；id_number_token 由 Flink vt_tokenize(bvn) 兜底
 CREATE OR REPLACE VIEW user_info_incr_bundle_lookup AS
-SELECT CAST(u.id AS SIGNED)                                          AS user_id,
-       CAST(TRIM(CONCAT(
-               IFNULL(ud.`firstName`, ''), ' ',
-               IFNULL(ud.`middleName`, ''), ' ',
-               IFNULL(ud.`lastName`, '')
-           )) AS CHAR)                                               AS full_name,
+SELECT u.id                                                          AS user_id,
+       -- 压缩多空格，对齐迁移脚本 _user_full_name
+       CAST(TRIM(BOTH ' ' FROM REPLACE(REPLACE(REPLACE(
+               CONCAT(IFNULL(ud.`firstName`, ''), ' ', IFNULL(ud.`middleName`, ''), ' ', IFNULL(ud.`lastName`, '')),
+               '  ', ' '), '  ', ' '), '  ', ' ')) AS CHAR)          AS full_name,
        CAST(NULL AS CHAR)                                            AS id_number_token,
        CAST(IFNULL(lup.password, '') AS CHAR)                        AS password,
        CAST(uri.ip AS CHAR)                                          AS registration_ip,
@@ -155,9 +155,10 @@ WHERE a.`productId` IS NOT NULL AND a.`productId` <> 0
   );
 
 -- ---------- application 增量 bundle Lookup（Flink: WHERE app_row_id = ?）----------
--- 勿 JOIN vt_token_cache（5 路 VT 会导致秒级点查）；token 由 Flink vt_tokenize 兜底
-CREATE OR REPLACE VIEW application_incr_bundle_lookup AS
-SELECT CAST(a.id AS SIGNED)                                          AS app_row_id,
+-- 关键：必须 ALGORITHM=MERGE + 以 a 为驱动，否则 MySQL 会全扫 core.application（800万+）
+-- 勿 JOIN vt_token_cache；token 由 Flink vt_tokenize 兜底
+CREATE OR REPLACE ALGORITHM=MERGE VIEW application_incr_bundle_lookup AS
+SELECT a.id                                                          AS app_row_id,
        CAST(a.applicationNo AS CHAR)                                 AS market_no,
        CONCAT('ng', LPAD(CAST(a.`appId` AS CHAR), 4, '0'), '-', a.applicationNo) AS application_no,
        CASE
@@ -197,47 +198,41 @@ SELECT CAST(a.id AS SIGNED)                                          AS app_row_
        CAST(IFNULL(u.credentialNo, '') AS CHAR)                      AS id2_raw,
        CAST(NULL AS CHAR)                                            AS id_number_token,
        CAST(NULL AS CHAR)                                            AS id2_token,
-       CAST(IFNULL((
-           SELECT MAX(rr.repay_time)
-           FROM ng_loan_core.repay_record rr
-           WHERE rr.sn = ca.sn
-       ), 0) AS SIGNED)                                              AS last_repay_time,
-       CAST(UNIX_TIMESTAMP(a.created) AS SIGNED) * 1000              AS event_time
+       CAST(0 AS SIGNED)                                             AS last_repay_time,
+       CAST(UNIX_TIMESTAMP(a.created) * 1000 AS SIGNED)              AS event_time
 FROM application a
+         STRAIGHT_JOIN ng_loan_core.application ca ON ca.ext_sn = a.applicationNo
          LEFT JOIN `user` u ON u.id = a.`userId`
-         LEFT JOIN ng_loan_core.application ca ON ca.ext_sn = a.applicationNo
-WHERE a.applicationNo IS NOT NULL AND TRIM(a.applicationNo) <> ''
-  AND ca.sn IS NOT NULL AND TRIM(ca.sn) <> '';
+WHERE a.applicationNo IS NOT NULL AND TRIM(a.applicationNo) <> '';
 
 -- ---------- 辅助：applicationNo → app_row_id ----------
-CREATE OR REPLACE VIEW market_app_id_by_no_lookup AS
+CREATE OR REPLACE ALGORITHM=MERGE VIEW market_app_id_by_no_lookup AS
 SELECT applicationNo,
-       CAST(id AS SIGNED) AS app_row_id
+       id AS app_row_id
 FROM application
 WHERE applicationNo IS NOT NULL AND TRIM(applicationNo) <> '';
 
 -- ---------- 辅助：userId → app_row_id（user_data 变更触发）----------
-CREATE OR REPLACE VIEW market_app_ids_by_user_lookup AS
-SELECT CAST(id AS SIGNED)      AS app_row_id,
-       CAST(`userId` AS SIGNED) AS user_id
+CREATE OR REPLACE ALGORITHM=MERGE VIEW market_app_ids_by_user_lookup AS
+SELECT id AS app_row_id,
+       `userId` AS user_id
 FROM application
 WHERE `userId` IS NOT NULL;
 
--- ---------- 辅助：market app id → core sn ----------
-CREATE OR REPLACE VIEW market_app_core_sn_lookup AS
-SELECT CAST(ma.id AS SIGNED) AS id,
-       ca.sn                 AS core_sn
+-- ---------- 辅助：market app id → core sn（裸列点查；Flink DECIMAL 承接 unsigned）----------
+CREATE OR REPLACE ALGORITHM=MERGE VIEW market_app_core_sn_lookup AS
+SELECT ma.id AS id,
+       ca.sn AS core_sn
 FROM application ma
-         INNER JOIN ng_loan_core.application ca ON ca.ext_sn = ma.applicationNo
+         STRAIGHT_JOIN ng_loan_core.application ca ON ca.ext_sn = ma.applicationNo
 WHERE ma.disburseTime > 0;
 
--- ---------- loan 增量 bundle Lookup（Flink: WHERE sn = ?）----------
--- 数值一律 CAST SIGNED，避免 JDBC BigInteger/Long 与 Flink INT 冲突
-CREATE OR REPLACE VIEW loan_incr_bundle_lookup AS
-SELECT CAST(rp.sn AS CHAR)                                                         AS sn,
+-- ---------- loan 增量 bundle Lookup（Flink: WHERE sn = ?；裸 sn 走主键）----------
+CREATE OR REPLACE ALGORITHM=MERGE VIEW loan_incr_bundle_lookup AS
+SELECT rp.sn                                                                       AS sn,
        CAST(rp.plan_sn AS SIGNED)                                                  AS plan_sn,
        CONCAT('ng', LPAD(CAST(ma.`appId` AS CHAR), 4, '0'), '-', ma.applicationNo) AS application_no,
-       CONCAT('ng-', rp.sn, '-', LPAD(1, 2, '0'), LPAD(0, 3, '0'))               AS loan_no,
+       CONCAT('ng-', CAST(rp.sn AS CHAR), '-', LPAD(1, 2, '0'), LPAD(0, 3, '0')) AS loan_no,
        CAST(1 AS SIGNED)                                                           AS period,
        CAST(0 AS SIGNED)                                                           AS roll_sequence,
        CAST(rp.start_date AS SIGNED)                                               AS start_date,
@@ -253,8 +248,8 @@ SELECT CAST(rp.sn AS CHAR)                                                      
        CAST(IFNULL(rp.settle_time, 0) AS SIGNED)                                   AS settle_time,
        rp.created_at
 FROM ng_loan_core.repay_plan rp
-         INNER JOIN ng_loan_core.application ca ON ca.sn = rp.sn
-         INNER JOIN application ma ON ma.applicationNo = ca.ext_sn
+         STRAIGHT_JOIN ng_loan_core.application ca ON ca.sn = rp.sn
+         STRAIGHT_JOIN application ma ON ma.applicationNo = ca.ext_sn
 WHERE ma.disburseTime > 0
   AND rp.plan_sn = (
       SELECT MAX(rp2.plan_sn)
