@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS dim_user_info_bundle (
     'url' = 'jdbc:mysql://${MARKET_MYSQL_HOST}:${MARKET_MYSQL_PORT}/${MARKET_MYSQL_DATABASE}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Africa/Lagos&tinyInt1isBit=false',
     'table-name' = 'user_info_incr_bundle_lookup',
     'username' = '${MARKET_MYSQL_USER}', 'password' = '${MARKET_MYSQL_PASSWORD}',
-    'lookup.cache.max-rows' = '300000', 'lookup.cache.ttl' = '${LOOKUP_CACHE_TTL}'
+    'lookup.cache.max-rows' = '100000', 'lookup.cache.ttl' = '${LOOKUP_CACHE_TTL_USER_INFO}'
 );
 
 CREATE TABLE IF NOT EXISTS sink_user_info (
@@ -80,6 +80,7 @@ SELECT CAST(`userId` AS DECIMAL(20, 0)) AS user_id, proc_time FROM cdc_uri WHERE
 
 -- JSON 标量字符串：空白 → null；转义双引号与反斜杠
 -- 结构对齐 ng_migration_run._build_user_info_json（emergency_contacts 增量暂写 []）
+-- 无 user_data 资料时不写目标，避免注册瞬间空壳 + Lookup 缓存把后续补数盖住
 INSERT INTO sink_user_info
 SELECT
     CAST(b.user_id AS BIGINT),
@@ -145,4 +146,9 @@ SELECT
     ) AS info
 FROM v_ui_triggers AS t
 INNER JOIN dim_user_info_bundle FOR SYSTEM_TIME AS OF t.proc_time AS b
-    ON b.user_id = t.user_id;
+    ON b.user_id = t.user_id
+WHERE (
+    (b.full_name IS NOT NULL AND TRIM(b.full_name) <> '')
+    OR (b.email IS NOT NULL AND TRIM(b.email) <> '')
+    OR (b.bvn_raw IS NOT NULL AND TRIM(b.bvn_raw) <> '')
+);

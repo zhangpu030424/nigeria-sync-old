@@ -69,7 +69,7 @@ CREATE TABLE IF NOT EXISTS cdc_user_data (
     'database-name' = '${MARKET_MYSQL_DATABASE}',
     'table-name' = 'user_data',
     'server-time-zone' = 'Africa/Lagos',
-    'server-id' = '${CDC_SERVER_ID_USER_DATA}',
+    'server-id' = '${CDC_SERVER_ID_APP_USER_DATA}',
     'scan.startup.mode' = '${CDC_STARTUP_MODE}',
     'scan.startup.timestamp-millis' = '${CDC_STARTUP_TIMESTAMP_MILLIS}',
     'scan.incremental.snapshot.enabled' = 'true',
