@@ -3,11 +3,10 @@
 # 依赖: MARKET_MYSQL_HOST/PORT/USER/PASSWORD/DATABASE
 
 mysql_market_cmd() {
-  local args=("$@")
   local connect_timeout="${MARKET_MYSQL_CONNECT_TIMEOUT:-15}"
   MYSQL_PWD="${MARKET_MYSQL_PASSWORD}" mysql --connect-timeout="${connect_timeout}" \
     -h "${MARKET_MYSQL_HOST}" -P "${MARKET_MYSQL_PORT:-3306}" \
-    -u "${MARKET_MYSQL_USER}" "${MARKET_MYSQL_DATABASE}" "${args[@]}"
+    -u "${MARKET_MYSQL_USER}" "${MARKET_MYSQL_DATABASE}" "$@"
 }
 
 mysql_market_query() {

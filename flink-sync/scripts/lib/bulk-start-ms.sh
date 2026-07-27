@@ -6,11 +6,12 @@
 # 避免运维本机（如北京时间）时钟偏差。值为 UTC epoch 毫秒，不是「北京时刻」编码。
 
 bulk_start_ms_from_source_mysql() {
-  local host="${SOURCE_MYSQL_HOST:-}"
-  local port="${SOURCE_MYSQL_PORT:-3306}"
-  local user="${SOURCE_MYSQL_USER:-}"
-  local pass="${SOURCE_MYSQL_PASSWORD:-}"
+  local host="${SOURCE_MYSQL_HOST:-${MARKET_MYSQL_HOST:-}}"
+  local port="${SOURCE_MYSQL_PORT:-${MARKET_MYSQL_PORT:-3306}}"
+  local user="${SOURCE_MYSQL_USER:-${MARKET_MYSQL_USER:-}}"
+  local pass="${SOURCE_MYSQL_PASSWORD:-${MARKET_MYSQL_PASSWORD:-}}"
   [[ -z "$host" || -z "$user" ]] && return 1
+  command -v mysql >/dev/null 2>&1 || return 1
   local ms
   ms=$(MYSQL_PWD="$pass" mysql -h "$host" -P "$port" -u "$user" -N -e \
     "SET time_zone = 'Africa/Lagos'; SELECT CAST(ROUND(UNIX_TIMESTAMP(NOW(3)) * 1000) AS UNSIGNED);" \
@@ -31,7 +32,7 @@ bulk_start_ms_now() {
     src="source_mysql"
   else
     ms=$(bulk_start_ms_from_host)
-    echo ">> WARN: 无法从源库取时间戳，回退本机 epoch（请检查 SOURCE_MYSQL_* 与 mysql 客户端）" >&2
+    echo ">> WARN: 无法从源库取时间戳，回退本机 epoch（请检查 MARKET_MYSQL_* / SOURCE_MYSQL_* 与 mysql 客户端）" >&2
   fi
   BULK_START_MS="$ms"
   BULK_START_SOURCE="$src"
