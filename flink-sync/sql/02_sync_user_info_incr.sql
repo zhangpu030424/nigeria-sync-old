@@ -47,10 +47,10 @@ CREATE TABLE IF NOT EXISTS dim_user_info_bundle (
     user_id BIGINT, full_name STRING, id_number_token STRING, password STRING,
     registration_ip STRING, install_channel STRING, app_name STRING, app_id BIGINT, reg_time BIGINT,
     bvn_raw STRING,
-    email STRING, birthday STRING, gender INT,
+    email STRING, birthday STRING, gender BIGINT,
     addressState STRING, addressDistrict STRING, address STRING,
-    company STRING, education INT, marital INT, profession STRING, salary STRING,
-    emergencyContact STRING, numberOfChildren INT, payCycle INT, salaryDay INT,
+    company STRING, education BIGINT, marital BIGINT, profession STRING, salary STRING,
+    emergencyContact STRING, numberOfChildren BIGINT, payCycle BIGINT, salaryDay BIGINT,
     PRIMARY KEY (user_id) NOT ENFORCED
 ) WITH (
     'connector' = 'jdbc',

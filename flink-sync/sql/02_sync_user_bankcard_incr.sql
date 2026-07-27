@@ -1,6 +1,8 @@
 -- 增量 user_bankcard：user_data CDC + Lookup + 雪花发号
+-- is_default 用 BIGINT，避免 JDBC Long → Flink INT ClassCast
 CREATE TEMPORARY FUNCTION snowflake_id AS 'com.nigeria.flink.udf.SnowflakeIdFunction';
 CREATE TEMPORARY FUNCTION bankcard_id_resolve AS 'com.nigeria.flink.udf.UserBankcardIdResolveFunction';
+CREATE TEMPORARY FUNCTION vt_tokenize AS 'com.nigeria.flink.udf.VtTokenizeFunction';
 
 SET 'parallelism.default' = '${FLINK_PARALLELISM}';
 SET 'table.exec.mini-batch.enabled' = 'true';
@@ -22,11 +24,15 @@ CREATE TABLE IF NOT EXISTS cdc_user_data (
 );
 
 CREATE TABLE IF NOT EXISTS dim_bankcard (
-    user_id BIGINT, bank_code STRING, bank_account_raw STRING, bank_account_token STRING, is_default INT,
+    user_id BIGINT,
+    bank_code STRING,
+    bank_account_raw STRING,
+    bank_account_token STRING,
+    is_default BIGINT,
     PRIMARY KEY (user_id) NOT ENFORCED
 ) WITH (
     'connector' = 'jdbc',
-    'url' = 'jdbc:mysql://${MARKET_MYSQL_HOST}:${MARKET_MYSQL_PORT}/${MARKET_MYSQL_DATABASE}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Africa/Lagos',
+    'url' = 'jdbc:mysql://${MARKET_MYSQL_HOST}:${MARKET_MYSQL_PORT}/${MARKET_MYSQL_DATABASE}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Africa/Lagos&tinyInt1isBit=false',
     'table-name' = 'user_bankcard_incr_lookup',
     'username' = '${MARKET_MYSQL_USER}', 'password' = '${MARKET_MYSQL_PASSWORD}',
     'lookup.cache.max-rows' = '200000', 'lookup.cache.ttl' = '${LOOKUP_CACHE_TTL}'
@@ -44,13 +50,21 @@ CREATE TABLE IF NOT EXISTS sink_user_bankcard (
 
 INSERT INTO sink_user_bankcard
 SELECT
-    bankcard_id_resolve(b.user_id, COALESCE(b.bank_account_token, b.bank_account_raw)) AS id,
+    bankcard_id_resolve(
+        b.user_id,
+        CASE
+            WHEN b.bank_account_token IS NOT NULL AND TRIM(b.bank_account_token) <> '' THEN b.bank_account_token
+            ELSE vt_tokenize(TRIM(b.bank_account_raw))
+        END
+    ) AS id,
     b.user_id AS group_user_id,
     b.bank_code,
-    COALESCE(b.bank_account_token, b.bank_account_raw) AS bank_account_number,
-    b.is_default
+    CASE
+        WHEN b.bank_account_token IS NOT NULL AND TRIM(b.bank_account_token) <> '' THEN b.bank_account_token
+        ELSE vt_tokenize(TRIM(b.bank_account_raw))
+    END AS bank_account_number,
+    CAST(b.is_default AS INT) AS is_default
 FROM cdc_user_data AS c
 INNER JOIN dim_bankcard FOR SYSTEM_TIME AS OF c.proc_time AS b
     ON b.user_id = c.`userId`
-WHERE COALESCE(b.bank_account_token, b.bank_account_raw) IS NOT NULL
-  AND TRIM(COALESCE(b.bank_account_token, b.bank_account_raw)) <> '';
+WHERE b.bank_account_raw IS NOT NULL AND TRIM(b.bank_account_raw) <> '';

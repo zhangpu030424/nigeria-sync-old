@@ -75,8 +75,9 @@ CREATE TABLE IF NOT EXISTS dim_loan_bundle (
     sn STRING,
     application_no STRING,
     loan_no STRING,
-    `period` INT,
-    roll_sequence INT,
+    -- period/roll_sequence/rp_status 用 BIGINT：JDBC 对 CAST SIGNED 返回 Long
+    `period` BIGINT,
+    roll_sequence BIGINT,
     start_date BIGINT,
     due_date BIGINT,
     prin_amt BIGINT,
@@ -84,7 +85,7 @@ CREATE TABLE IF NOT EXISTS dim_loan_bundle (
     orig_fee BIGINT,
     penalty BIGINT,
     amt BIGINT,
-    rp_status INT,
+    rp_status BIGINT,
     repaid_amt BIGINT,
     repay_last_time BIGINT,
     settle_time BIGINT,
@@ -106,7 +107,7 @@ CREATE TABLE IF NOT EXISTS dim_core_sn_by_market_app (
     PRIMARY KEY (id) NOT ENFORCED
 ) WITH (
     'connector' = 'jdbc',
-    'url' = 'jdbc:mysql://${MARKET_MYSQL_HOST}:${MARKET_MYSQL_PORT}/${MARKET_MYSQL_DATABASE}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Africa/Lagos',
+    'url' = 'jdbc:mysql://${MARKET_MYSQL_HOST}:${MARKET_MYSQL_PORT}/${MARKET_MYSQL_DATABASE}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Africa/Lagos&tinyInt1isBit=false',
     'table-name' = 'market_app_core_sn_lookup',
     'username' = '${MARKET_MYSQL_USER}',
     'password' = '${MARKET_MYSQL_PASSWORD}',
@@ -161,8 +162,8 @@ INSERT INTO sink_loan
 SELECT
     l.loan_no,
     l.application_no,
-    l.`period`,
-    l.roll_sequence,
+    CAST(l.`period` AS INT),
+    CAST(l.roll_sequence AS INT),
     DATE_FORMAT(FROM_UNIXTIME(CASE WHEN l.start_date > 10000000000 THEN l.start_date / 1000 ELSE l.start_date END), 'yyyy-MM-dd') AS start_date,
     DATE_FORMAT(FROM_UNIXTIME(CASE WHEN l.due_date > 10000000000 THEN l.due_date / 1000 ELSE l.due_date END), 'yyyy-MM-dd') AS due_date,
     DATE_FORMAT(FROM_UNIXTIME(CASE WHEN l.due_date > 10000000000 THEN l.due_date / 1000 ELSE l.due_date END), 'yyyy-MM-dd') AS due_date_final,
@@ -180,14 +181,14 @@ SELECT
         THEN DATE_FORMAT(FROM_UNIXTIME(CASE WHEN l.settle_time > 10000000000 THEN l.settle_time / 1000 ELSE l.settle_time END), 'yyyy-MM-dd')
         ELSE CAST(NULL AS STRING) END AS paid_off_date,
     CAST(UNIX_TIMESTAMP(CAST(l.created_at AS STRING)) * 1000 AS BIGINT) AS created_time,
-    CASE
+    CAST(CASE
         WHEN l.rp_status = 1 AND COALESCE(l.repaid_amt, 0) = 0 THEN 20
         WHEN l.rp_status = 1 AND COALESCE(l.repaid_amt, 0) <> 0 THEN 24
         WHEN l.rp_status = 3 THEN 23
         WHEN l.rp_status = 4 THEN 25
         WHEN l.rp_status = 2 THEN 27
         ELSE l.rp_status
-    END AS status
+    END AS INT) AS status
 FROM v_loan_triggers AS t
 INNER JOIN dim_loan_bundle FOR SYSTEM_TIME AS OF t.proc_time AS l
     ON l.sn = t.sn

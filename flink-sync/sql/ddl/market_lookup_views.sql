@@ -65,75 +65,80 @@ FROM `user` u
                    );
 
 -- ---------- user_info 增量 bundle Lookup（Flink: WHERE user_id = ?）----------
+-- 勿 JOIN vt_token_cache；id_number_token 由 Flink vt_tokenize(bvn) 兜底
 CREATE OR REPLACE VIEW user_info_incr_bundle_lookup AS
 SELECT CAST(u.id AS SIGNED)                                          AS user_id,
-       TRIM(CONCAT(
+       CAST(TRIM(CONCAT(
                IFNULL(ud.`firstName`, ''), ' ',
                IFNULL(ud.`middleName`, ''), ' ',
                IFNULL(ud.`lastName`, '')
-           ))                                                        AS full_name,
-       vt_id.token                                                   AS id_number_token,
-       IFNULL(lup.password, '')                                      AS password,
-       uri.ip                                                        AS registration_ip,
-       dac.channel                                                   AS install_channel,
-       ap.name                                                       AS app_name,
+           )) AS CHAR)                                               AS full_name,
+       CAST(NULL AS CHAR)                                            AS id_number_token,
+       CAST(IFNULL(lup.password, '') AS CHAR)                        AS password,
+       CAST(uri.ip AS CHAR)                                          AS registration_ip,
+       CAST(dac.channel AS CHAR)                                     AS install_channel,
+       CAST(ap.name AS CHAR)                                         AS app_name,
        CAST(u.`appId` AS SIGNED)                                     AS app_id,
        CAST(UNIX_TIMESTAMP(u.created) * 1000 AS SIGNED)              AS reg_time,
-       ud.bvn                                                        AS bvn_raw,
-       ud.email, ud.birthday, ud.gender,
-       ud.`addressState`, ud.`addressDistrict`, ud.address,
-       ud.company, ud.education, ud.marital, ud.profession, ud.salary,
-       ud.`emergencyContact`, ud.`numberOfChildren`, ud.`payCycle`, ud.`salaryDay`
+       CAST(ud.bvn AS CHAR)                                          AS bvn_raw,
+       CAST(ud.email AS CHAR) AS email,
+       CAST(ud.birthday AS CHAR) AS birthday,
+       CAST(ud.gender AS SIGNED) AS gender,
+       CAST(ud.`addressState` AS CHAR) AS addressState,
+       CAST(ud.`addressDistrict` AS CHAR) AS addressDistrict,
+       CAST(ud.address AS CHAR) AS address,
+       CAST(ud.company AS CHAR) AS company,
+       CAST(ud.education AS SIGNED) AS education,
+       CAST(ud.marital AS SIGNED) AS marital,
+       CAST(ud.profession AS CHAR) AS profession,
+       CAST(ud.salary AS CHAR) AS salary,
+       CAST(ud.`emergencyContact` AS CHAR) AS emergencyContact,
+       CAST(ud.`numberOfChildren` AS SIGNED) AS numberOfChildren,
+       CAST(ud.`payCycle` AS SIGNED) AS payCycle,
+       CAST(ud.`salaryDay` AS SIGNED) AS salaryDay
 FROM `user` u
          LEFT JOIN app ap ON ap.id = u.`appId`
          LEFT JOIN user_data ud
-                   ON ud.`userId` = u.id
-                       AND ud.id = (
-                           SELECT CAST(MAX(ud2.id) AS SIGNED)
-                           FROM user_data ud2
-                           WHERE ud2.`userId` = u.id
-                       )
-         LEFT JOIN vt_token_cache vt_id
-                   ON vt_id.vt_type = 'id_number' AND vt_id.status = 1
-                       AND vt_id.token IS NOT NULL AND TRIM(vt_id.token) <> ''
-                       AND vt_id.raw_value COLLATE utf8mb4_bin = TRIM(ud.bvn) COLLATE utf8mb4_bin
+                   ON ud.id = (
+                       SELECT ud2.id FROM user_data ud2
+                       WHERE ud2.`userId` = u.id
+                       ORDER BY ud2.id DESC LIMIT 1
+                   )
          LEFT JOIN user_reg_ip uri
-                   ON uri.`userId` = u.id
-                       AND uri.id = (
-                           SELECT CAST(MAX(uri2.id) AS SIGNED)
-                           FROM user_reg_ip uri2
-                           WHERE uri2.`userId` = u.id
-                       )
+                   ON uri.id = (
+                       SELECT uri2.id FROM user_reg_ip uri2
+                       WHERE uri2.`userId` = u.id
+                       ORDER BY uri2.id DESC LIMIT 1
+                   )
          LEFT JOIN log_user_password lup
-                   ON lup.`appId` = u.`appId` AND lup.mobile = u.mobile
-                       AND lup.id = (
-                           SELECT CAST(MAX(l2.id) AS SIGNED)
-                           FROM log_user_password l2
-                           WHERE l2.`appId` = u.`appId` AND l2.mobile = u.mobile
-                       )
+                   ON lup.id = (
+                       SELECT l2.id FROM log_user_password l2
+                       WHERE l2.`appId` = u.`appId` AND l2.mobile = u.mobile
+                       ORDER BY l2.id DESC LIMIT 1
+                   )
          LEFT JOIN device_ad_channel dac
-                   ON dac.`deviceId` = u.`deviceId`
-                       AND dac.id = (
-                           SELECT CAST(MAX(d2.id) AS SIGNED)
-                           FROM device_ad_channel d2
-                           WHERE d2.`deviceId` = u.`deviceId`
-                       );
+                   ON dac.id = (
+                       SELECT d2.id FROM device_ad_channel d2
+                       WHERE d2.`deviceId` = u.`deviceId`
+                       ORDER BY d2.id DESC LIMIT 1
+                   );
 
 -- ---------- user_bankcard 增量 Lookup（Flink: WHERE user_id = ?）----------
+-- 勿 JOIN vt_token_cache（慢）；token 由 Flink UDF / 明文兜底
 CREATE OR REPLACE VIEW user_bankcard_incr_lookup AS
 SELECT CAST(ud.`userId` AS SIGNED)                                   AS user_id,
-       IFNULL(ud.bankCode, '')                                       AS bank_code,
-       TRIM(ud.bankAccount)                                          AS bank_account_raw,
-       vt_b.token                                                    AS bank_account_token,
-       1                                                             AS is_default
+       CAST(IFNULL(ud.bankCode, '') AS CHAR)                         AS bank_code,
+       CAST(TRIM(ud.bankAccount) AS CHAR)                            AS bank_account_raw,
+       CAST(NULL AS CHAR)                                            AS bank_account_token,
+       CAST(1 AS SIGNED)                                             AS is_default
 FROM user_data ud
-         LEFT JOIN vt_token_cache vt_b
-                   ON vt_b.vt_type = 'bank_account' AND vt_b.status = 1
-                       AND vt_b.token IS NOT NULL AND TRIM(vt_b.token) <> ''
-                       AND vt_b.raw_value COLLATE utf8mb4_bin = TRIM(ud.bankAccount) COLLATE utf8mb4_bin
 WHERE ud.bankAccount IS NOT NULL AND TRIM(ud.bankAccount) <> ''
   AND ud.id = (
-      SELECT CAST(MAX(ud2.id) AS SIGNED) FROM user_data ud2 WHERE ud2.`userId` = ud.`userId`
+      SELECT ud2.id
+      FROM user_data ud2
+      WHERE ud2.`userId` = ud.`userId`
+      ORDER BY ud2.id DESC
+      LIMIT 1
   );
 
 -- ---------- user_product 增量 Lookup（Flink: WHERE user_id = ? AND product_id = ?）----------
@@ -150,9 +155,10 @@ WHERE a.`productId` IS NOT NULL AND a.`productId` <> 0
   );
 
 -- ---------- application 增量 bundle Lookup（Flink: WHERE app_row_id = ?）----------
+-- 勿 JOIN vt_token_cache（5 路 VT 会导致秒级点查）；token 由 Flink vt_tokenize 兜底
 CREATE OR REPLACE VIEW application_incr_bundle_lookup AS
 SELECT CAST(a.id AS SIGNED)                                          AS app_row_id,
-       a.applicationNo                                               AS market_no,
+       CAST(a.applicationNo AS CHAR)                                 AS market_no,
        CONCAT('ng', LPAD(CAST(a.`appId` AS CHAR), 4, '0'), '-', a.applicationNo) AS application_no,
        CASE
            WHEN a.mobile LIKE '+234%' THEN a.mobile
@@ -160,76 +166,46 @@ SELECT CAST(a.id AS SIGNED)                                          AS app_row_
            WHEN a.mobile LIKE '0%' THEN CONCAT('+234', SUBSTRING(a.mobile, 2))
            ELSE CONCAT('+234', a.mobile)
            END                                                       AS mobile_norm,
-       vt_m.token                                                    AS mobile_token,
+       CAST(NULL AS CHAR)                                            AS mobile_token,
        'ng01'                                                        AS bid,
        CAST(a.`appId` AS SIGNED)                                     AS app_id,
        '1.0.0'                                                       AS app_version,
        CAST(a.`userId` AS SIGNED)                                    AS user_id,
-       a.applicationNo                                               AS sn,
-       CASE WHEN a.`repeatLoan` = 0 THEN 1 ELSE 0 END                AS is_first_apply,
-       IFNULL(NULLIF(a.gaid, ''), NULL)                              AS gaid_raw,
-       vt_g.token                                                    AS gaid_token,
-       IFNULL(CAST(a.`deviceDataId` AS CHAR), '')                    AS device_uuid,
-       IFNULL(a.bankCode, '')                                        AS bank_code,
-       IFNULL(a.bankAccount, '')                                     AS bank_account_raw,
-       vt_b.token                                                    AS bank_account_token,
+       CAST(a.applicationNo AS CHAR)                                 AS sn,
+       CAST(CASE WHEN a.`repeatLoan` = 0 THEN 1 ELSE 0 END AS SIGNED) AS is_first_apply,
+       CAST(IFNULL(NULLIF(a.gaid, ''), NULL) AS CHAR)                AS gaid_raw,
+       CAST(NULL AS CHAR)                                            AS gaid_token,
+       CAST(IFNULL(CAST(a.`deviceDataId` AS CHAR), '') AS CHAR)      AS device_uuid,
+       CAST(IFNULL(a.bankCode, '') AS CHAR)                          AS bank_code,
+       CAST(IFNULL(a.bankAccount, '') AS CHAR)                       AS bank_account_raw,
+       CAST(NULL AS CHAR)                                            AS bank_account_token,
        CAST(a.`productId` AS CHAR)                                   AS product_id,
-       a.term,
-       a.shouldLoanAmount                                            AS should_loan_amount,
-       a.amount,
-       a.repayment,
-       a.disburseAmount                                              AS disburse_amount,
-       a.applyDate                                                   AS apply_date,
-       a.dueDate                                                     AS due_date,
-       ca.sn                                                         AS core_sn,
+       CAST(a.term AS SIGNED)                                        AS term,
+       CAST(IFNULL(a.shouldLoanAmount, 0) AS SIGNED)                 AS should_loan_amount,
+       CAST(IFNULL(a.amount, 0) AS SIGNED)                           AS amount,
+       CAST(IFNULL(a.repayment, 0) AS SIGNED)                        AS repayment,
+       CAST(IFNULL(a.disburseAmount, 0) AS SIGNED)                   AS disburse_amount,
+       CAST(IFNULL(a.applyDate, 0) AS SIGNED)                        AS apply_date,
+       CAST(IFNULL(a.dueDate, 0) AS SIGNED)                          AS due_date,
+       CAST(ca.sn AS CHAR)                                           AS core_sn,
        CAST(IFNULL(ca.apply_time, 0) AS SIGNED)                      AS core_apply_time,
        CAST(IFNULL(ca.audit_time, 0) AS SIGNED)                      AS core_audit_time,
        CAST(IFNULL(ca.orig_fee, 0) AS SIGNED)                        AS core_orig_fee,
-       a.disburseTime                                                AS disburse_time,
-       a.paidTime                                                    AS paid_time,
-       a.`status`                                                    AS src_status,
-       IFNULL(u.credentialNo, '')                                    AS id2_raw,
-       vt_id.token                                                   AS id_number_token,
-       vt_i2.token                                                   AS id2_token,
+       CAST(IFNULL(a.disburseTime, 0) AS SIGNED)                     AS disburse_time,
+       CAST(IFNULL(a.paidTime, 0) AS SIGNED)                         AS paid_time,
+       CAST(IFNULL(a.`status`, 0) AS SIGNED)                         AS src_status,
+       CAST(IFNULL(u.credentialNo, '') AS CHAR)                      AS id2_raw,
+       CAST(NULL AS CHAR)                                            AS id_number_token,
+       CAST(NULL AS CHAR)                                            AS id2_token,
        CAST(IFNULL((
            SELECT MAX(rr.repay_time)
-           FROM ng_loan_core.application ca2
-                    INNER JOIN ng_loan_core.repay_record rr ON rr.sn = ca2.sn
-           WHERE ca2.ext_sn = a.applicationNo
+           FROM ng_loan_core.repay_record rr
+           WHERE rr.sn = ca.sn
        ), 0) AS SIGNED)                                              AS last_repay_time,
        CAST(UNIX_TIMESTAMP(a.created) AS SIGNED) * 1000              AS event_time
 FROM application a
          LEFT JOIN `user` u ON u.id = a.`userId`
          LEFT JOIN ng_loan_core.application ca ON ca.ext_sn = a.applicationNo
-         LEFT JOIN user_data ud
-                   ON ud.`userId` = a.`userId`
-                       AND ud.id = (
-                           SELECT CAST(MAX(ud2.id) AS SIGNED)
-                           FROM user_data ud2
-                           WHERE ud2.`userId` = a.`userId`
-                       )
-         LEFT JOIN vt_token_cache vt_m
-                   ON vt_m.vt_type = 'mobile' AND vt_m.status = 1
-                       AND vt_m.raw_value COLLATE utf8mb4_bin = (
-                           CASE
-                               WHEN a.mobile LIKE '+234%' THEN a.mobile
-                               WHEN a.mobile LIKE '234%' THEN CONCAT('+', a.mobile)
-                               WHEN a.mobile LIKE '0%' THEN CONCAT('+234', SUBSTRING(a.mobile, 2))
-                               ELSE CONCAT('+234', a.mobile)
-                               END
-                           ) COLLATE utf8mb4_bin
-         LEFT JOIN vt_token_cache vt_id
-                   ON vt_id.vt_type = 'id_number' AND vt_id.status = 1
-                       AND vt_id.raw_value COLLATE utf8mb4_bin = TRIM(ud.bvn) COLLATE utf8mb4_bin
-         LEFT JOIN vt_token_cache vt_b
-                   ON vt_b.vt_type = 'bank_account' AND vt_b.status = 1
-                       AND vt_b.raw_value COLLATE utf8mb4_bin = TRIM(a.bankAccount) COLLATE utf8mb4_bin
-         LEFT JOIN vt_token_cache vt_g
-                   ON vt_g.vt_type = 'gaid_idfa' AND vt_g.status = 1
-                       AND vt_g.raw_value COLLATE utf8mb4_bin = TRIM(a.gaid) COLLATE utf8mb4_bin
-         LEFT JOIN vt_token_cache vt_i2
-                   ON vt_i2.vt_type = 'id2' AND vt_i2.status = 1
-                       AND vt_i2.raw_value COLLATE utf8mb4_bin = TRIM(u.credentialNo) COLLATE utf8mb4_bin
 WHERE a.applicationNo IS NOT NULL AND TRIM(a.applicationNo) <> ''
   AND ca.sn IS NOT NULL AND TRIM(ca.sn) <> '';
 
@@ -255,25 +231,26 @@ FROM application ma
          INNER JOIN ng_loan_core.application ca ON ca.ext_sn = ma.applicationNo
 WHERE ma.disburseTime > 0;
 
--- ---------- loan 增量 bundle Lookup ----------
+-- ---------- loan 增量 bundle Lookup（Flink: WHERE sn = ?）----------
+-- 数值一律 CAST SIGNED，避免 JDBC BigInteger/Long 与 Flink INT 冲突
 CREATE OR REPLACE VIEW loan_incr_bundle_lookup AS
-SELECT rp.sn,
-       rp.plan_sn,
+SELECT CAST(rp.sn AS CHAR)                                                         AS sn,
+       CAST(rp.plan_sn AS SIGNED)                                                  AS plan_sn,
        CONCAT('ng', LPAD(CAST(ma.`appId` AS CHAR), 4, '0'), '-', ma.applicationNo) AS application_no,
        CONCAT('ng-', rp.sn, '-', LPAD(1, 2, '0'), LPAD(0, 3, '0'))               AS loan_no,
-       1                                                                           AS period,
-       0                                                                           AS roll_sequence,
-       rp.start_date,
-       rp.due_date,
-       rp.prin_amt,
-       rp.interest,
-       rp.orig_fee,
-       rp.penalty,
-       rp.amt,
-       rp.`status`                                                                 AS rp_status,
-       IFNULL(rp.repaid_amt, 0)                                                     AS repaid_amt,
-       rp.repay_last_time,
-       rp.settle_time,
+       CAST(1 AS SIGNED)                                                           AS period,
+       CAST(0 AS SIGNED)                                                           AS roll_sequence,
+       CAST(rp.start_date AS SIGNED)                                               AS start_date,
+       CAST(rp.due_date AS SIGNED)                                                 AS due_date,
+       CAST(IFNULL(rp.prin_amt, 0) AS SIGNED)                                      AS prin_amt,
+       CAST(IFNULL(rp.interest, 0) AS SIGNED)                                      AS interest,
+       CAST(IFNULL(rp.orig_fee, 0) AS SIGNED)                                      AS orig_fee,
+       CAST(IFNULL(rp.penalty, 0) AS SIGNED)                                       AS penalty,
+       CAST(IFNULL(rp.amt, 0) AS SIGNED)                                           AS amt,
+       CAST(IFNULL(rp.`status`, 0) AS SIGNED)                                      AS rp_status,
+       CAST(IFNULL(rp.repaid_amt, 0) AS SIGNED)                                    AS repaid_amt,
+       CAST(IFNULL(rp.repay_last_time, 0) AS SIGNED)                               AS repay_last_time,
+       CAST(IFNULL(rp.settle_time, 0) AS SIGNED)                                   AS settle_time,
        rp.created_at
 FROM ng_loan_core.repay_plan rp
          INNER JOIN ng_loan_core.application ca ON ca.sn = rp.sn
