@@ -135,7 +135,7 @@ CREATE TABLE IF NOT EXISTS sink_loan (
     paid_off_date STRING,
     created_time BIGINT,
     status INT,
-    PRIMARY KEY (application_no, period, roll_sequence) NOT ENFORCED
+    PRIMARY KEY (application_no, `period`, roll_sequence) NOT ENFORCED
 ) WITH (
     'connector' = 'jdbc',
     'url' = 'jdbc:mysql://${TARGET_MYSQL_HOST}:${TARGET_MYSQL_PORT}/${TARGET_MYSQL_DATABASE}?${TARGET_JDBC_PARAMS}',
