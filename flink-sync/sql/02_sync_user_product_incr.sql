@@ -1,8 +1,11 @@
 -- 增量 user_product：application CDC + 最新额度 Lookup
 SET 'parallelism.default' = '${FLINK_PARALLELISM}';
 SET 'table.exec.mini-batch.enabled' = 'true';
+SET 'table.exec.mini-batch.allow-latency' = '200ms';
+SET 'table.exec.mini-batch.size' = '${FLINK_MINI_BATCH_SIZE}';
 SET 'execution.checkpointing.interval' = '${FLINK_CHECKPOINT_INTERVAL}';
 SET 'execution.checkpointing.timeout' = '${FLINK_CHECKPOINT_TIMEOUT}';
+SET 'execution.checkpointing.min-pause' = '120s';
 
 CREATE TABLE IF NOT EXISTS cdc_application (
     id BIGINT, `userId` BIGINT, `productId` BIGINT, proc_time AS PROCTIME(),

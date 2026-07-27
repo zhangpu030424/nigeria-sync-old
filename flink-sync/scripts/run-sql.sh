@@ -16,6 +16,7 @@ fi
 source scripts/lib/load-project-env.sh
 load_project_env "$(pwd)"
 
+# 强制注入 Flink 运行参数（避免 .env 空值或父 shell 未 export 导致 envsubst 留空）
 export FLINK_PARALLELISM="${FLINK_PARALLELISM:-4}"
 export FLINK_MINI_BATCH_SIZE="${FLINK_MINI_BATCH_SIZE:-5000}"
 export FLINK_SINK_BUFFER_ROWS="${FLINK_SINK_BUFFER_ROWS:-10000}"
@@ -62,7 +63,8 @@ if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
   exit 1
 fi
 
-echo ">> 执行: $SQL_FILE (parallelism=${FLINK_PARALLELISM})"
+echo ">> 执行: $SQL_FILE (parallelism=${FLINK_PARALLELISM} mini_batch=${FLINK_MINI_BATCH_SIZE})"
+grep -E "^SET 'parallelism|^SET 'table.exec.mini-batch|^SET 'execution.checkpointing.interval" "$PREPARED" 2>/dev/null | head -6 || true
 docker cp "$PREPARED" "${CONTAINER}:${REMOTE}"
 SQL_LOG="$(mktemp)"
 trap 'rm -f "$PREPARED" "$SQL_LOG"' EXIT

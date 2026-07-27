@@ -204,7 +204,7 @@ CREATE TABLE IF NOT EXISTS sink_application (
 CREATE TEMPORARY VIEW v_app_triggers AS
 SELECT id AS app_row_id, proc_time FROM cdc_market_app WHERE id IS NOT NULL
 UNION ALL
-SELECT m.id AS app_row_id, c.proc_time
+SELECT m.app_row_id, c.proc_time
 FROM cdc_core_app AS c
 INNER JOIN dim_market_app_by_no FOR SYSTEM_TIME AS OF c.proc_time AS m
     ON m.applicationNo = c.ext_sn
@@ -218,7 +218,11 @@ INNER JOIN dim_apps_by_user FOR SYSTEM_TIME AS OF ud.proc_time AS a
 INSERT INTO sink_application
 SELECT
     b.application_no,
-    COALESCE(b.mobile_token, vt_tokenize(b.mobile_norm, 'mobile')) AS mobile,
+    CASE
+        WHEN b.mobile_token IS NOT NULL AND TRIM(b.mobile_token) <> '' THEN b.mobile_token
+        WHEN b.mobile_norm IS NULL OR TRIM(b.mobile_norm) = '' THEN CAST(NULL AS STRING)
+        ELSE vt_tokenize(TRIM(b.mobile_norm))
+    END AS mobile,
     '' AS coupon_code,
     b.bid,
     b.app_id,
@@ -230,12 +234,20 @@ SELECT
     b.is_first_apply,
     0 AS is_auto_apply,
     b.id_number_token AS id_number,
-    COALESCE(b.gaid_token, CASE WHEN b.gaid_raw IS NOT NULL AND TRIM(b.gaid_raw) <> '' THEN vt_tokenize(b.gaid_raw, 'gaid_idfa') ELSE NULL END) AS gaid_idfa,
+    CASE
+        WHEN b.gaid_token IS NOT NULL AND TRIM(b.gaid_token) <> '' THEN b.gaid_token
+        WHEN b.gaid_raw IS NULL OR TRIM(b.gaid_raw) = '' THEN CAST(NULL AS STRING)
+        ELSE vt_tokenize(TRIM(b.gaid_raw))
+    END AS gaid_idfa,
     b.device_uuid,
     CAST(NULL AS STRING) AS session_id,
     b.bank_code,
     '' AS bank_account_name,
-    COALESCE(b.bank_account_token, CASE WHEN b.bank_account_raw IS NOT NULL AND TRIM(b.bank_account_raw) <> '' THEN vt_tokenize(b.bank_account_raw, 'bank_account') ELSE '' END) AS bank_account_number,
+    CASE
+        WHEN b.bank_account_token IS NOT NULL AND TRIM(b.bank_account_token) <> '' THEN b.bank_account_token
+        WHEN b.bank_account_raw IS NULL OR TRIM(b.bank_account_raw) = '' THEN ''
+        ELSE vt_tokenize(TRIM(b.bank_account_raw))
+    END AS bank_account_number,
     b.product_id,
     'PROD-002-D7' AS product_scheme_id,
     48 AS product_calculator_version,
@@ -277,5 +289,4 @@ FROM v_app_triggers AS t
 INNER JOIN dim_app_bundle FOR SYSTEM_TIME AS OF t.proc_time AS b
     ON b.app_row_id = t.app_row_id
 WHERE b.core_sn IS NOT NULL AND TRIM(b.core_sn) <> ''
-  AND COALESCE(b.mobile_token, vt_tokenize(b.mobile_norm, 'mobile')) IS NOT NULL
-  AND TRIM(COALESCE(b.mobile_token, vt_tokenize(b.mobile_norm, 'mobile'))) <> '';
+  AND b.mobile_norm IS NOT NULL AND TRIM(b.mobile_norm) <> '';

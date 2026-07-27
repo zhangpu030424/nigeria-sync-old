@@ -4,8 +4,11 @@ CREATE TEMPORARY FUNCTION bankcard_id_resolve AS 'com.nigeria.flink.udf.UserBank
 
 SET 'parallelism.default' = '${FLINK_PARALLELISM}';
 SET 'table.exec.mini-batch.enabled' = 'true';
+SET 'table.exec.mini-batch.allow-latency' = '200ms';
+SET 'table.exec.mini-batch.size' = '${FLINK_MINI_BATCH_SIZE}';
 SET 'execution.checkpointing.interval' = '${FLINK_CHECKPOINT_INTERVAL}';
 SET 'execution.checkpointing.timeout' = '${FLINK_CHECKPOINT_TIMEOUT}';
+SET 'execution.checkpointing.min-pause' = '120s';
 
 CREATE TABLE IF NOT EXISTS cdc_user_data (
     id BIGINT, `userId` BIGINT, proc_time AS PROCTIME(), PRIMARY KEY (id) NOT ENFORCED

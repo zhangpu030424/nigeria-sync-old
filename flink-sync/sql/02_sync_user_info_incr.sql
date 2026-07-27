@@ -81,7 +81,10 @@ SELECT `userId` AS user_id, proc_time FROM cdc_uri WHERE `userId` IS NOT NULL;
 INSERT INTO sink_user_info
 SELECT
     b.user_id,
-    COALESCE(b.id_number_token, CASE WHEN b.bvn_raw IS NOT NULL AND TRIM(b.bvn_raw) <> '' THEN vt_tokenize(b.bvn_raw, 'id_number') ELSE '' END) AS id_number,
+    COALESCE(
+        NULLIF(TRIM(b.id_number_token), ''),
+        CASE WHEN b.bvn_raw IS NOT NULL AND TRIM(b.bvn_raw) <> '' THEN vt_tokenize(TRIM(b.bvn_raw)) ELSE '' END
+    ) AS id_number,
     TRIM(b.full_name) AS full_name,
     b.password,
     '' AS live_image,

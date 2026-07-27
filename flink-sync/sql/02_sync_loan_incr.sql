@@ -75,7 +75,7 @@ CREATE TABLE IF NOT EXISTS dim_loan_bundle (
     sn STRING,
     application_no STRING,
     loan_no STRING,
-    period INT,
+    `period` INT,
     roll_sequence INT,
     start_date BIGINT,
     due_date BIGINT,
@@ -117,7 +117,7 @@ CREATE TABLE IF NOT EXISTS dim_core_sn_by_market_app (
 CREATE TABLE IF NOT EXISTS sink_loan (
     loan_no STRING,
     application_no STRING,
-    period INT,
+    `period` INT,
     roll_sequence INT,
     start_date STRING,
     due_date STRING,
@@ -161,7 +161,7 @@ INSERT INTO sink_loan
 SELECT
     l.loan_no,
     l.application_no,
-    l.period,
+    l.`period`,
     l.roll_sequence,
     DATE_FORMAT(FROM_UNIXTIME(CASE WHEN l.start_date > 10000000000 THEN l.start_date / 1000 ELSE l.start_date END), 'yyyy-MM-dd') AS start_date,
     DATE_FORMAT(FROM_UNIXTIME(CASE WHEN l.due_date > 10000000000 THEN l.due_date / 1000 ELSE l.due_date END), 'yyyy-MM-dd') AS due_date,

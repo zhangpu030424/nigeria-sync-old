@@ -181,7 +181,11 @@ SELECT
     u.app_id,
     u.user_id AS group_user_id,
     u.user_id AS info_user_id,
-    COALESCE(u.mobile_token, vt_tokenize(u.mobile_norm, 'mobile')) AS mobile,
+    CASE
+        WHEN u.mobile_token IS NOT NULL AND TRIM(u.mobile_token) <> '' THEN u.mobile_token
+        WHEN u.mobile_norm IS NULL OR TRIM(u.mobile_norm) = '' THEN CAST(NULL AS STRING)
+        ELSE vt_tokenize(TRIM(u.mobile_norm))
+    END AS mobile,
     u.password,
     u.closed_time,
     u.reg_device_uuid,
@@ -205,5 +209,7 @@ FROM v_user_triggers AS t
 INNER JOIN dim_user_row FOR SYSTEM_TIME AS OF t.proc_time AS u
     ON u.user_id = t.user_id
 WHERE u.mobile_norm IS NOT NULL AND TRIM(u.mobile_norm) <> ''
-  AND COALESCE(u.mobile_token, vt_tokenize(u.mobile_norm, 'mobile')) IS NOT NULL
-  AND TRIM(COALESCE(u.mobile_token, vt_tokenize(u.mobile_norm, 'mobile'))) <> '';
+  AND (
+    (u.mobile_token IS NOT NULL AND TRIM(u.mobile_token) <> '')
+    OR (u.mobile_norm IS NOT NULL AND TRIM(u.mobile_norm) <> '')
+  );
