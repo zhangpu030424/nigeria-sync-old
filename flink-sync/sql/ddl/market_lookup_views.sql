@@ -23,7 +23,7 @@ WHERE u.`deviceId` IS NOT NULL AND u.`deviceId` > 0;
 
 -- ---------- user 增量 Lookup（Flink: WHERE id = ?；对齐 nigeria-flink-sync 裸 id + CHAR）----------
 CREATE OR REPLACE VIEW user_incr_lookup AS
-SELECT u.id_signed                                                   AS id,
+SELECT CAST(u.id AS SIGNED)                                      AS id,
        CAST(u.`appId` AS SIGNED)                                     AS app_id,
        CASE
            WHEN u.mobile LIKE '+234%' THEN u.mobile

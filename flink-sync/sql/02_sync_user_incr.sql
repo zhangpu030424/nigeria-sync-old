@@ -99,7 +99,7 @@ CREATE TABLE IF NOT EXISTS dim_user_row (
     'table-name' = 'user_incr_lookup',
     'username' = '${MARKET_MYSQL_USER}',
     'password' = '${MARKET_MYSQL_PASSWORD}',
-    'lookup.cache.max-rows' = '300000',
+    'lookup.cache.max-rows' = '500000',
     'lookup.cache.ttl' = '${LOOKUP_CACHE_TTL}'
 );
 
