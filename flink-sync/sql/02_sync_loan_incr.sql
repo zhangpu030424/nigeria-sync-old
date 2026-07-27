@@ -179,7 +179,7 @@ SELECT
     CASE WHEN COALESCE(l.settle_time, 0) > 0
         THEN DATE_FORMAT(FROM_UNIXTIME(CASE WHEN l.settle_time > 10000000000 THEN l.settle_time / 1000 ELSE l.settle_time END), 'yyyy-MM-dd')
         ELSE CAST(NULL AS STRING) END AS paid_off_date,
-    CAST(UNIX_TIMESTAMP(l.created_at) * 1000 AS BIGINT) AS created_time,
+    CAST(UNIX_TIMESTAMP(CAST(l.created_at AS STRING)) * 1000 AS BIGINT) AS created_time,
     CASE
         WHEN l.rp_status = 1 AND COALESCE(l.repaid_amt, 0) = 0 THEN 20
         WHEN l.rp_status = 1 AND COALESCE(l.repaid_amt, 0) <> 0 THEN 24
