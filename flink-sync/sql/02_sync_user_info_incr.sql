@@ -87,7 +87,7 @@ SELECT
         NULLIF(TRIM(b.id_number_token), ''),
         CASE WHEN b.bvn_raw IS NOT NULL AND TRIM(b.bvn_raw) <> '' THEN vt_tokenize(TRIM(b.bvn_raw)) ELSE '' END
     ) AS id_number,
-    NULLIF(TRIM(b.full_name), '') AS full_name,
+    COALESCE(NULLIF(TRIM(b.full_name), ''), '') AS full_name,
     b.password,
     '' AS live_image,
     '' AS id_card,

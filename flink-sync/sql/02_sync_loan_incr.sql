@@ -1,5 +1,5 @@
 -- 增量 loan：core repay_plan / repay_record + market application CDC
--- unsigned bigint 在 JDBC 返回 BigInteger；Lookup 视图 CAST DECIMAL + Flink DECIMAL(20,0)
+-- unsigned bigint 经 JDBC Lookup 会变成 BigInteger；维表侧用 STRING + 视图 CAST CHAR 避免 ClassCast
 SET 'parallelism.default' = '${FLINK_PARALLELISM}';
 SET 'table.exec.mini-batch.enabled' = 'true';
 SET 'table.exec.mini-batch.allow-latency' = '200ms';
@@ -73,7 +73,7 @@ CREATE TABLE IF NOT EXISTS cdc_market_app_disburse (
 );
 
 CREATE TABLE IF NOT EXISTS dim_loan_bundle (
-    sn DECIMAL(20, 0),
+    sn STRING,
     application_no STRING,
     loan_no STRING,
     `period` BIGINT,
@@ -102,8 +102,8 @@ CREATE TABLE IF NOT EXISTS dim_loan_bundle (
 );
 
 CREATE TABLE IF NOT EXISTS dim_core_sn_by_market_app (
-    id DECIMAL(20, 0),
-    core_sn DECIMAL(20, 0),
+    id STRING,
+    core_sn STRING,
     PRIMARY KEY (id) NOT ENFORCED
 ) WITH (
     'connector' = 'jdbc',
@@ -148,15 +148,15 @@ CREATE TABLE IF NOT EXISTS sink_loan (
 );
 
 CREATE TEMPORARY VIEW v_loan_triggers AS
-SELECT sn, proc_time FROM cdc_repay_plan WHERE sn IS NOT NULL
+SELECT CAST(sn AS STRING) AS sn, proc_time FROM cdc_repay_plan WHERE sn IS NOT NULL
 UNION ALL
-SELECT sn, proc_time FROM cdc_repay_record WHERE sn IS NOT NULL
+SELECT CAST(sn AS STRING) AS sn, proc_time FROM cdc_repay_record WHERE sn IS NOT NULL
 UNION ALL
 SELECT m.core_sn AS sn, a.proc_time
 FROM cdc_market_app_disburse AS a
 INNER JOIN dim_core_sn_by_market_app FOR SYSTEM_TIME AS OF a.proc_time AS m
-    ON m.id = a.id
-WHERE m.core_sn IS NOT NULL;
+    ON m.id = CAST(a.id AS STRING)
+WHERE m.core_sn IS NOT NULL AND TRIM(m.core_sn) <> '';
 
 INSERT INTO sink_loan
 SELECT

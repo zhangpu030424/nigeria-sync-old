@@ -107,6 +107,7 @@ CREATE TABLE IF NOT EXISTS dim_app_bundle (
     paid_time BIGINT,
     src_status BIGINT,
     id_number_token STRING,
+    bvn_raw STRING,
     last_repay_time BIGINT,
     PRIMARY KEY (app_row_id) NOT ENFORCED
 ) WITH (
@@ -220,8 +221,8 @@ SELECT
     b.application_no,
     CASE
         WHEN b.mobile_token IS NOT NULL AND TRIM(b.mobile_token) <> '' THEN b.mobile_token
-        WHEN b.mobile_norm IS NULL OR TRIM(b.mobile_norm) = '' THEN CAST(NULL AS STRING)
-        ELSE vt_tokenize(TRIM(b.mobile_norm))
+        WHEN b.mobile_norm IS NULL OR TRIM(b.mobile_norm) = '' THEN ''
+        ELSE COALESCE(vt_tokenize(TRIM(b.mobile_norm)), '')
     END AS mobile,
     '' AS coupon_code,
     b.bid,
@@ -233,7 +234,10 @@ SELECT
     0 AS is_test,
     CAST(b.is_first_apply AS INT) AS is_first_apply,
     0 AS is_auto_apply,
-    b.id_number_token AS id_number,
+    COALESCE(
+        NULLIF(TRIM(b.id_number_token), ''),
+        CASE WHEN b.bvn_raw IS NOT NULL AND TRIM(b.bvn_raw) <> '' THEN COALESCE(vt_tokenize(TRIM(b.bvn_raw)), '') ELSE '' END
+    ) AS id_number,
     CASE
         WHEN b.gaid_token IS NOT NULL AND TRIM(b.gaid_token) <> '' THEN b.gaid_token
         WHEN b.gaid_raw IS NULL OR TRIM(b.gaid_raw) = '' THEN CAST(NULL AS STRING)
