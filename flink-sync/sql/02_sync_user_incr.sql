@@ -110,7 +110,7 @@ CREATE TABLE IF NOT EXISTS dim_users_by_app_mobile (
     PRIMARY KEY (app_id, mobile_raw) NOT ENFORCED
 ) WITH (
     'connector' = 'jdbc',
-    'url' = 'jdbc:mysql://${MARKET_MYSQL_HOST}:${MARKET_MYSQL_PORT}/${MARKET_MYSQL_DATABASE}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Africa/Lagos',
+    'url' = 'jdbc:mysql://${MARKET_MYSQL_HOST}:${MARKET_MYSQL_PORT}/${MARKET_MYSQL_DATABASE}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Africa/Lagos&tinyInt1isBit=false',
     'table-name' = 'users_by_app_mobile_lookup',
     'username' = '${MARKET_MYSQL_USER}',
     'password' = '${MARKET_MYSQL_PASSWORD}',
@@ -124,7 +124,7 @@ CREATE TABLE IF NOT EXISTS dim_users_by_device (
     PRIMARY KEY (device_id) NOT ENFORCED
 ) WITH (
     'connector' = 'jdbc',
-    'url' = 'jdbc:mysql://${MARKET_MYSQL_HOST}:${MARKET_MYSQL_PORT}/${MARKET_MYSQL_DATABASE}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Africa/Lagos',
+    'url' = 'jdbc:mysql://${MARKET_MYSQL_HOST}:${MARKET_MYSQL_PORT}/${MARKET_MYSQL_DATABASE}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Africa/Lagos&tinyInt1isBit=false',
     'table-name' = 'users_by_device_lookup',
     'username' = '${MARKET_MYSQL_USER}',
     'password' = '${MARKET_MYSQL_PASSWORD}',

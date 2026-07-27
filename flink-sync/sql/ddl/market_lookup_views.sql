@@ -1,31 +1,30 @@
--- ng_loan_market 增量 Lookup 视图（Flink JDBC Lookup 用）
--- 部署: ./scripts/deploy-source-ddl.sh
--- 前置: flink_cdc 账号需 SELECT on ng_loan_market + ng_loan_core
+-- ng_loan_market 增量 Lookup 视图（Flink JDBC Lookup 点查优化版）
+-- 原则:
+--   1. 数值列 CAST AS SIGNED，避免 JDBC BigInteger → Flink BIGINT ClassCast
+--   2. 禁止视图内全表 GROUP BY 物化；Latest 行用相关子查询 MAX(id)（WHERE user_id=? 时可走索引）
+-- 部署: ./scripts/deploy-source-ddl.sh --force
 
 SET SESSION wait_timeout = 28800;
 
--- ---------- 手机号规范化（与 ng_migration_run 一致）----------
--- 在视图中内联 CASE，勿依赖函数
-
--- ---------- 辅助：appId+mobile → user_id ----------
+-- ---------- 辅助：appId+mobile → user_id（lup CDC 触发解析 user_id）----------
 CREATE OR REPLACE VIEW users_by_app_mobile_lookup AS
-SELECT u.`appId` AS app_id,
-       u.mobile AS mobile_raw,
-       u.id     AS user_id
+SELECT CAST(u.`appId` AS SIGNED) AS app_id,
+       u.mobile                  AS mobile_raw,
+       CAST(u.id AS SIGNED)      AS user_id
 FROM `user` u
 WHERE u.id IS NOT NULL;
 
--- ---------- 辅助：deviceId → user_id ----------
+-- ---------- 辅助：deviceId → user_id（dac CDC 触发）----------
 CREATE OR REPLACE VIEW users_by_device_lookup AS
-SELECT u.`deviceId` AS device_id,
-       u.id         AS user_id
+SELECT CAST(u.`deviceId` AS SIGNED) AS device_id,
+       CAST(u.id AS SIGNED)         AS user_id
 FROM `user` u
 WHERE u.`deviceId` IS NOT NULL AND u.`deviceId` > 0;
 
--- ---------- user 增量 Lookup ----------
+-- ---------- user 增量 Lookup（Flink: WHERE user_id = ?）----------
 CREATE OR REPLACE VIEW user_incr_lookup AS
-SELECT u.id                                                          AS user_id,
-       u.`appId`                                                     AS app_id,
+SELECT CAST(u.id AS SIGNED)                                          AS user_id,
+       CAST(u.`appId` AS SIGNED)                                     AS app_id,
        CASE
            WHEN u.mobile LIKE '+234%' THEN u.mobile
            WHEN u.mobile LIKE '234%' THEN CONCAT('+', u.mobile)
@@ -34,8 +33,11 @@ SELECT u.id                                                          AS user_id,
            END                                                       AS mobile_norm,
        vt_m.token                                                    AS mobile_token,
        IFNULL(reg_d.deviceUUID, '')                                  AS reg_device_uuid,
-       CASE WHEN u.`isCancel` IN (1, '1') THEN UNIX_TIMESTAMP(u.updated) * 1000 ELSE 0 END AS closed_time,
-       UNIX_TIMESTAMP(u.created) * 1000                              AS reg_time,
+       CAST(CASE
+                WHEN u.`isCancel` IN (1, '1') THEN UNIX_TIMESTAMP(u.updated) * 1000
+                ELSE 0
+            END AS SIGNED)                                           AS closed_time,
+       CAST(UNIX_TIMESTAMP(u.created) * 1000 AS SIGNED)              AS reg_time,
        0                                                             AS test_flag,
        IFNULL(lup.password, '')                                      AS password,
        dac.channel                                                   AS dac_channel,
@@ -56,27 +58,24 @@ FROM `user` u
                                ELSE CONCAT('+234', u.mobile)
                                END
                            ) COLLATE utf8mb4_bin
-         LEFT JOIN (
-    SELECT lup.`appId`, lup.mobile, lup.password
-    FROM log_user_password lup
-             INNER JOIN (
-        SELECT `appId`, mobile, MAX(id) AS max_id
-        FROM log_user_password
-        GROUP BY `appId`, mobile
-    ) t ON lup.`appId` = t.`appId` AND lup.mobile = t.mobile AND lup.id = t.max_id
-) lup ON lup.`appId` = u.`appId` AND lup.mobile = u.mobile
-         LEFT JOIN (
-    SELECT dac.`deviceId`, dac.channel, dac.google_ads_campaign_id, dac.google_ads_adgroup_id,
-           dac.fb_install_referrer_campaign_id, dac.fb_install_referrer_campaign_group_id
-    FROM device_ad_channel dac
-             INNER JOIN (
-        SELECT `deviceId`, MAX(id) AS max_id FROM device_ad_channel GROUP BY `deviceId`
-    ) t ON dac.`deviceId` = t.`deviceId` AND dac.id = t.max_id
-) dac ON dac.`deviceId` = u.`deviceId`;
+         LEFT JOIN log_user_password lup
+                   ON lup.`appId` = u.`appId` AND lup.mobile = u.mobile
+                       AND lup.id = (
+                           SELECT CAST(MAX(l2.id) AS SIGNED)
+                           FROM log_user_password l2
+                           WHERE l2.`appId` = u.`appId` AND l2.mobile = u.mobile
+                       )
+         LEFT JOIN device_ad_channel dac
+                   ON dac.`deviceId` = u.`deviceId`
+                       AND dac.id = (
+                           SELECT CAST(MAX(d2.id) AS SIGNED)
+                           FROM device_ad_channel d2
+                           WHERE d2.`deviceId` = u.`deviceId`
+                       );
 
--- ---------- user_info 增量 bundle Lookup ----------
+-- ---------- user_info 增量 bundle Lookup（Flink: WHERE user_id = ?）----------
 CREATE OR REPLACE VIEW user_info_incr_bundle_lookup AS
-SELECT u.id AS user_id,
+SELECT CAST(u.id AS SIGNED)                                          AS user_id,
        TRIM(CONCAT(
                IFNULL(ud.`firstName`, ''), ' ',
                IFNULL(ud.`middleName`, ''), ' ',
@@ -87,8 +86,8 @@ SELECT u.id AS user_id,
        uri.ip                                                        AS registration_ip,
        dac.channel                                                   AS install_channel,
        ap.name                                                       AS app_name,
-       u.`appId`                                                     AS app_id,
-       UNIX_TIMESTAMP(u.created) * 1000                              AS reg_time,
+       CAST(u.`appId` AS SIGNED)                                     AS app_id,
+       CAST(UNIX_TIMESTAMP(u.created) * 1000 AS SIGNED)              AS reg_time,
        ud.bvn                                                        AS bvn_raw,
        ud.email, ud.birthday, ud.gender,
        ud.`addressState`, ud.`addressDistrict`, ud.address,
@@ -96,69 +95,72 @@ SELECT u.id AS user_id,
        ud.`emergencyContact`, ud.`numberOfChildren`, ud.`payCycle`, ud.`salaryDay`
 FROM `user` u
          LEFT JOIN app ap ON ap.id = u.`appId`
-         LEFT JOIN (
-    SELECT ud.*
-    FROM user_data ud
-             INNER JOIN (SELECT `userId`, MAX(id) AS max_id FROM user_data GROUP BY `userId`) t
-                        ON ud.`userId` = t.`userId` AND ud.id = t.max_id
-) ud ON ud.`userId` = u.id
+         LEFT JOIN user_data ud
+                   ON ud.`userId` = u.id
+                       AND ud.id = (
+                           SELECT CAST(MAX(ud2.id) AS SIGNED)
+                           FROM user_data ud2
+                           WHERE ud2.`userId` = u.id
+                       )
          LEFT JOIN vt_token_cache vt_id
                    ON vt_id.vt_type = 'id_number' AND vt_id.status = 1
                        AND vt_id.token IS NOT NULL AND TRIM(vt_id.token) <> ''
                        AND vt_id.raw_value COLLATE utf8mb4_bin = TRIM(ud.bvn) COLLATE utf8mb4_bin
-         LEFT JOIN (
-    SELECT uri.`userId`, uri.ip
-    FROM user_reg_ip uri
-             INNER JOIN (SELECT `userId`, MAX(id) AS max_id FROM user_reg_ip GROUP BY `userId`) t
-                        ON uri.`userId` = t.`userId` AND uri.id = t.max_id
-) uri ON uri.`userId` = u.id
-         LEFT JOIN (
-    SELECT lup.`appId`, lup.mobile, lup.password
-    FROM log_user_password lup
-             INNER JOIN (
-        SELECT `appId`, mobile, MAX(id) AS max_id FROM log_user_password GROUP BY `appId`, mobile
-    ) t ON lup.`appId` = t.`appId` AND lup.mobile = t.mobile AND lup.id = t.max_id
-) lup ON lup.`appId` = u.`appId` AND lup.mobile = u.mobile
-         LEFT JOIN (
-    SELECT dac.`deviceId`, dac.channel
-    FROM device_ad_channel dac
-             INNER JOIN (SELECT `deviceId`, MAX(id) AS max_id FROM device_ad_channel GROUP BY `deviceId`) t
-                        ON dac.`deviceId` = t.`deviceId` AND dac.id = t.max_id
-) dac ON dac.`deviceId` = u.`deviceId`;
+         LEFT JOIN user_reg_ip uri
+                   ON uri.`userId` = u.id
+                       AND uri.id = (
+                           SELECT CAST(MAX(uri2.id) AS SIGNED)
+                           FROM user_reg_ip uri2
+                           WHERE uri2.`userId` = u.id
+                       )
+         LEFT JOIN log_user_password lup
+                   ON lup.`appId` = u.`appId` AND lup.mobile = u.mobile
+                       AND lup.id = (
+                           SELECT CAST(MAX(l2.id) AS SIGNED)
+                           FROM log_user_password l2
+                           WHERE l2.`appId` = u.`appId` AND l2.mobile = u.mobile
+                       )
+         LEFT JOIN device_ad_channel dac
+                   ON dac.`deviceId` = u.`deviceId`
+                       AND dac.id = (
+                           SELECT CAST(MAX(d2.id) AS SIGNED)
+                           FROM device_ad_channel d2
+                           WHERE d2.`deviceId` = u.`deviceId`
+                       );
 
--- ---------- user_bankcard 增量 Lookup ----------
+-- ---------- user_bankcard 增量 Lookup（Flink: WHERE user_id = ?）----------
 CREATE OR REPLACE VIEW user_bankcard_incr_lookup AS
-SELECT ud.`userId`                                              AS user_id,
-       IFNULL(ud.bankCode, '')                                  AS bank_code,
-       TRIM(ud.bankAccount)                                     AS bank_account_raw,
-       vt_b.token                                               AS bank_account_token,
-       1                                                        AS is_default
+SELECT CAST(ud.`userId` AS SIGNED)                                   AS user_id,
+       IFNULL(ud.bankCode, '')                                       AS bank_code,
+       TRIM(ud.bankAccount)                                          AS bank_account_raw,
+       vt_b.token                                                    AS bank_account_token,
+       1                                                             AS is_default
 FROM user_data ud
-         INNER JOIN (
-    SELECT `userId`, MAX(id) AS max_id FROM user_data GROUP BY `userId`
-) pick ON ud.`userId` = pick.`userId` AND ud.id = pick.max_id
          LEFT JOIN vt_token_cache vt_b
                    ON vt_b.vt_type = 'bank_account' AND vt_b.status = 1
                        AND vt_b.token IS NOT NULL AND TRIM(vt_b.token) <> ''
                        AND vt_b.raw_value COLLATE utf8mb4_bin = TRIM(ud.bankAccount) COLLATE utf8mb4_bin
-WHERE ud.bankAccount IS NOT NULL AND TRIM(ud.bankAccount) <> '';
+WHERE ud.bankAccount IS NOT NULL AND TRIM(ud.bankAccount) <> ''
+  AND ud.id = (
+      SELECT CAST(MAX(ud2.id) AS SIGNED) FROM user_data ud2 WHERE ud2.`userId` = ud.`userId`
+  );
 
--- ---------- user_product 增量 Lookup（每 user+product 最新申请金额）----------
+-- ---------- user_product 增量 Lookup（Flink: WHERE user_id = ? AND product_id = ?）----------
 CREATE OR REPLACE VIEW user_product_incr_lookup AS
-SELECT pick.`userId`   AS user_id,
-       pick.`productId` AS product_id,
-       a.amount        AS credit_amount
-FROM (
-         SELECT `userId`, `productId`, MAX(id) AS max_id
-         FROM application
-         WHERE `productId` IS NOT NULL AND `productId` <> 0
-         GROUP BY `userId`, `productId`
-     ) pick
-         INNER JOIN application a ON a.id = pick.max_id;
+SELECT CAST(a.`userId` AS SIGNED)                                    AS user_id,
+       CAST(a.`productId` AS SIGNED)                                 AS product_id,
+       CAST(a.amount AS SIGNED)                                      AS credit_amount
+FROM application a
+WHERE a.`productId` IS NOT NULL AND a.`productId` <> 0
+  AND a.id = (
+      SELECT CAST(MAX(a2.id) AS SIGNED)
+      FROM application a2
+      WHERE a2.`userId` = a.`userId` AND a2.`productId` = a.`productId`
+  );
 
--- ---------- application 增量 bundle Lookup（market + core + bvn + repay）----------
+-- ---------- application 增量 bundle Lookup（Flink: WHERE app_row_id = ?）----------
 CREATE OR REPLACE VIEW application_incr_bundle_lookup AS
-SELECT a.id                                                          AS app_row_id,
+SELECT CAST(a.id AS SIGNED)                                          AS app_row_id,
        a.applicationNo                                               AS market_no,
        CONCAT('ng', LPAD(CAST(a.`appId` AS CHAR), 4, '0'), '-', a.applicationNo) AS application_no,
        CASE
@@ -169,9 +171,9 @@ SELECT a.id                                                          AS app_row_
            END                                                       AS mobile_norm,
        vt_m.token                                                    AS mobile_token,
        'ng01'                                                        AS bid,
-       a.`appId`                                                     AS app_id,
+       CAST(a.`appId` AS SIGNED)                                     AS app_id,
        '1.0.0'                                                       AS app_version,
-       a.`userId`                                                    AS user_id,
+       CAST(a.`userId` AS SIGNED)                                    AS user_id,
        a.applicationNo                                               AS sn,
        CASE WHEN a.`repeatLoan` = 0 THEN 1 ELSE 0 END                AS is_first_apply,
        IFNULL(NULLIF(a.gaid, ''), NULL)                              AS gaid_raw,
@@ -189,26 +191,32 @@ SELECT a.id                                                          AS app_row_
        a.applyDate                                                   AS apply_date,
        a.dueDate                                                     AS due_date,
        ca.sn                                                         AS core_sn,
-       IFNULL(ca.apply_time, 0)                                      AS core_apply_time,
-       IFNULL(ca.audit_time, 0)                                      AS core_audit_time,
-       IFNULL(ca.orig_fee, 0)                                        AS core_orig_fee,
+       CAST(IFNULL(ca.apply_time, 0) AS SIGNED)                      AS core_apply_time,
+       CAST(IFNULL(ca.audit_time, 0) AS SIGNED)                      AS core_audit_time,
+       CAST(IFNULL(ca.orig_fee, 0) AS SIGNED)                        AS core_orig_fee,
        a.disburseTime                                                AS disburse_time,
        a.paidTime                                                    AS paid_time,
        a.`status`                                                    AS src_status,
        IFNULL(u.credentialNo, '')                                    AS id2_raw,
        vt_id.token                                                   AS id_number_token,
        vt_i2.token                                                   AS id2_token,
-       IFNULL(rr.last_repay_time, 0)                                 AS last_repay_time,
-       CAST(UNIX_TIMESTAMP(a.created) AS UNSIGNED) * 1000            AS event_time
+       CAST(IFNULL((
+           SELECT MAX(rr.repay_time)
+           FROM ng_loan_core.application ca2
+                    INNER JOIN ng_loan_core.repay_record rr ON rr.sn = ca2.sn
+           WHERE ca2.ext_sn = a.applicationNo
+       ), 0) AS SIGNED)                                              AS last_repay_time,
+       CAST(UNIX_TIMESTAMP(a.created) AS SIGNED) * 1000              AS event_time
 FROM application a
          LEFT JOIN `user` u ON u.id = a.`userId`
          LEFT JOIN ng_loan_core.application ca ON ca.ext_sn = a.applicationNo
-         LEFT JOIN (
-    SELECT ud.`userId`, ud.bvn
-    FROM user_data ud
-             INNER JOIN (SELECT `userId`, MAX(id) AS max_id FROM user_data GROUP BY `userId`) t
-                        ON ud.`userId` = t.`userId` AND ud.id = t.max_id
-) ud ON ud.`userId` = a.`userId`
+         LEFT JOIN user_data ud
+                   ON ud.`userId` = a.`userId`
+                       AND ud.id = (
+                           SELECT CAST(MAX(ud2.id) AS SIGNED)
+                           FROM user_data ud2
+                           WHERE ud2.`userId` = a.`userId`
+                       )
          LEFT JOIN vt_token_cache vt_m
                    ON vt_m.vt_type = 'mobile' AND vt_m.status = 1
                        AND vt_m.raw_value COLLATE utf8mb4_bin = (
@@ -231,31 +239,27 @@ FROM application a
          LEFT JOIN vt_token_cache vt_i2
                    ON vt_i2.vt_type = 'id2' AND vt_i2.status = 1
                        AND vt_i2.raw_value COLLATE utf8mb4_bin = TRIM(u.credentialNo) COLLATE utf8mb4_bin
-         LEFT JOIN (
-    SELECT ca2.ext_sn, MAX(rr.repay_time) AS last_repay_time
-    FROM ng_loan_core.application ca2
-             INNER JOIN ng_loan_core.repay_record rr ON rr.sn = ca2.sn
-    GROUP BY ca2.ext_sn
-) rr ON rr.ext_sn = a.applicationNo
 WHERE a.applicationNo IS NOT NULL AND TRIM(a.applicationNo) <> ''
   AND ca.sn IS NOT NULL AND TRIM(ca.sn) <> '';
 
 -- ---------- 辅助：applicationNo → app_row_id ----------
 CREATE OR REPLACE VIEW market_app_id_by_no_lookup AS
-SELECT applicationNo, id AS app_row_id
+SELECT applicationNo,
+       CAST(id AS SIGNED) AS app_row_id
 FROM application
 WHERE applicationNo IS NOT NULL AND TRIM(applicationNo) <> '';
 
 -- ---------- 辅助：userId → app_row_id（user_data 变更触发）----------
 CREATE OR REPLACE VIEW market_app_ids_by_user_lookup AS
-SELECT id AS app_row_id, `userId` AS user_id
+SELECT CAST(id AS SIGNED)      AS app_row_id,
+       CAST(`userId` AS SIGNED) AS user_id
 FROM application
 WHERE `userId` IS NOT NULL;
 
 -- ---------- 辅助：market app id → core sn ----------
 CREATE OR REPLACE VIEW market_app_core_sn_lookup AS
-SELECT ma.id,
-       ca.sn AS core_sn
+SELECT CAST(ma.id AS SIGNED) AS id,
+       ca.sn                 AS core_sn
 FROM application ma
          INNER JOIN ng_loan_core.application ca ON ca.ext_sn = ma.applicationNo
 WHERE ma.disburseTime > 0;
@@ -281,11 +285,11 @@ SELECT rp.sn,
        rp.settle_time,
        rp.created_at
 FROM ng_loan_core.repay_plan rp
-         INNER JOIN (
-    SELECT sn, MAX(plan_sn) AS max_plan_sn
-    FROM ng_loan_core.repay_plan
-    GROUP BY sn
-) pick ON rp.sn = pick.sn AND rp.plan_sn = pick.max_plan_sn
          INNER JOIN ng_loan_core.application ca ON ca.sn = rp.sn
          INNER JOIN application ma ON ma.applicationNo = ca.ext_sn
-WHERE ma.disburseTime > 0;
+WHERE ma.disburseTime > 0
+  AND rp.plan_sn = (
+      SELECT MAX(rp2.plan_sn)
+      FROM ng_loan_core.repay_plan rp2
+      WHERE rp2.sn = rp.sn
+  );
