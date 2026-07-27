@@ -105,3 +105,19 @@ wait
 ## 配置项
 
 `SOURCE_*` / `TARGET_*` / `USER_BATCH` / `USER_INSERT_BATCH` / `WORKERS` / `APP_WORKERS` / `LOOKUP_PARALLEL` / `LUP_PAIR_CHUNK` / `VT_PRELOAD` / `VT_TOKEN_ENABLE` / `VT_TOKEN_CHUNK` / `VT_TOKEN_DB` / `DROP_MAT_ON_START` / `DEADLOCK_MAX_RETRIES` / `LOG_FILE`
+
+## 实时增量同步（Flink CDC）
+
+批处理对账之外，可用 `flink-sync/` 目录做 **binlog 级实时同步**（架构参考 `nigeria-flink-sync`）：
+
+```bash
+cd flink-sync
+cp .env.example .env   # 填 MARKET_MYSQL_* / CORE_MYSQL_* / TARGET_MYSQL_*
+./scripts/up.sh
+./scripts/sync-incr-auto.sh
+```
+
+- 首次上线：先跑 `ng_migration_all.sh` 全量，再启 Flink 增量
+- 兜底：保留 `run_reconcile_cron.sh` 滚动对账（建议缩窗口到 7 天）
+
+详见 [flink-sync/README.md](flink-sync/README.md)

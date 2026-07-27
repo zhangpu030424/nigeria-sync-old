@@ -1,0 +1,97 @@
+# Flink CDC 同步 — 服务器部署
+#
+# 使用前：
+#   cp .env.example .env   # 填写源库/目标库
+#   ./scripts/up.sh
+#
+# Web UI：http://<服务器IP>:8089
+
+services:
+  jobmanager:
+    build: .
+    image: ng-sync-flink:1.18-cdc
+    container_name: ng-sync-flink-jobmanager
+    restart: unless-stopped
+    ports:
+      - "${FLINK_WEB_PORT:-8089}:8089"
+    command: jobmanager
+    environment:
+      VT_BASE_URL: ${VT_BASE_URL:-http://101.47.27.225}
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        rest.port: 8089
+        rest.bind-port: 8089
+        jobmanager.memory.process.size: 2048m
+        state.backend: rocksdb
+        state.checkpoints.dir: file:///tmp/flink-checkpoints
+        state.savepoints.dir: file:///tmp/flink-savepoints
+        state.checkpoint-storage: filesystem
+        execution.checkpointing.interval: 300s
+        execution.checkpointing.timeout: 1800s
+        execution.checkpointing.min-pause: 120s
+        execution.checkpointing.tolerable-failed-checkpoints: 10
+        execution.checkpointing.unaligned: true
+        execution.checkpointing.mode: EXACTLY_ONCE
+        execution.checkpointing.externalized-checkpoint-retention: DELETE_ON_CANCELLATION
+        # Sink 短暂连不上目标库时：任务失败后自动从 checkpoint 恢复（UPSERT 幂等）
+        restart-strategy.type: fixed-delay
+        restart-strategy.fixed-delay.attempts: 2147483647
+        restart-strategy.fixed-delay.delay: 10s
+        table.local-time-zone: Africa/Lagos
+    volumes:
+      - ./data/flink-checkpoints:/tmp/flink-checkpoints
+      - ./data/flink-savepoints:/tmp/flink-savepoints
+      - ./sql:/opt/flink/sql:ro
+    networks:
+      - flink-network
+
+  taskmanager:
+    build: .
+    image: ng-sync-flink:1.18-cdc
+    pull_policy: never
+    container_name: ng-sync-flink-taskmanager
+    restart: unless-stopped
+    depends_on:
+      - jobmanager
+    command: taskmanager
+    environment:
+      VT_BASE_URL: ${VT_BASE_URL:-http://101.47.27.225}
+      VT_BATCH_SIZE: ${VT_BATCH_SIZE:-10000}
+      VT_BATCH_FLUSH_MS: ${VT_BATCH_FLUSH_MS:-5000}
+      VT_BATCH_TIMEOUT_SEC: ${VT_BATCH_TIMEOUT_SEC:-300}
+      VT_BATCH_MAX_RETRIES: ${VT_BATCH_MAX_RETRIES:-3}
+      SNOWFLAKE_EPOCH_MS: ${SNOWFLAKE_EPOCH_MS:-1288834974657}
+      SNOWFLAKE_DATACENTER_ID: ${SNOWFLAKE_DATACENTER_ID:-0}
+      SNOWFLAKE_WORKER_ID_BASE: ${SNOWFLAKE_WORKER_ID_BASE:-16}
+      SNOWFLAKE_WORKER_ID: ${SNOWFLAKE_WORKER_ID:-}
+      SNOWFLAKE_WORKER_ID_BITS: ${SNOWFLAKE_WORKER_ID_BITS:-5}
+      SNOWFLAKE_DATACENTER_ID_BITS: ${SNOWFLAKE_DATACENTER_ID_BITS:-5}
+      SNOWFLAKE_SEQUENCE_BITS: ${SNOWFLAKE_SEQUENCE_BITS:-12}
+      TARGET_MYSQL_HOST: ${TARGET_MYSQL_HOST}
+      TARGET_MYSQL_PORT: ${TARGET_MYSQL_PORT:-3306}
+      TARGET_MYSQL_USER: ${TARGET_MYSQL_USER}
+      TARGET_MYSQL_PASSWORD: ${TARGET_MYSQL_PASSWORD}
+      TARGET_MYSQL_DATABASE: ${TARGET_MYSQL_DATABASE}
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: ${FLINK_TASK_SLOTS:-16}
+        taskmanager.memory.process.size: ${FLINK_TM_MEMORY:-40960m}
+        state.backend: rocksdb
+        state.backend.rocksdb.memory.managed: true
+        state.checkpoints.dir: file:///tmp/flink-checkpoints
+        state.savepoints.dir: file:///tmp/flink-savepoints
+        state.checkpoint-storage: filesystem
+        restart-strategy.type: fixed-delay
+        restart-strategy.fixed-delay.attempts: 2147483647
+        restart-strategy.fixed-delay.delay: 10s
+        table.local-time-zone: Africa/Lagos
+    volumes:
+      - ./data/flink-checkpoints:/tmp/flink-checkpoints
+      - ./data/flink-savepoints:/tmp/flink-savepoints
+      - ./sql:/opt/flink/sql:ro
+    networks:
+      - flink-network
+
+networks:
+  flink-network:
+    driver: bridge

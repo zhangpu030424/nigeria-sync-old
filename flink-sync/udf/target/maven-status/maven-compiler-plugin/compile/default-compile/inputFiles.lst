@@ -1,0 +1,7 @@
+/Users/zhangpu/Documents/Java/nigeria-flink-sync/udf/src/main/java/com/nigeria/flink/udf/EmergencyContactsVtHelper.java
+/Users/zhangpu/Documents/Java/nigeria-flink-sync/udf/src/main/java/com/nigeria/flink/udf/MobileNormalizer.java
+/Users/zhangpu/Documents/Java/nigeria-flink-sync/udf/src/main/java/com/nigeria/flink/udf/SnowflakeIdFunction.java
+/Users/zhangpu/Documents/Java/nigeria-flink-sync/udf/src/main/java/com/nigeria/flink/udf/SnowflakeIdGenerator.java
+/Users/zhangpu/Documents/Java/nigeria-flink-sync/udf/src/main/java/com/nigeria/flink/udf/VtBatchClient.java
+/Users/zhangpu/Documents/Java/nigeria-flink-sync/udf/src/main/java/com/nigeria/flink/udf/VtTokenizeEmergencyContactsFunction.java
+/Users/zhangpu/Documents/Java/nigeria-flink-sync/udf/src/main/java/com/nigeria/flink/udf/VtTokenizeFunction.java
