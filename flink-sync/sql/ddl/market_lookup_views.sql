@@ -195,15 +195,11 @@ SELECT a.id                                                          AS app_row_
        CAST(IFNULL(a.disburseTime, 0) AS SIGNED)                     AS disburse_time,
        CAST(IFNULL(a.paidTime, 0) AS SIGNED)                         AS paid_time,
        CAST(IFNULL(a.`status`, 0) AS SIGNED)                         AS src_status,
-       CAST(IFNULL(u.credentialNo, '') AS CHAR)                      AS id2_raw,
        CAST(NULL AS CHAR)                                            AS id_number_token,
-       CAST(NULL AS CHAR)                                            AS id2_token,
        CAST(ud.bvn AS CHAR)                                          AS bvn_raw,
-       CAST(0 AS SIGNED)                                             AS last_repay_time,
-       CAST(UNIX_TIMESTAMP(a.created) * 1000 AS SIGNED)              AS event_time
+       CAST(0 AS SIGNED)                                             AS last_repay_time
 FROM application a
          STRAIGHT_JOIN ng_loan_core.application ca ON ca.ext_sn = a.applicationNo
-         LEFT JOIN `user` u ON u.id = a.`userId`
          LEFT JOIN user_data ud
                    ON ud.id = (
                        SELECT ud2.id FROM user_data ud2
@@ -219,18 +215,24 @@ SELECT applicationNo,
 FROM application
 WHERE applicationNo IS NOT NULL AND TRIM(applicationNo) <> '';
 
--- ---------- 辅助：userId → app_row_id（user_data 变更触发）----------
+-- ---------- 辅助：userId → 最新 app_row_id（user_data 变更触发）----------
+-- 只取该用户最新一笔，避免一用户上千笔 application 扇出打爆 LookupJoin
 CREATE OR REPLACE ALGORITHM=MERGE VIEW market_app_ids_by_user_lookup AS
-SELECT id AS app_row_id,
-       `userId` AS user_id
-FROM application
-WHERE `userId` IS NOT NULL;
+SELECT a.`userId` AS user_id,
+       a.id AS app_row_id
+FROM application a
+WHERE a.`userId` IS NOT NULL
+  AND a.id = (
+      SELECT MAX(a2.id)
+      FROM application a2
+      WHERE a2.`userId` = a.`userId`
+  );
 
 -- ---------- 辅助：market app id → core sn ----------
--- JDBC Lookup：unsigned 裸列会返回 BigInteger → Flink ClassCast；CAST CHAR 后 Flink 用 STRING
+-- 点查键用裸 id（走 application 主键）；Flink 侧 DECIMAL 承接 JDBC BigInteger
 CREATE OR REPLACE ALGORITHM=MERGE VIEW market_app_core_sn_lookup AS
-SELECT CAST(ma.id AS CHAR) AS id,
-       CAST(ca.sn AS CHAR) AS core_sn
+SELECT ma.id AS id,
+       ca.sn AS core_sn
 FROM application ma
          STRAIGHT_JOIN ng_loan_core.application ca ON ca.ext_sn = ma.applicationNo
 WHERE ma.disburseTime > 0;

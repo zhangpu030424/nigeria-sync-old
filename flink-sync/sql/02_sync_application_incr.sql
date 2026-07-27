@@ -11,6 +11,8 @@ SET 'execution.checkpointing.min-pause' = '120s';
 SET 'execution.checkpointing.tolerable-failed-checkpoints' = '10';
 SET 'execution.checkpointing.unaligned' = 'true';
 SET 'table.exec.state.ttl' = '2 h';
+SET 'table.exec.async-lookup.buffer-capacity' = '200';
+SET 'table.exec.async-lookup.timeout' = '60s';
 
 CREATE TABLE IF NOT EXISTS cdc_market_app (
     id BIGINT,
@@ -116,7 +118,7 @@ CREATE TABLE IF NOT EXISTS dim_app_bundle (
     'table-name' = 'application_incr_bundle_lookup',
     'username' = '${MARKET_MYSQL_USER}',
     'password' = '${MARKET_MYSQL_PASSWORD}',
-    'lookup.cache.max-rows' = '200000',
+    'lookup.cache.max-rows' = '500000',
     'lookup.cache.ttl' = '${LOOKUP_CACHE_TTL}'
 );
 
@@ -130,21 +132,21 @@ CREATE TABLE IF NOT EXISTS dim_market_app_by_no (
     'table-name' = 'market_app_id_by_no_lookup',
     'username' = '${MARKET_MYSQL_USER}',
     'password' = '${MARKET_MYSQL_PASSWORD}',
-    'lookup.cache.max-rows' = '300000',
+    'lookup.cache.max-rows' = '500000',
     'lookup.cache.ttl' = '${LOOKUP_CACHE_TTL}'
 );
 
 CREATE TABLE IF NOT EXISTS dim_apps_by_user (
-    app_row_id DECIMAL(20, 0),
     user_id DECIMAL(20, 0),
-    PRIMARY KEY (app_row_id) NOT ENFORCED
+    app_row_id DECIMAL(20, 0),
+    PRIMARY KEY (user_id) NOT ENFORCED
 ) WITH (
     'connector' = 'jdbc',
     'url' = 'jdbc:mysql://${MARKET_MYSQL_HOST}:${MARKET_MYSQL_PORT}/${MARKET_MYSQL_DATABASE}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Africa/Lagos&tinyInt1isBit=false',
     'table-name' = 'market_app_ids_by_user_lookup',
     'username' = '${MARKET_MYSQL_USER}',
     'password' = '${MARKET_MYSQL_PASSWORD}',
-    'lookup.cache.max-rows' = '300000',
+    'lookup.cache.max-rows' = '500000',
     'lookup.cache.ttl' = '${LOOKUP_CACHE_TTL}'
 );
 

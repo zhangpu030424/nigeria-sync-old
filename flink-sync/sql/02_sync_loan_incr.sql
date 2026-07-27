@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS cdc_repay_record (
 
 CREATE TABLE IF NOT EXISTS cdc_market_app_disburse (
     id DECIMAL(20, 0),
+    `disburseTime` BIGINT,
     proc_time AS PROCTIME(),
     PRIMARY KEY (id) NOT ENFORCED
 ) WITH (
@@ -102,8 +103,8 @@ CREATE TABLE IF NOT EXISTS dim_loan_bundle (
 );
 
 CREATE TABLE IF NOT EXISTS dim_core_sn_by_market_app (
-    id STRING,
-    core_sn STRING,
+    id DECIMAL(20, 0),
+    core_sn DECIMAL(20, 0),
     PRIMARY KEY (id) NOT ENFORCED
 ) WITH (
     'connector' = 'jdbc',
@@ -152,11 +153,16 @@ SELECT CAST(sn AS STRING) AS sn, proc_time FROM cdc_repay_plan WHERE sn IS NOT N
 UNION ALL
 SELECT CAST(sn AS STRING) AS sn, proc_time FROM cdc_repay_record WHERE sn IS NOT NULL
 UNION ALL
-SELECT m.core_sn AS sn, a.proc_time
-FROM cdc_market_app_disburse AS a
+-- 先过滤已放款再 Lookup，避免每条 application CDC 都打 JDBC
+SELECT CAST(m.core_sn AS STRING) AS sn, a.proc_time
+FROM (
+    SELECT id, proc_time
+    FROM cdc_market_app_disburse
+    WHERE COALESCE(`disburseTime`, 0) > 0
+) AS a
 INNER JOIN dim_core_sn_by_market_app FOR SYSTEM_TIME AS OF a.proc_time AS m
-    ON m.id = CAST(a.id AS STRING)
-WHERE m.core_sn IS NOT NULL AND TRIM(m.core_sn) <> '';
+    ON m.id = a.id
+WHERE m.core_sn IS NOT NULL;
 
 INSERT INTO sink_loan
 SELECT
