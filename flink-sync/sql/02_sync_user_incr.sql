@@ -78,21 +78,21 @@ CREATE TABLE IF NOT EXISTS cdc_dac (
 );
 
 CREATE TABLE IF NOT EXISTS dim_user_row (
-    user_id BIGINT,
+    id BIGINT,
     app_id BIGINT,
     mobile_norm STRING,
     mobile_token STRING,
     reg_device_uuid STRING,
     closed_time BIGINT,
     reg_time BIGINT,
-    test_flag INT,
+    test_flag BIGINT,
     password STRING,
     dac_channel STRING,
     google_ads_campaign_id STRING,
     google_ads_adgroup_id STRING,
     fb_install_referrer_campaign_id STRING,
     fb_install_referrer_campaign_group_id STRING,
-    PRIMARY KEY (user_id) NOT ENFORCED
+    PRIMARY KEY (id) NOT ENFORCED
 ) WITH (
     'connector' = 'jdbc',
     'url' = 'jdbc:mysql://${MARKET_MYSQL_HOST}:${MARKET_MYSQL_PORT}/${MARKET_MYSQL_DATABASE}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Africa/Lagos&tinyInt1isBit=false',
@@ -142,7 +142,7 @@ CREATE TABLE IF NOT EXISTS sink_user (
     closed_time BIGINT,
     reg_device_uuid STRING,
     reg_time BIGINT,
-    test_flag INT,
+    test_flag BIGINT,
     utm_source STRING,
     utm_medium STRING,
     utm_campaign STRING,
@@ -177,10 +177,10 @@ INNER JOIN dim_users_by_device FOR SYSTEM_TIME AS OF c.proc_time AS d
 
 INSERT INTO sink_user
 SELECT
-    u.user_id,
+    u.id,
     u.app_id,
-    u.user_id AS group_user_id,
-    u.user_id AS info_user_id,
+    u.id AS group_user_id,
+    u.id AS info_user_id,
     CASE
         WHEN u.mobile_token IS NOT NULL AND TRIM(u.mobile_token) <> '' THEN u.mobile_token
         WHEN u.mobile_norm IS NULL OR TRIM(u.mobile_norm) = '' THEN CAST(NULL AS STRING)
@@ -207,7 +207,7 @@ SELECT
     CAST(NULL AS STRING) AS advertiser_id
 FROM v_user_triggers AS t
 INNER JOIN dim_user_row FOR SYSTEM_TIME AS OF t.proc_time AS u
-    ON u.user_id = t.user_id
+    ON u.id = t.user_id
 WHERE u.mobile_norm IS NOT NULL AND TRIM(u.mobile_norm) <> ''
   AND (
     (u.mobile_token IS NOT NULL AND TRIM(u.mobile_token) <> '')

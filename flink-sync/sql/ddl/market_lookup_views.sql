@@ -8,22 +8,22 @@ SET SESSION wait_timeout = 28800;
 
 -- ---------- 辅助：appId+mobile → user_id（lup CDC 触发解析 user_id）----------
 CREATE OR REPLACE VIEW users_by_app_mobile_lookup AS
-SELECT CAST(u.`appId` AS SIGNED) AS app_id,
-       u.mobile                  AS mobile_raw,
-       CAST(u.id AS SIGNED)      AS user_id
+SELECT u.`appId`  AS app_id,
+       CAST(u.mobile AS CHAR) AS mobile_raw,
+       u.id       AS user_id
 FROM `user` u
 WHERE u.id IS NOT NULL;
 
 -- ---------- 辅助：deviceId → user_id（dac CDC 触发）----------
 CREATE OR REPLACE VIEW users_by_device_lookup AS
-SELECT CAST(u.`deviceId` AS SIGNED) AS device_id,
-       CAST(u.id AS SIGNED)         AS user_id
+SELECT u.`deviceId` AS device_id,
+       u.id         AS user_id
 FROM `user` u
 WHERE u.`deviceId` IS NOT NULL AND u.`deviceId` > 0;
 
--- ---------- user 增量 Lookup（Flink: WHERE user_id = ?）----------
+-- ---------- user 增量 Lookup（Flink: WHERE id = ?；对齐 nigeria-flink-sync 裸 id + CHAR）----------
 CREATE OR REPLACE VIEW user_incr_lookup AS
-SELECT CAST(u.id AS SIGNED)                                          AS user_id,
+SELECT u.id                                                          AS id,
        CAST(u.`appId` AS SIGNED)                                     AS app_id,
        CASE
            WHEN u.mobile LIKE '+234%' THEN u.mobile
@@ -31,47 +31,38 @@ SELECT CAST(u.id AS SIGNED)                                          AS user_id,
            WHEN u.mobile LIKE '0%' THEN CONCAT('+234', SUBSTRING(u.mobile, 2))
            ELSE CONCAT('+234', u.mobile)
            END                                                       AS mobile_norm,
-       vt_m.token                                                    AS mobile_token,
-       IFNULL(reg_d.deviceUUID, '')                                  AS reg_device_uuid,
+       CAST(NULL AS CHAR)                                            AS mobile_token,
+       CAST(IFNULL(reg_d.deviceUUID, '') AS CHAR)                    AS reg_device_uuid,
        CAST(CASE
                 WHEN u.`isCancel` IN (1, '1') THEN UNIX_TIMESTAMP(u.updated) * 1000
                 ELSE 0
             END AS SIGNED)                                           AS closed_time,
        CAST(UNIX_TIMESTAMP(u.created) * 1000 AS SIGNED)              AS reg_time,
-       0                                                             AS test_flag,
-       IFNULL(lup.password, '')                                      AS password,
-       dac.channel                                                   AS dac_channel,
-       dac.google_ads_campaign_id,
-       dac.google_ads_adgroup_id,
-       dac.fb_install_referrer_campaign_id,
-       dac.fb_install_referrer_campaign_group_id
+       CAST(0 AS SIGNED)                                             AS test_flag,
+       CAST(IFNULL(lup.password, '') AS CHAR)                         AS password,
+       CAST(dac.channel AS CHAR)                                      AS dac_channel,
+       CAST(dac.google_ads_campaign_id AS CHAR)                      AS google_ads_campaign_id,
+       CAST(dac.google_ads_adgroup_id AS CHAR)                       AS google_ads_adgroup_id,
+       CAST(dac.fb_install_referrer_campaign_id AS CHAR)            AS fb_install_referrer_campaign_id,
+       CAST(dac.fb_install_referrer_campaign_group_id AS CHAR)       AS fb_install_referrer_campaign_group_id
 FROM `user` u
          LEFT JOIN device reg_d ON reg_d.id = u.`deviceId`
-         LEFT JOIN vt_token_cache vt_m
-                   ON vt_m.vt_type = 'mobile' AND vt_m.status = 1
-                       AND vt_m.token IS NOT NULL AND TRIM(vt_m.token) <> ''
-                       AND vt_m.raw_value COLLATE utf8mb4_bin = (
-                           CASE
-                               WHEN u.mobile LIKE '+234%' THEN u.mobile
-                               WHEN u.mobile LIKE '234%' THEN CONCAT('+', u.mobile)
-                               WHEN u.mobile LIKE '0%' THEN CONCAT('+234', SUBSTRING(u.mobile, 2))
-                               ELSE CONCAT('+234', u.mobile)
-                               END
-                           ) COLLATE utf8mb4_bin
          LEFT JOIN log_user_password lup
-                   ON lup.`appId` = u.`appId` AND lup.mobile = u.mobile
-                       AND lup.id = (
-                           SELECT CAST(MAX(l2.id) AS SIGNED)
-                           FROM log_user_password l2
-                           WHERE l2.`appId` = u.`appId` AND l2.mobile = u.mobile
-                       )
+                   ON lup.id = (
+                       SELECT CAST(l2.id AS SIGNED)
+                       FROM log_user_password l2
+                       WHERE l2.`appId` = u.`appId` AND l2.mobile = u.mobile
+                       ORDER BY l2.id DESC
+                       LIMIT 1
+                   )
          LEFT JOIN device_ad_channel dac
-                   ON dac.`deviceId` = u.`deviceId`
-                       AND dac.id = (
-                           SELECT CAST(MAX(d2.id) AS SIGNED)
-                           FROM device_ad_channel d2
-                           WHERE d2.`deviceId` = u.`deviceId`
-                       );
+                   ON dac.id = (
+                       SELECT CAST(d2.id AS SIGNED)
+                       FROM device_ad_channel d2
+                       WHERE d2.`deviceId` = u.`deviceId`
+                       ORDER BY d2.id DESC
+                       LIMIT 1
+                   );
 
 -- ---------- user_info 增量 bundle Lookup（Flink: WHERE user_id = ?）----------
 CREATE OR REPLACE VIEW user_info_incr_bundle_lookup AS

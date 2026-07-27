@@ -37,6 +37,15 @@ if [[ "$FORCE" -eq 0 && "${DEPLOY_SOURCE_DDL_SKIP_IF_OK:-1}" == "1" ]]; then
   fi
 fi
 
+if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "${FLINK_JOBMANAGER_CONTAINER:-ng-sync-flink-jobmanager}"; then
+  running=$(docker exec "${FLINK_JOBMANAGER_CONTAINER:-ng-sync-flink-jobmanager}" ./bin/flink list 2>/dev/null \
+    | grep -cE 'RUNNING|RESTARTING|CANCELLING' || true)
+  if [[ "${running:-0}" -gt 0 ]]; then
+    echo "WARN: 仍有 ${running} 个 Flink Job 在跑，CREATE VIEW 可能等 MDL 锁。建议先:"
+    echo "  bash scripts/cancel-flink-jobs.sh --yes --keep-checkpoints"
+  fi
+fi
+
 echo ">> 部署 Lookup 视图到 ${MARKET_MYSQL_USER}@${MARKET_MYSQL_HOST}/${MARKET_MYSQL_DATABASE}"
-mysql_market_cmd < "$DDL"
+mysql_market_cmd --init-command="SET SESSION lock_wait_timeout=${SOURCE_DDL_LOCK_WAIT_TIMEOUT:-120}" < "$DDL"
 echo ">> 完成"
