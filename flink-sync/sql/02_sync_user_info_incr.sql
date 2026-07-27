@@ -1,5 +1,6 @@
 -- 增量 user_info：多源 CDC + bundle Lookup
 CREATE TEMPORARY FUNCTION vt_tokenize AS 'com.nigeria.flink.udf.VtTokenizeFunction';
+CREATE TEMPORARY FUNCTION vt_format_emergency_contacts AS 'com.nigeria.flink.udf.VtTokenizeEmergencyContactsFunction';
 
 SET 'parallelism.default' = '${FLINK_PARALLELISM}';
 SET 'table.exec.mini-batch.enabled' = 'true';
@@ -79,7 +80,7 @@ UNION ALL
 SELECT CAST(`userId` AS DECIMAL(20, 0)) AS user_id, proc_time FROM cdc_uri WHERE `userId` IS NOT NULL;
 
 -- JSON 标量字符串：空白 → null；转义双引号与反斜杠
--- 结构对齐 ng_migration_run._build_user_info_json（emergency_contacts 增量暂写 []）
+-- 结构对齐 ng_migration_run._build_user_info_json；emergency_contacts 由 UDF 从源库元组转对象并 VT
 -- 无 user_data 资料时不写目标，避免注册瞬间空壳 + Lookup 缓存把后续补数盖住
 INSERT INTO sink_user_info
 SELECT
@@ -125,7 +126,7 @@ SELECT
         ',"religion":null',
         ',"salary":', CASE WHEN b.salary IS NULL OR TRIM(b.salary) = '' THEN 'null'
             ELSE CONCAT('"', REPLACE(REPLACE(TRIM(b.salary), '\\', '\\\\'), '"', '\\"'), '"') END,
-        ',"emergency_contacts":[]',
+        ',"emergency_contacts":', vt_format_emergency_contacts(COALESCE(b.emergencyContact, '')),
         ',"registration_ip":', CASE WHEN b.registration_ip IS NULL OR TRIM(b.registration_ip) = '' THEN 'null'
             ELSE CONCAT('"', REPLACE(REPLACE(TRIM(b.registration_ip), '\\', '\\\\'), '"', '\\"'), '"') END,
         ',"registration_time":', CASE WHEN b.reg_time IS NULL OR b.reg_time = 0 THEN 'null' ELSE CAST(b.reg_time AS STRING) END,

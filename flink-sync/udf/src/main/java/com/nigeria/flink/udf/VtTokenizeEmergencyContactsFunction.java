@@ -25,12 +25,13 @@ public class VtTokenizeEmergencyContactsFunction extends ScalarFunction {
 
     public String eval(String payload) {
         if (payload == null) {
-            return "[]";
+            return EmergencyContactsVtHelper.emptyContactsJson();
         }
         String trimmed = payload.trim();
         if (trimmed.isEmpty() || "null".equalsIgnoreCase(trimmed)) {
-            return "[]";
+            return EmergencyContactsVtHelper.emptyContactsJson();
         }
+        // 源库 emergencyContact 或已格式化数组 / info JSON
         return EmergencyContactsVtHelper.processPayload(trimmed, client);
     }
 
