@@ -65,11 +65,10 @@ sync_jobs_print_plan() {
 }
 
 # 按 Job 解析并行度
-# 增量默认（约 30 slot 上跑齐 7 Job）：
-#   user / user_product / user_bankcard / id_mapping → FLINK_PARALLELISM_INCR_LIGHT(2)
-#   user_info → 建议 FLINK_PARALLELISM_INCR_USER_INFO=4
-#   application / loan → FLINK_PARALLELISM_INCR_HEAVY(8)
-# 可用 FLINK_PARALLELISM_INCR_<JOB>（大写，如 FLINK_PARALLELISM_INCR_APPLICATION=8）覆盖
+# 增量默认（本集群 TM=16 slot，建议峰值 ≤14 留余量）：
+#   user / user_product / user_bankcard / user_info / id_mapping → FLINK_PARALLELISM_INCR_LIGHT(2)
+#   application / loan → FLINK_PARALLELISM_INCR_HEAVY(2)  【16 slot 勿用 4/8，易 NoResourceAvailable】
+# 可用 FLINK_PARALLELISM_INCR_<JOB>（大写，如 FLINK_PARALLELISM_INCR_APPLICATION=2）覆盖
 # 用法: sync_job_parallelism user_info incr
 sync_job_parallelism() {
   local job_key="$1"
@@ -115,7 +114,7 @@ sync_job_parallelism() {
 
   case "$job_key" in
     application|loan)
-      echo "${FLINK_PARALLELISM_INCR_HEAVY:-8}"
+      echo "${FLINK_PARALLELISM_INCR_HEAVY:-2}"
       ;;
     user|user_product|user_bankcard|user_info|id_mapping)
       echo "${FLINK_PARALLELISM_INCR_LIGHT:-2}"

@@ -217,9 +217,10 @@ WHERE applicationNo IS NOT NULL AND TRIM(applicationNo) <> '';
 
 -- ---------- 辅助：userId → 最新 app_row_id（user_data 变更触发）----------
 -- 只取该用户最新一笔，避免一用户上千笔 application 扇出打爆 LookupJoin
+-- CAST SIGNED：JDBC 对 unsigned 返回 Long/BigInteger，Flink DECIMAL 会 ClassCast
 CREATE OR REPLACE ALGORITHM=MERGE VIEW market_app_ids_by_user_lookup AS
-SELECT a.`userId` AS user_id,
-       a.id AS app_row_id
+SELECT CAST(a.`userId` AS SIGNED) AS user_id,
+       CAST(a.id AS SIGNED) AS app_row_id
 FROM application a
 WHERE a.`userId` IS NOT NULL
   AND a.id = (

@@ -137,8 +137,8 @@ CREATE TABLE IF NOT EXISTS dim_market_app_by_no (
 );
 
 CREATE TABLE IF NOT EXISTS dim_apps_by_user (
-    user_id DECIMAL(20, 0),
-    app_row_id DECIMAL(20, 0),
+    user_id BIGINT,
+    app_row_id BIGINT,
     PRIMARY KEY (user_id) NOT ENFORCED
 ) WITH (
     'connector' = 'jdbc',
@@ -213,10 +213,11 @@ INNER JOIN dim_market_app_by_no FOR SYSTEM_TIME AS OF c.proc_time AS m
     ON m.applicationNo = c.ext_sn
 WHERE c.ext_sn IS NOT NULL AND TRIM(c.ext_sn) <> ''
 UNION ALL
-SELECT a.app_row_id, ud.proc_time
+SELECT CAST(a.app_row_id AS DECIMAL(20, 0)) AS app_row_id, ud.proc_time
 FROM cdc_user_data AS ud
 INNER JOIN dim_apps_by_user FOR SYSTEM_TIME AS OF ud.proc_time AS a
-    ON a.user_id = CAST(ud.`userId` AS DECIMAL(20, 0));
+    ON a.user_id = ud.`userId`
+WHERE ud.`userId` IS NOT NULL;
 
 INSERT INTO sink_application
 SELECT
