@@ -8,22 +8,22 @@ SET SESSION wait_timeout = 28800;
 
 -- ---------- 辅助：appId+mobile → user_id（lup CDC 触发解析 user_id）----------
 CREATE OR REPLACE VIEW users_by_app_mobile_lookup AS
-SELECT u.`appId`  AS app_id,
-       CAST(u.mobile AS CHAR) AS mobile_raw,
-       u.id       AS user_id
+SELECT u.`appId`                   AS app_id,
+       u.mobile                    AS mobile_raw,
+       CAST(u.id AS SIGNED)        AS user_id
 FROM `user` u
 WHERE u.id IS NOT NULL;
 
 -- ---------- 辅助：deviceId → user_id（dac CDC 触发）----------
 CREATE OR REPLACE VIEW users_by_device_lookup AS
-SELECT u.`deviceId` AS device_id,
-       u.id         AS user_id
+SELECT CAST(u.`deviceId` AS SIGNED) AS device_id,
+       CAST(u.id AS SIGNED)          AS user_id
 FROM `user` u
 WHERE u.`deviceId` IS NOT NULL AND u.`deviceId` > 0;
 
 -- ---------- user 增量 Lookup（Flink: WHERE id = ?；对齐 nigeria-flink-sync 裸 id + CHAR）----------
 CREATE OR REPLACE VIEW user_incr_lookup AS
-SELECT u.id                                                          AS id,
+SELECT u.id_signed                                                   AS id,
        CAST(u.`appId` AS SIGNED)                                     AS app_id,
        CASE
            WHEN u.mobile LIKE '+234%' THEN u.mobile

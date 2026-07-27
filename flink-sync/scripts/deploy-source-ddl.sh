@@ -7,9 +7,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 FORCE=0
+FORCE_INDEXES=0
 for arg in "$@"; do
   case "$arg" in
     --force) FORCE=1 ;;
+    --force-indexes) FORCE_INDEXES=1 ;;
     -h|--help)
       echo "用法: $0 [--force]"
       exit 0
@@ -47,5 +49,10 @@ if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "${FLINK_JOBMANAGER_CO
 fi
 
 echo ">> 部署 Lookup 视图到 ${MARKET_MYSQL_USER}@${MARKET_MYSQL_HOST}/${MARKET_MYSQL_DATABASE}"
+if [[ "$FORCE_INDEXES" -eq 1 || "$FORCE" -eq 1 ]] && [[ -f sql/ddl/market_lookup_indexes.sql ]]; then
+  echo ">> 部署 Lookup 索引/生成列（id_signed）"
+  mysql_market_cmd --init-command="SET SESSION lock_wait_timeout=${SOURCE_DDL_LOCK_WAIT_TIMEOUT:-120}" \
+    < sql/ddl/market_lookup_indexes.sql || echo "WARN: market_lookup_indexes.sql 未完整（可能无 ALTER 权限）"
+fi
 mysql_market_cmd --init-command="SET SESSION lock_wait_timeout=${SOURCE_DDL_LOCK_WAIT_TIMEOUT:-120}" < "$DDL"
 echo ">> 完成"
