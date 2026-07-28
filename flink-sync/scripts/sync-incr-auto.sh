@@ -14,7 +14,7 @@ CANCEL_JOBS=1
 SKIP_DDL=0
 JOBS_FILTER=""
 BULK_START_MS_ARG=""
-STARTUP_MODE="${CDC_STARTUP_MODE:-initial}"
+STARTUP_MODE="${CDC_STARTUP_MODE:-latest-offset}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -23,7 +23,7 @@ while [[ $# -gt 0 ]]; do
     --bulk-start-ms=*) BULK_START_MS_ARG="${1#--bulk-start-ms=}" ;;
     --bulk-start-ms) shift; BULK_START_MS_ARG="${1:-}" ;;
     --startup-mode=*) STARTUP_MODE="${1#--startup-mode=}" ;;
-    --startup-mode) shift; STARTUP_MODE="${1:-initial}" ;;
+    --startup-mode) shift; STARTUP_MODE="${1:-latest-offset}" ;;
     --skip-ddl) SKIP_DDL=1 ;;
     --keep-jobs) CANCEL_JOBS=0 ;;
     -h|--help) sed -n '2,12p' "$0"; exit 0 ;;

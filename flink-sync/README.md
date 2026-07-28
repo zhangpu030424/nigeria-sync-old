@@ -26,7 +26,7 @@ window_upsert.py          (秒级延迟)              run_reconcile_cron.sh
 ```
 
 - **首次上线**：目标库若尚无数据，先用上级目录 `ng_migration_all.sh` 跑全量，再启动 Flink 增量。
-- **已全量**：可直接 `./scripts/sync-incr-auto.sh`（`CDC_STARTUP_MODE=initial` 会先快照补漏再追 binlog）。
+- **已全量**：可直接 `./scripts/sync-incr-auto.sh`（默认 `CDC_STARTUP_MODE=latest-offset` 只追新变更；补漏用 `initial`/`timestamp`）。
 - **兜底**：保留 `run_reconcile_cron.sh` 滚动对账（建议缩到 7 天窗口）。
 
 ## 快速开始
