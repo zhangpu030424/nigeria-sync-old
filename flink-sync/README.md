@@ -14,6 +14,7 @@
 | 4 | user_product | application | `user_product_incr_lookup` |
 | 5 | application | market.application, core.application, user_data | `application_incr_bundle_lookup` |
 | 6 | loan | repay_plan, repay_record, market.application | `loan_incr_bundle_lookup` |
+| 7 | id_mapping | application, user_data, user | `id_mapping_incr_bundle_lookup` |
 
 ## 与批处理的关系
 
