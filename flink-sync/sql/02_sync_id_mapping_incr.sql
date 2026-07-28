@@ -19,7 +19,7 @@ SET 'table.exec.async-lookup.buffer-capacity' = '200';
 SET 'table.exec.async-lookup.timeout' = '60s';
 
 CREATE TABLE IF NOT EXISTS cdc_market_app (
-    id BIGINT,
+    id DECIMAL(20, 0),
     proc_time AS PROCTIME(),
     PRIMARY KEY (id) NOT ENFORCED
 ) WITH (
@@ -39,8 +39,8 @@ CREATE TABLE IF NOT EXISTS cdc_market_app (
 );
 
 CREATE TABLE IF NOT EXISTS cdc_user_data (
-    id BIGINT,
-    `userId` BIGINT,
+    id DECIMAL(20, 0),
+    `userId` DECIMAL(20, 0),
     proc_time AS PROCTIME(),
     PRIMARY KEY (id) NOT ENFORCED
 ) WITH (
@@ -60,7 +60,7 @@ CREATE TABLE IF NOT EXISTS cdc_user_data (
 );
 
 CREATE TABLE IF NOT EXISTS cdc_user (
-    id BIGINT,
+    id DECIMAL(20, 0),
     proc_time AS PROCTIME(),
     PRIMARY KEY (id) NOT ENFORCED
 ) WITH (
@@ -80,7 +80,7 @@ CREATE TABLE IF NOT EXISTS cdc_user (
 );
 
 CREATE TABLE IF NOT EXISTS dim_idmap_bundle (
-    app_row_id BIGINT,
+    app_row_id DECIMAL(20, 0),
     app_id BIGINT,
     mobile_norm STRING,
     mobile_token STRING,
@@ -106,8 +106,8 @@ CREATE TABLE IF NOT EXISTS dim_idmap_bundle (
 );
 
 CREATE TABLE IF NOT EXISTS dim_apps_by_user (
-    user_id BIGINT,
-    app_row_id BIGINT,
+    user_id DECIMAL(20, 0),
+    app_row_id DECIMAL(20, 0),
     PRIMARY KEY (user_id) NOT ENFORCED
 ) WITH (
     'connector' = 'jdbc',
