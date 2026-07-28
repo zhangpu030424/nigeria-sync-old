@@ -211,12 +211,11 @@ WHERE a.applicationNo IS NOT NULL AND TRIM(a.applicationNo) <> '';
 -- ---------- id_mapping 增量 bundle Lookup（Flink: WHERE app_row_id = ?）----------
 -- 口径对齐 ng_migration_run._build_id_mapping_rows：
 --   anchor=id 为 mobile token；按 type 展开 mobile/gaid_idfa/device_uuid/bank_account/id_number/id2
--- 优化：
---   1) app_row_id 用裸 a.id（勿 CAST），否则 JDBC Lookup 无法走 PRIMARY
---   2) 优先 vt_token_cache；miss 由 Flink vt_tokenize 兜底
+-- 类型：app_row_id / user_id 用 CAST(SIGNED)，与 Flink BIGINT 对齐（unsigned 裸列 → JDBC BigInteger → ClassCast）
+-- VT：优先 vt_token_cache；miss 由 Flink vt_tokenize 兜底
 -- 需有 core 建档（与 application 写入条件一致）
 CREATE OR REPLACE ALGORITHM=MERGE VIEW id_mapping_incr_bundle_lookup AS
-SELECT a.id                                                          AS app_row_id,
+SELECT CAST(a.id AS SIGNED)                                          AS app_row_id,
        CAST(a.`appId` AS SIGNED)                                     AS app_id,
        CASE
            WHEN a.mobile LIKE '+234%' THEN a.mobile
@@ -268,18 +267,19 @@ WHERE a.applicationNo IS NOT NULL AND TRIM(a.applicationNo) <> ''
   AND a.mobile IS NOT NULL AND TRIM(a.mobile) <> '';
 
 -- ---------- 辅助：applicationNo → app_row_id ----------
+-- CAST(SIGNED)：与 Flink BIGINT 对齐；application / id_mapping 共用
 CREATE OR REPLACE ALGORITHM=MERGE VIEW market_app_id_by_no_lookup AS
 SELECT applicationNo,
-       id AS app_row_id
+       CAST(id AS SIGNED) AS app_row_id
 FROM application
 WHERE applicationNo IS NOT NULL AND TRIM(applicationNo) <> '';
 
 -- ---------- 辅助：userId → 最新 app_row_id（user_data 变更触发）----------
 -- 只取该用户最新一笔，避免一用户上千笔 application 扇出打爆 LookupJoin
--- 点查键裸列：userId / id（勿 CAST）；Flink 侧 BIGINT 承接
+-- CAST(SIGNED)：与 Flink BIGINT 对齐（勿裸 unsigned，否则 ClassCast 拖垮 application）
 CREATE OR REPLACE ALGORITHM=MERGE VIEW market_app_ids_by_user_lookup AS
-SELECT a.`userId` AS user_id,
-       a.id AS app_row_id
+SELECT CAST(a.`userId` AS SIGNED) AS user_id,
+       CAST(a.id AS SIGNED) AS app_row_id
 FROM application a
 WHERE a.`userId` IS NOT NULL
   AND a.id = (
