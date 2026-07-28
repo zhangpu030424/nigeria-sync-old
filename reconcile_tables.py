@@ -547,29 +547,62 @@ def _probe_max_user_id(
 ) -> int:
     """查实际 MAX(user_id)，避免按 1 亿空段切分。"""
     cfg = _worker_load_env(str(env_path))
-    tgt = mig.connect_target(cfg)
+    exclude_sql = ""
+    params = [max_user_id]  # type: List[Any]
+    if table == "user" and exclude_app_ids:
+        ex_ph = ",".join(["%s"] * len(exclude_app_ids))
+        exclude_sql = "AND app_id NOT IN ({0})".format(ex_ph)
+        params.extend(exclude_app_ids)
+    sql = """
+        SELECT MAX(user_id) AS max_id
+        FROM `{table}`
+        WHERE user_id < %s
+          {exclude_sql}
+    """.format(table=table, exclude_sql=exclude_sql)
+    max_retries = max(3, int(cfg.get("mysql_batch_retries") or 6))
+    last_exc = None  # type: Optional[BaseException]
+    tgt = None
     try:
-        exclude_sql = ""
-        params = [max_user_id]  # type: List[Any]
-        if table == "user" and exclude_app_ids:
-            ex_ph = ",".join(["%s"] * len(exclude_app_ids))
-            exclude_sql = "AND app_id NOT IN ({0})".format(ex_ph)
-            params.extend(exclude_app_ids)
-        with tgt.cursor() as cur:
-            cur.execute(
-                """
-                SELECT MAX(user_id) AS max_id
-                FROM `{table}`
-                WHERE user_id < %s
-                  {exclude_sql}
-                """.format(table=table, exclude_sql=exclude_sql),
-                params,
-            )
-            row = cur.fetchone() or {}
-        actual = int(row.get("max_id") or 0)
-        return max(0, min(actual + 1, max_user_id))
+        for attempt in range(max_retries):
+            try:
+                if tgt is None:
+                    tgt = mig.connect_target(cfg)
+                else:
+                    try:
+                        tgt.ping(reconnect=True)
+                    except Exception:
+                        mig._close_mysql_conn(tgt)
+                        tgt = mig.connect_target(cfg)
+                with tgt.cursor() as cur:
+                    cur.execute(sql, params)
+                    row = cur.fetchone() or {}
+                actual = int(row.get("max_id") or 0)
+                return max(0, min(actual + 1, max_user_id))
+            except Exception as exc:
+                last_exc = exc
+                mig._close_mysql_conn(tgt)
+                tgt = None
+                if attempt < max_retries - 1 and (
+                    _is_mysql_lost_conn(exc) or mig._is_transient_insert_error(exc)
+                ):
+                    delay = min(30.0, 0.5 * (2 ** attempt)) + random.uniform(0, 0.2)
+                    print(
+                        "probe max user_id retry table={0} attempt={1}/{2} "
+                        "err={3} sleep={4:.1f}s".format(
+                            table, attempt + 1, max_retries,
+                            exc.args[0] if getattr(exc, "args", None) else type(exc).__name__,
+                            delay,
+                        ),
+                        flush=True,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise
+        if last_exc is not None:
+            raise last_exc
+        return 0
     finally:
-        tgt.close()
+        mig._close_mysql_conn(tgt)
 
 
 def _load_target_shard(spec: dict) -> Tuple[int, List[dict], Dict[str, int]]:
@@ -755,22 +788,55 @@ def product_key(row: dict) -> Tuple[int, str]:
 
 def _probe_max_group_user_id(env_path: Path, table: str, max_gid: int) -> int:
     cfg = _worker_load_env(str(env_path))
-    tgt = mig.connect_target(cfg)
+    sql = """
+        SELECT MAX(group_user_id) AS max_id
+        FROM `{0}`
+        WHERE group_user_id < %s
+    """.format(table)
+    max_retries = max(3, int(cfg.get("mysql_batch_retries") or 6))
+    last_exc = None  # type: Optional[BaseException]
+    tgt = None
     try:
-        with tgt.cursor() as cur:
-            cur.execute(
-                """
-                SELECT MAX(group_user_id) AS max_id
-                FROM `{0}`
-                WHERE group_user_id < %s
-                """.format(table),
-                (max_gid,),
-            )
-            row = cur.fetchone() or {}
-        actual = int(row.get("max_id") or 0)
-        return max(0, min(actual + 1, max_gid))
+        for attempt in range(max_retries):
+            try:
+                if tgt is None:
+                    tgt = mig.connect_target(cfg)
+                else:
+                    try:
+                        tgt.ping(reconnect=True)
+                    except Exception:
+                        mig._close_mysql_conn(tgt)
+                        tgt = mig.connect_target(cfg)
+                with tgt.cursor() as cur:
+                    cur.execute(sql, (max_gid,))
+                    row = cur.fetchone() or {}
+                actual = int(row.get("max_id") or 0)
+                return max(0, min(actual + 1, max_gid))
+            except Exception as exc:
+                last_exc = exc
+                mig._close_mysql_conn(tgt)
+                tgt = None
+                if attempt < max_retries - 1 and (
+                    _is_mysql_lost_conn(exc) or mig._is_transient_insert_error(exc)
+                ):
+                    delay = min(30.0, 0.5 * (2 ** attempt)) + random.uniform(0, 0.2)
+                    print(
+                        "probe max group_user_id retry table={0} attempt={1}/{2} "
+                        "err={3} sleep={4:.1f}s".format(
+                            table, attempt + 1, max_retries,
+                            exc.args[0] if getattr(exc, "args", None) else type(exc).__name__,
+                            delay,
+                        ),
+                        flush=True,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise
+        if last_exc is not None:
+            raise last_exc
+        return 0
     finally:
-        tgt.close()
+        mig._close_mysql_conn(tgt)
 
 
 def _load_target_group_user_shard(spec: dict) -> Tuple[int, List[dict], Dict[str, int]]:
