@@ -230,7 +230,7 @@ WHERE a.`userId` IS NOT NULL
   );
 
 -- ---------- 辅助：market app id → core sn ----------
--- 点查键用裸 id（走 application 主键）；Flink 侧 DECIMAL 承接 JDBC BigInteger
+-- 裸 id/sn 走主键与索引；Flink 侧 DECIMAL 承接 unsigned
 CREATE OR REPLACE ALGORITHM=MERGE VIEW market_app_core_sn_lookup AS
 SELECT ma.id AS id,
        ca.sn AS core_sn
@@ -239,8 +239,9 @@ FROM application ma
 WHERE ma.disburseTime > 0;
 
 -- ---------- loan 增量 bundle Lookup（Flink: WHERE sn = ?）----------
+-- sn 必须是裸列 rp.sn：CAST 成 CHAR/SIGNED 都会让 MERGE 下推后无法用 sn 索引（全表扫）
 CREATE OR REPLACE ALGORITHM=MERGE VIEW loan_incr_bundle_lookup AS
-SELECT CAST(rp.sn AS CHAR)                                                         AS sn,
+SELECT rp.sn                                                                       AS sn,
        CAST(rp.plan_sn AS SIGNED)                                                  AS plan_sn,
        CONCAT('ng', LPAD(CAST(ma.`appId` AS CHAR), 4, '0'), '-', ma.applicationNo) AS application_no,
        CONCAT('ng-', CAST(rp.sn AS CHAR), '-', LPAD(1, 2, '0'), LPAD(0, 3, '0')) AS loan_no,

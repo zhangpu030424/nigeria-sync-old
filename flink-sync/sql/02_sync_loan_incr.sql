@@ -1,5 +1,5 @@
 -- 增量 loan：core repay_plan / repay_record + market application CDC
--- unsigned bigint 经 JDBC Lookup 会变成 BigInteger；维表侧用 STRING + 视图 CAST CHAR 避免 ClassCast
+-- sn 维表用 DECIMAL + 视图裸列，保证 JDBC Lookup 走 repay_plan.sn 索引（勿 CAST CHAR）
 SET 'parallelism.default' = '${FLINK_PARALLELISM}';
 SET 'table.exec.mini-batch.enabled' = 'true';
 SET 'table.exec.mini-batch.allow-latency' = '200ms';
@@ -9,6 +9,8 @@ SET 'execution.checkpointing.timeout' = '${FLINK_CHECKPOINT_TIMEOUT}';
 SET 'execution.checkpointing.min-pause' = '120s';
 SET 'execution.checkpointing.tolerable-failed-checkpoints' = '10';
 SET 'execution.checkpointing.unaligned' = 'true';
+SET 'table.exec.async-lookup.buffer-capacity' = '200';
+SET 'table.exec.async-lookup.timeout' = '60s';
 
 CREATE TABLE IF NOT EXISTS cdc_repay_plan (
     sn DECIMAL(20, 0),
@@ -74,7 +76,7 @@ CREATE TABLE IF NOT EXISTS cdc_market_app_disburse (
 );
 
 CREATE TABLE IF NOT EXISTS dim_loan_bundle (
-    sn STRING,
+    sn DECIMAL(20, 0),
     application_no STRING,
     loan_no STRING,
     `period` BIGINT,
@@ -98,7 +100,7 @@ CREATE TABLE IF NOT EXISTS dim_loan_bundle (
     'table-name' = 'loan_incr_bundle_lookup',
     'username' = '${MARKET_MYSQL_USER}',
     'password' = '${MARKET_MYSQL_PASSWORD}',
-    'lookup.cache.max-rows' = '200000',
+    'lookup.cache.max-rows' = '500000',
     'lookup.cache.ttl' = '${LOOKUP_CACHE_TTL}'
 );
 
@@ -112,7 +114,7 @@ CREATE TABLE IF NOT EXISTS dim_core_sn_by_market_app (
     'table-name' = 'market_app_core_sn_lookup',
     'username' = '${MARKET_MYSQL_USER}',
     'password' = '${MARKET_MYSQL_PASSWORD}',
-    'lookup.cache.max-rows' = '200000',
+    'lookup.cache.max-rows' = '500000',
     'lookup.cache.ttl' = '${LOOKUP_CACHE_TTL}'
 );
 
@@ -149,12 +151,12 @@ CREATE TABLE IF NOT EXISTS sink_loan (
 );
 
 CREATE TEMPORARY VIEW v_loan_triggers AS
-SELECT CAST(sn AS STRING) AS sn, proc_time FROM cdc_repay_plan WHERE sn IS NOT NULL
+SELECT sn, proc_time FROM cdc_repay_plan WHERE sn IS NOT NULL
 UNION ALL
-SELECT CAST(sn AS STRING) AS sn, proc_time FROM cdc_repay_record WHERE sn IS NOT NULL
+SELECT sn, proc_time FROM cdc_repay_record WHERE sn IS NOT NULL
 UNION ALL
 -- 先过滤已放款再 Lookup，避免每条 application CDC 都打 JDBC
-SELECT CAST(m.core_sn AS STRING) AS sn, a.proc_time
+SELECT m.core_sn AS sn, a.proc_time
 FROM (
     SELECT id, proc_time
     FROM cdc_market_app_disburse
@@ -173,15 +175,15 @@ SELECT
     DATE_FORMAT(FROM_UNIXTIME(CASE WHEN l.start_date > 10000000000 THEN l.start_date / 1000 ELSE l.start_date END), 'yyyy-MM-dd') AS start_date,
     DATE_FORMAT(FROM_UNIXTIME(CASE WHEN l.due_date > 10000000000 THEN l.due_date / 1000 ELSE l.due_date END), 'yyyy-MM-dd') AS due_date,
     DATE_FORMAT(FROM_UNIXTIME(CASE WHEN l.due_date > 10000000000 THEN l.due_date / 1000 ELSE l.due_date END), 'yyyy-MM-dd') AS due_date_final,
-    COALESCE(l.prin_amt, 0) AS principal,
-    COALESCE(l.interest, 0) AS interest,
-    COALESCE(l.orig_fee, 0) AS admin_fee,
+    GREATEST(COALESCE(l.prin_amt, 0), 0) AS principal,
+    GREATEST(COALESCE(l.interest, 0), 0) AS interest,
+    GREATEST(COALESCE(l.orig_fee, 0), 0) AS admin_fee,
     0 AS service_fee,
     0 AS tax_fee,
-    COALESCE(l.penalty, 0) AS penalty_amount,
+    GREATEST(COALESCE(l.penalty, 0), 0) AS penalty_amount,
     0 AS reduction_amount,
-    COALESCE(l.amt, 0) AS total_amount,
-    CASE WHEN l.rp_status IN (2, 4) THEN COALESCE(l.repaid_amt, 0) ELSE 0 END AS paid_amount,
+    GREATEST(COALESCE(l.amt, 0), 0) AS total_amount,
+    CASE WHEN l.rp_status IN (2, 4) THEN GREATEST(COALESCE(l.repaid_amt, 0), 0) ELSE 0 END AS paid_amount,
     CASE WHEN COALESCE(l.repay_last_time, 0) > 0 THEN l.repay_last_time * 1000 ELSE CAST(NULL AS BIGINT) END AS paid_time,
     CASE WHEN COALESCE(l.settle_time, 0) > 0
         THEN DATE_FORMAT(FROM_UNIXTIME(CASE WHEN l.settle_time > 10000000000 THEN l.settle_time / 1000 ELSE l.settle_time END), 'yyyy-MM-dd')
