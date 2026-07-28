@@ -211,12 +211,9 @@ WHERE a.applicationNo IS NOT NULL AND TRIM(a.applicationNo) <> '';
 -- ---------- id_mapping 增量 bundle Lookup（Flink: WHERE app_row_id = ?）----------
 -- 口径对齐 ng_migration_run._build_id_mapping_rows：
 --   anchor=id 为 mobile token；按 type 展开 mobile/gaid_idfa/device_uuid/bank_account/id_number/id2
--- 优化：
---   1) app_row_id 用裸 a.id（勿 CAST），否则 JDBC Lookup 无法走 PRIMARY
---   2) 优先 vt_token_cache（点查路径 + uk_type_raw）；miss 由 Flink vt_tokenize 兜底
 -- 需有 core 建档（与 application 写入条件一致）
 CREATE OR REPLACE ALGORITHM=MERGE VIEW id_mapping_incr_bundle_lookup AS
-SELECT a.id                                                          AS app_row_id,
+SELECT CAST(a.id AS SIGNED)                                          AS app_row_id,
        CAST(a.`appId` AS SIGNED)                                     AS app_id,
        CASE
            WHEN a.mobile LIKE '+234%' THEN a.mobile
@@ -224,16 +221,16 @@ SELECT a.id                                                          AS app_row_
            WHEN a.mobile LIKE '0%' THEN CONCAT('+234', SUBSTRING(a.mobile, 2))
            ELSE CONCAT('+234', a.mobile)
            END                                                       AS mobile_norm,
-       CAST(vt_m.token AS CHAR)                                      AS mobile_token,
+       CAST(NULL AS CHAR)                                            AS mobile_token,
        CAST(IFNULL(NULLIF(a.gaid, ''), NULL) AS CHAR)                AS gaid_raw,
-       CAST(vt_g.token AS CHAR)                                      AS gaid_token,
+       CAST(NULL AS CHAR)                                            AS gaid_token,
        CAST(IFNULL(CAST(a.`deviceDataId` AS CHAR), '') AS CHAR)      AS device_uuid,
        CAST(IFNULL(a.bankAccount, '') AS CHAR)                       AS bank_account_raw,
-       CAST(vt_ba.token AS CHAR)                                     AS bank_account_token,
+       CAST(NULL AS CHAR)                                            AS bank_account_token,
        CAST(ud.bvn AS CHAR)                                          AS bvn_raw,
-       CAST(vt_id.token AS CHAR)                                     AS id_number_token,
+       CAST(NULL AS CHAR)                                            AS id_number_token,
        CAST(IFNULL(u.credentialNo, '') AS CHAR)                      AS id2_raw,
-       CAST(vt_id2.token AS CHAR)                                    AS id2_token,
+       CAST(NULL AS CHAR)                                            AS id2_token,
        CAST(UNIX_TIMESTAMP(a.created) AS SIGNED) * 1000              AS event_time
 FROM application a
          STRAIGHT_JOIN ng_loan_core.application ca ON ca.ext_sn = a.applicationNo
@@ -244,42 +241,22 @@ FROM application a
                        WHERE ud2.`userId` = a.`userId`
                        ORDER BY ud2.id DESC LIMIT 1
                    )
-         LEFT JOIN vt_token_cache vt_m
-                   ON vt_m.vt_type = 1 AND vt_m.status = 1
-                       AND vt_m.raw_value COLLATE utf8mb4_bin = (CASE
-                           WHEN a.mobile LIKE '+234%' THEN a.mobile
-                           WHEN a.mobile LIKE '234%' THEN CONCAT('+', a.mobile)
-                           WHEN a.mobile LIKE '0%' THEN CONCAT('+234', SUBSTRING(a.mobile, 2))
-                           ELSE CONCAT('+234', a.mobile)
-                       END) COLLATE utf8mb4_bin
-         LEFT JOIN vt_token_cache vt_g
-                   ON vt_g.vt_type = 2 AND vt_g.status = 1
-                       AND vt_g.raw_value COLLATE utf8mb4_bin = NULLIF(TRIM(a.gaid), '') COLLATE utf8mb4_bin
-         LEFT JOIN vt_token_cache vt_ba
-                   ON vt_ba.vt_type = 3 AND vt_ba.status = 1
-                       AND vt_ba.raw_value COLLATE utf8mb4_bin = NULLIF(TRIM(a.bankAccount), '') COLLATE utf8mb4_bin
-         LEFT JOIN vt_token_cache vt_id
-                   ON vt_id.vt_type = 4 AND vt_id.status = 1
-                       AND vt_id.raw_value COLLATE utf8mb4_bin = NULLIF(TRIM(ud.bvn), '') COLLATE utf8mb4_bin
-         LEFT JOIN vt_token_cache vt_id2
-                   ON vt_id2.vt_type = 4 AND vt_id2.status = 1
-                       AND vt_id2.raw_value COLLATE utf8mb4_bin = NULLIF(TRIM(u.credentialNo), '') COLLATE utf8mb4_bin
 WHERE a.applicationNo IS NOT NULL AND TRIM(a.applicationNo) <> ''
   AND a.mobile IS NOT NULL AND TRIM(a.mobile) <> '';
 
 -- ---------- 辅助：applicationNo → app_row_id ----------
 CREATE OR REPLACE ALGORITHM=MERGE VIEW market_app_id_by_no_lookup AS
 SELECT applicationNo,
-       id AS app_row_id
+       CAST(id AS SIGNED) AS app_row_id
 FROM application
 WHERE applicationNo IS NOT NULL AND TRIM(applicationNo) <> '';
 
 -- ---------- 辅助：userId → 最新 app_row_id（user_data 变更触发）----------
 -- 只取该用户最新一笔，避免一用户上千笔 application 扇出打爆 LookupJoin
--- 点查键裸列：userId / id（勿 CAST）；Flink 侧 DECIMAL(20,0) 承接 unsigned
+-- CAST SIGNED：JDBC 对 unsigned 返回 Long/BigInteger，Flink DECIMAL 会 ClassCast
 CREATE OR REPLACE ALGORITHM=MERGE VIEW market_app_ids_by_user_lookup AS
-SELECT a.`userId` AS user_id,
-       a.id AS app_row_id
+SELECT CAST(a.`userId` AS SIGNED) AS user_id,
+       CAST(a.id AS SIGNED) AS app_row_id
 FROM application a
 WHERE a.`userId` IS NOT NULL
   AND a.id = (
