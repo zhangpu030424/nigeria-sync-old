@@ -1,5 +1,5 @@
 -- 增量 application：market + core CDC 触发 + bundle Lookup
--- Lookup 键用 DECIMAL(20,0) + 视图裸列，保证 JDBC 点查走 PRIMARY（勿 CAST SIGNED）
+-- Lookup 键用 BIGINT + 视图裸列：JDBC 对常见 unsigned 值返回 Long；DECIMAL 会 Long→BigDecimal ClassCast
 CREATE TEMPORARY FUNCTION vt_tokenize AS 'com.nigeria.flink.udf.VtTokenizeFunction';
 
 SET 'parallelism.default' = '${FLINK_PARALLELISM}';
@@ -16,7 +16,7 @@ SET 'table.exec.async-lookup.buffer-capacity' = '200';
 SET 'table.exec.async-lookup.timeout' = '60s';
 
 CREATE TABLE IF NOT EXISTS cdc_market_app (
-    id DECIMAL(20, 0),
+    id BIGINT,
     proc_time AS PROCTIME(),
     PRIMARY KEY (id) NOT ENFORCED
 ) WITH (
@@ -57,8 +57,8 @@ CREATE TABLE IF NOT EXISTS cdc_core_app (
 );
 
 CREATE TABLE IF NOT EXISTS cdc_user_data (
-    id DECIMAL(20, 0),
-    `userId` DECIMAL(20, 0),
+    id BIGINT,
+    `userId` BIGINT,
     proc_time AS PROCTIME(),
     PRIMARY KEY (id) NOT ENFORCED
 ) WITH (
@@ -78,7 +78,7 @@ CREATE TABLE IF NOT EXISTS cdc_user_data (
 );
 
 CREATE TABLE IF NOT EXISTS dim_app_bundle (
-    app_row_id DECIMAL(20, 0),
+    app_row_id BIGINT,
     market_no STRING,
     application_no STRING,
     mobile_norm STRING,
@@ -125,7 +125,7 @@ CREATE TABLE IF NOT EXISTS dim_app_bundle (
 
 CREATE TABLE IF NOT EXISTS dim_market_app_by_no (
     applicationNo STRING,
-    app_row_id DECIMAL(20, 0),
+    app_row_id BIGINT,
     PRIMARY KEY (applicationNo) NOT ENFORCED
 ) WITH (
     'connector' = 'jdbc',
@@ -138,8 +138,8 @@ CREATE TABLE IF NOT EXISTS dim_market_app_by_no (
 );
 
 CREATE TABLE IF NOT EXISTS dim_apps_by_user (
-    user_id DECIMAL(20, 0),
-    app_row_id DECIMAL(20, 0),
+    user_id BIGINT,
+    app_row_id BIGINT,
     PRIMARY KEY (user_id) NOT ENFORCED
 ) WITH (
     'connector' = 'jdbc',

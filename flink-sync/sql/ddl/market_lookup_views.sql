@@ -158,7 +158,7 @@ WHERE a.`productId` IS NOT NULL AND a.`productId` <> 0
 -- 关键：必须 ALGORITHM=MERGE + 以 a 为驱动，否则 MySQL 会全扫 core.application（800万+）
 -- 勿 JOIN vt_token_cache；token 由 Flink vt_tokenize 兜底
 CREATE OR REPLACE ALGORITHM=MERGE VIEW application_incr_bundle_lookup AS
--- app_row_id 裸 a.id：保证 JDBC Lookup 走 PRIMARY；Flink 侧 DECIMAL(20,0) 接 unsigned
+-- app_row_id 裸 a.id：保证 JDBC Lookup 走 PRIMARY；Flink 侧 BIGINT（JDBC 返回 Long）
 SELECT a.id                                                          AS app_row_id,
        CAST(a.applicationNo AS CHAR)                                 AS market_no,
        CONCAT('ng', LPAD(CAST(a.`appId` AS CHAR), 4, '0'), '-', a.applicationNo) AS application_no,
@@ -212,7 +212,7 @@ WHERE a.applicationNo IS NOT NULL AND TRIM(a.applicationNo) <> '';
 -- ---------- id_mapping 增量 bundle Lookup（Flink: WHERE app_row_id = ?）----------
 -- 口径对齐 ng_migration_run._build_id_mapping_rows：
 --   anchor=id 为 mobile token；按 type 展开 mobile/gaid_idfa/device_uuid/bank_account/id_number/id2
--- 优化：app_row_id 裸 a.id（勿 CAST）；Flink 侧 DECIMAL(20,0) 接 unsigned
+-- 优化：app_row_id 裸 a.id（勿 CAST）；Flink 侧 BIGINT（JDBC 返回 Long）
 -- VT：优先 vt_token_cache；miss 由 Flink vt_tokenize 兜底
 -- 需有 core 建档（与 application 写入条件一致）
 CREATE OR REPLACE ALGORITHM=MERGE VIEW id_mapping_incr_bundle_lookup AS
@@ -268,7 +268,7 @@ WHERE a.applicationNo IS NOT NULL AND TRIM(a.applicationNo) <> ''
   AND a.mobile IS NOT NULL AND TRIM(a.mobile) <> '';
 
 -- ---------- 辅助：applicationNo → app_row_id ----------
--- 裸 id；Flink 侧 DECIMAL(20,0) 承接 unsigned（application / id_mapping 共用）
+-- 裸 id；Flink 侧 BIGINT；application / id_mapping 共用
 CREATE OR REPLACE ALGORITHM=MERGE VIEW market_app_id_by_no_lookup AS
 SELECT applicationNo,
        id AS app_row_id
@@ -277,7 +277,7 @@ WHERE applicationNo IS NOT NULL AND TRIM(applicationNo) <> '';
 
 -- ---------- 辅助：userId → 最新 app_row_id（user_data 变更触发）----------
 -- 只取该用户最新一笔，避免一用户上千笔 application 扇出打爆 LookupJoin
--- 点查键裸列 userId/id；Flink 侧 DECIMAL(20,0)
+-- 点查键裸列 userId/id；Flink 侧 BIGINT
 CREATE OR REPLACE ALGORITHM=MERGE VIEW market_app_ids_by_user_lookup AS
 SELECT a.`userId` AS user_id,
        a.id AS app_row_id

@@ -2,6 +2,7 @@
 -- 口径对齐 ng_migration_run._build_id_mapping_rows：
 --   id(锚点)=mobile token；单向展开 type=
 --     mobile / gaid_idfa / device_uuid / bank_account / id_number / id2
+-- Lookup 键 BIGINT + 视图裸列（勿 DECIMAL：JDBC Long 无法转 BigDecimal）
 -- 前置: ./scripts/deploy-source-ddl.sh（含 id_mapping_incr_bundle_lookup）
 CREATE TEMPORARY FUNCTION vt_tokenize AS 'com.nigeria.flink.udf.VtTokenizeFunction';
 
@@ -19,7 +20,7 @@ SET 'table.exec.async-lookup.buffer-capacity' = '200';
 SET 'table.exec.async-lookup.timeout' = '60s';
 
 CREATE TABLE IF NOT EXISTS cdc_market_app (
-    id DECIMAL(20, 0),
+    id BIGINT,
     proc_time AS PROCTIME(),
     PRIMARY KEY (id) NOT ENFORCED
 ) WITH (
@@ -39,8 +40,8 @@ CREATE TABLE IF NOT EXISTS cdc_market_app (
 );
 
 CREATE TABLE IF NOT EXISTS cdc_user_data (
-    id DECIMAL(20, 0),
-    `userId` DECIMAL(20, 0),
+    id BIGINT,
+    `userId` BIGINT,
     proc_time AS PROCTIME(),
     PRIMARY KEY (id) NOT ENFORCED
 ) WITH (
@@ -60,7 +61,7 @@ CREATE TABLE IF NOT EXISTS cdc_user_data (
 );
 
 CREATE TABLE IF NOT EXISTS cdc_user (
-    id DECIMAL(20, 0),
+    id BIGINT,
     proc_time AS PROCTIME(),
     PRIMARY KEY (id) NOT ENFORCED
 ) WITH (
@@ -80,7 +81,7 @@ CREATE TABLE IF NOT EXISTS cdc_user (
 );
 
 CREATE TABLE IF NOT EXISTS dim_idmap_bundle (
-    app_row_id DECIMAL(20, 0),
+    app_row_id BIGINT,
     app_id BIGINT,
     mobile_norm STRING,
     mobile_token STRING,
@@ -106,8 +107,8 @@ CREATE TABLE IF NOT EXISTS dim_idmap_bundle (
 );
 
 CREATE TABLE IF NOT EXISTS dim_apps_by_user (
-    user_id DECIMAL(20, 0),
-    app_row_id DECIMAL(20, 0),
+    user_id BIGINT,
+    app_row_id BIGINT,
     PRIMARY KEY (user_id) NOT ENFORCED
 ) WITH (
     'connector' = 'jdbc',
