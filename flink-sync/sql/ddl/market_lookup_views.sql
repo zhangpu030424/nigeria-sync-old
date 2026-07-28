@@ -158,7 +158,7 @@ WHERE a.`productId` IS NOT NULL AND a.`productId` <> 0
 -- 关键：必须 ALGORITHM=MERGE + 以 a 为驱动，否则 MySQL 会全扫 core.application（800万+）
 -- 勿 JOIN vt_token_cache；token 由 Flink vt_tokenize 兜底
 CREATE OR REPLACE ALGORITHM=MERGE VIEW application_incr_bundle_lookup AS
-SELECT a.id                                                          AS app_row_id,
+SELECT CAST(a.id AS SIGNED)                                          AS app_row_id,
        CAST(a.applicationNo AS CHAR)                                 AS market_no,
        CONCAT('ng', LPAD(CAST(a.`appId` AS CHAR), 4, '0'), '-', a.applicationNo) AS application_no,
        CASE
@@ -211,7 +211,7 @@ WHERE a.applicationNo IS NOT NULL AND TRIM(a.applicationNo) <> '';
 -- ---------- 辅助：applicationNo → app_row_id ----------
 CREATE OR REPLACE ALGORITHM=MERGE VIEW market_app_id_by_no_lookup AS
 SELECT applicationNo,
-       id AS app_row_id
+       CAST(id AS SIGNED) AS app_row_id
 FROM application
 WHERE applicationNo IS NOT NULL AND TRIM(applicationNo) <> '';
 

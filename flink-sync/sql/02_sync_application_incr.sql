@@ -77,7 +77,7 @@ CREATE TABLE IF NOT EXISTS cdc_user_data (
 );
 
 CREATE TABLE IF NOT EXISTS dim_app_bundle (
-    app_row_id DECIMAL(20, 0),
+    app_row_id BIGINT,
     market_no STRING,
     application_no STRING,
     mobile_norm STRING,
@@ -124,7 +124,7 @@ CREATE TABLE IF NOT EXISTS dim_app_bundle (
 
 CREATE TABLE IF NOT EXISTS dim_market_app_by_no (
     applicationNo STRING,
-    app_row_id DECIMAL(20, 0),
+    app_row_id BIGINT,
     PRIMARY KEY (applicationNo) NOT ENFORCED
 ) WITH (
     'connector' = 'jdbc',
@@ -205,7 +205,7 @@ CREATE TABLE IF NOT EXISTS sink_application (
 );
 
 CREATE TEMPORARY VIEW v_app_triggers AS
-SELECT CAST(id AS DECIMAL(20, 0)) AS app_row_id, proc_time FROM cdc_market_app WHERE id IS NOT NULL
+SELECT id AS app_row_id, proc_time FROM cdc_market_app WHERE id IS NOT NULL
 UNION ALL
 SELECT m.app_row_id, c.proc_time
 FROM cdc_core_app AS c
@@ -213,7 +213,7 @@ INNER JOIN dim_market_app_by_no FOR SYSTEM_TIME AS OF c.proc_time AS m
     ON m.applicationNo = c.ext_sn
 WHERE c.ext_sn IS NOT NULL AND TRIM(c.ext_sn) <> ''
 UNION ALL
-SELECT CAST(a.app_row_id AS DECIMAL(20, 0)) AS app_row_id, ud.proc_time
+SELECT a.app_row_id, ud.proc_time
 FROM cdc_user_data AS ud
 INNER JOIN dim_apps_by_user FOR SYSTEM_TIME AS OF ud.proc_time AS a
     ON a.user_id = ud.`userId`
@@ -265,18 +265,19 @@ SELECT
     1 AS periods,
     1 AS repayment_method,
     CONCAT(
-        '{"roll_sequence":0,"period":1,"principal":', CAST(COALESCE(b.disburse_amount, 0) AS STRING),
-        ',"disbursed_amount":', CAST(COALESCE(b.disburse_amount, 0) AS STRING),
-        ',"interest":0,"admin_fee":', CAST(COALESCE(b.core_orig_fee, 0) AS STRING),
-        ',"service_fee":0,"tax_fee":0,"reduction_amount":0,"total_amount":', CAST(COALESCE(b.repayment, 0) AS STRING),
+        '{"roll_sequence":0,"period":1,"principal":', CAST(GREATEST(COALESCE(b.disburse_amount, 0), 0) AS STRING),
+        ',"disbursed_amount":', CAST(GREATEST(COALESCE(b.disburse_amount, 0), 0) AS STRING),
+        ',"interest":0,"admin_fee":', CAST(GREATEST(COALESCE(b.core_orig_fee, 0), 0) AS STRING),
+        ',"service_fee":0,"tax_fee":0,"reduction_amount":0,"total_amount":', CAST(GREATEST(COALESCE(b.repayment, 0), 0) AS STRING),
         ',"term":', CAST(COALESCE(b.term, 0) AS STRING),
         ',"roll_allowed":0}'
     ) AS repayment_plan,
-    COALESCE(b.amount, 0) AS credit_limit,
-    COALESCE(b.amount, 0) AS loan_amount,
-    COALESCE(b.disburse_amount, 0) AS principal,
-    COALESCE(b.repayment, 0) AS total_amount,
-    COALESCE(b.disburse_amount, 0) AS disbursed_amount,
+    -- 目标库 amount 列为 bigint unsigned；源库 repayment 存在负数，直接写入会 Data truncation 并拖垮整 job
+    GREATEST(COALESCE(b.amount, 0), 0) AS credit_limit,
+    GREATEST(COALESCE(b.amount, 0), 0) AS loan_amount,
+    GREATEST(COALESCE(b.disburse_amount, 0), 0) AS principal,
+    GREATEST(COALESCE(b.repayment, 0), 0) AS total_amount,
+    GREATEST(COALESCE(b.disburse_amount, 0), 0) AS disbursed_amount,
     COALESCE(b.apply_date, 0) * 1000 AS created_time,
     COALESCE(b.core_apply_time, 0) * 1000 AS submited_time,
     COALESCE(b.core_audit_time, 0) * 1000 AS reviewed_time,
