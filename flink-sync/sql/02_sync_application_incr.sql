@@ -1,5 +1,5 @@
 -- 增量 application：market + core CDC 触发 + bundle Lookup
--- Lookup 键用 BIGINT + 视图裸列：JDBC 对常见 unsigned 值返回 Long；DECIMAL 会 Long→BigDecimal ClassCast
+-- Lookup 键暂 CAST(SIGNED)+BIGINT（裸 unsigned 会 ClassCast）；latest-offset 下可接受
 CREATE TEMPORARY FUNCTION vt_tokenize AS 'com.nigeria.flink.udf.VtTokenizeFunction';
 
 SET 'parallelism.default' = '${FLINK_PARALLELISM}';
@@ -232,8 +232,8 @@ SELECT
     b.bid,
     b.app_id,
     b.app_version,
-    CAST(b.user_id AS BIGINT) AS user_id,
-    CAST(b.user_id AS BIGINT) AS group_user_id,
+    b.user_id,
+    b.user_id AS group_user_id,
     b.sn,
     0 AS is_test,
     CAST(b.is_first_apply AS INT) AS is_first_apply,
