@@ -156,10 +156,11 @@ WHERE a.`productId` IS NOT NULL AND a.`productId` <> 0
 
 -- ---------- application 增量 bundle Lookup（Flink: WHERE app_row_id = ?）----------
 -- 关键：必须 ALGORITHM=MERGE + 以 a 为驱动，否则 MySQL 会全扫 core.application（800万+）
+-- 关键：app_row_id 必须是裸 a.id（勿 CAST）；CAST 后 WHERE app_row_id=? 无法走主键 → 全表扫 1400万+ / 数秒每次
+-- Flink 侧用 DECIMAL(20,0) 承接 unsigned，避免 ClassCast
 -- 勿 JOIN vt_token_cache；token 由 Flink vt_tokenize 兜底
 CREATE OR REPLACE ALGORITHM=MERGE VIEW application_incr_bundle_lookup AS
--- 暂用 CAST(SIGNED)：裸 unsigned 与 Flink BIGINT/DECIMAL 均易 ClassCast；点查会慢，待专项优化
-SELECT CAST(a.id AS SIGNED)                                          AS app_row_id,
+SELECT a.id                                                          AS app_row_id,
        CAST(a.applicationNo AS CHAR)                                 AS market_no,
        CONCAT('ng', LPAD(CAST(a.`appId` AS CHAR), 4, '0'), '-', a.applicationNo) AS application_no,
        CASE
@@ -268,19 +269,20 @@ WHERE a.applicationNo IS NOT NULL AND TRIM(a.applicationNo) <> ''
   AND a.mobile IS NOT NULL AND TRIM(a.mobile) <> '';
 
 -- ---------- 辅助：applicationNo → app_row_id ----------
--- 裸 id；Flink 侧 BIGINT；application / id_mapping 共用
+-- 裸 id；Flink 侧 DECIMAL(20,0)；application / id_mapping 共用
 CREATE OR REPLACE ALGORITHM=MERGE VIEW market_app_id_by_no_lookup AS
 SELECT applicationNo,
-       CAST(id AS SIGNED) AS app_row_id
+       id AS app_row_id
 FROM application
 WHERE applicationNo IS NOT NULL AND TRIM(applicationNo) <> '';
 
 -- ---------- 辅助：userId → 最新 app_row_id（user_data 变更触发）----------
 -- 只取该用户最新一笔，避免一用户上千笔 application 扇出打爆 LookupJoin
--- 暂用 CAST(SIGNED) 对齐 Flink BIGINT，避免裸 unsigned ClassCast
+-- 裸 userId/id：CAST 会导致 WHERE user_id=? 无法用 userId 索引 → 扫全表索引
+-- Flink 侧 DECIMAL(20,0)
 CREATE OR REPLACE ALGORITHM=MERGE VIEW market_app_ids_by_user_lookup AS
-SELECT CAST(a.`userId` AS SIGNED) AS user_id,
-       CAST(a.id AS SIGNED) AS app_row_id
+SELECT a.`userId` AS user_id,
+       a.id AS app_row_id
 FROM application a
 WHERE a.`userId` IS NOT NULL
   AND a.id = (
