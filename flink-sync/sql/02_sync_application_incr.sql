@@ -1,6 +1,8 @@
 -- 增量 application：market + core CDC 触发 + bundle Lookup
--- Lookup 键：视图侧裸 unsigned id/userId；Flink 侧 DECIMAL(20,0)（勿 BIGINT+视图 CAST，否则点查全表扫）
-CREATE TEMPORARY FUNCTION vt_tokenize AS 'com.nigeria.flink.udf.VtTokenizeFunction';
+-- Lookup 键：裸 applicationNo（唯一索引），避免 UNSIGNED id 的 BigInteger ClassCast / CAST 全表扫
+-- 视图：application_incr_bundle_by_no_lookup / market_app_no_by_user_lookup（不改源表结构）
+-- VT：一行 4 字段合并一次 /v2t（vt_tokenize_app）+ 进程内 LRU
+CREATE TEMPORARY FUNCTION vt_tokenize_app AS 'com.nigeria.flink.udf.VtTokenizeAppFieldsFunction';
 
 SET 'parallelism.default' = '${FLINK_PARALLELISM}';
 SET 'table.exec.mini-batch.enabled' = 'true';
@@ -16,7 +18,10 @@ SET 'table.exec.async-lookup.buffer-capacity' = '200';
 SET 'table.exec.async-lookup.timeout' = '60s';
 
 CREATE TABLE IF NOT EXISTS cdc_market_app (
-    id DECIMAL(20, 0),
+    id BIGINT,
+    applicationNo STRING,
+    -- status 走 CDC，避免 Lookup 缓存把中间态写成最终态（1→5→6 / 7→13 秒级连跳）
+    status INT,
     proc_time AS PROCTIME(),
     PRIMARY KEY (id) NOT ENFORCED
 ) WITH (
@@ -32,7 +37,8 @@ CREATE TABLE IF NOT EXISTS cdc_market_app (
     'scan.startup.mode' = '${CDC_STARTUP_MODE}',
     'scan.startup.timestamp-millis' = '${CDC_STARTUP_TIMESTAMP_MILLIS}',
     'scan.incremental.snapshot.enabled' = 'true',
-    'debezium.snapshot.mode' = 'schema_only'
+    'debezium.snapshot.mode' = 'schema_only',
+    'debezium.bigint.unsigned.handling.mode' = 'long'
 );
 
 CREATE TABLE IF NOT EXISTS cdc_core_app (
@@ -53,12 +59,13 @@ CREATE TABLE IF NOT EXISTS cdc_core_app (
     'scan.startup.mode' = '${CDC_STARTUP_MODE}',
     'scan.startup.timestamp-millis' = '${CDC_STARTUP_TIMESTAMP_MILLIS}',
     'scan.incremental.snapshot.enabled' = 'true',
-    'debezium.snapshot.mode' = 'schema_only'
+    'debezium.snapshot.mode' = 'schema_only',
+    'debezium.bigint.unsigned.handling.mode' = 'long'
 );
 
 CREATE TABLE IF NOT EXISTS cdc_user_data (
-    id DECIMAL(20, 0),
-    `userId` DECIMAL(20, 0),
+    id BIGINT,
+    `userId` BIGINT,
     proc_time AS PROCTIME(),
     PRIMARY KEY (id) NOT ENFORCED
 ) WITH (
@@ -78,7 +85,8 @@ CREATE TABLE IF NOT EXISTS cdc_user_data (
 );
 
 CREATE TABLE IF NOT EXISTS dim_app_bundle (
-    app_row_id DECIMAL(20, 0),
+    market_application_no STRING,
+    app_row_id BIGINT,
     market_no STRING,
     application_no STRING,
     mobile_norm STRING,
@@ -112,39 +120,25 @@ CREATE TABLE IF NOT EXISTS dim_app_bundle (
     id_number_token STRING,
     bvn_raw STRING,
     last_repay_time BIGINT,
-    PRIMARY KEY (app_row_id) NOT ENFORCED
+    PRIMARY KEY (market_application_no) NOT ENFORCED
 ) WITH (
     'connector' = 'jdbc',
     'url' = 'jdbc:mysql://${MARKET_MYSQL_HOST}:${MARKET_MYSQL_PORT}/${MARKET_MYSQL_DATABASE}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Africa/Lagos&tinyInt1isBit=false',
-    'table-name' = 'application_incr_bundle_lookup',
+    'table-name' = 'application_incr_bundle_by_no_lookup',
     'username' = '${MARKET_MYSQL_USER}',
     'password' = '${MARKET_MYSQL_PASSWORD}',
     'lookup.cache.max-rows' = '500000',
     'lookup.cache.ttl' = '${LOOKUP_CACHE_TTL}'
 );
 
-CREATE TABLE IF NOT EXISTS dim_market_app_by_no (
-    applicationNo STRING,
-    app_row_id DECIMAL(20, 0),
-    PRIMARY KEY (applicationNo) NOT ENFORCED
-) WITH (
-    'connector' = 'jdbc',
-    'url' = 'jdbc:mysql://${MARKET_MYSQL_HOST}:${MARKET_MYSQL_PORT}/${MARKET_MYSQL_DATABASE}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Africa/Lagos&tinyInt1isBit=false',
-    'table-name' = 'market_app_id_by_no_lookup',
-    'username' = '${MARKET_MYSQL_USER}',
-    'password' = '${MARKET_MYSQL_PASSWORD}',
-    'lookup.cache.max-rows' = '500000',
-    'lookup.cache.ttl' = '${LOOKUP_CACHE_TTL}'
-);
-
-CREATE TABLE IF NOT EXISTS dim_apps_by_user (
-    user_id DECIMAL(20, 0),
-    app_row_id DECIMAL(20, 0),
+CREATE TABLE IF NOT EXISTS dim_app_no_by_user (
+    user_id BIGINT,
+    market_application_no STRING,
     PRIMARY KEY (user_id) NOT ENFORCED
 ) WITH (
     'connector' = 'jdbc',
     'url' = 'jdbc:mysql://${MARKET_MYSQL_HOST}:${MARKET_MYSQL_PORT}/${MARKET_MYSQL_DATABASE}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Africa/Lagos&tinyInt1isBit=false',
-    'table-name' = 'market_app_ids_by_user_lookup',
+    'table-name' = 'market_app_no_by_user_lookup',
     'username' = '${MARKET_MYSQL_USER}',
     'password' = '${MARKET_MYSQL_PASSWORD}',
     'lookup.cache.max-rows' = '500000',
@@ -206,96 +200,93 @@ CREATE TABLE IF NOT EXISTS sink_application (
 );
 
 CREATE TEMPORARY VIEW v_app_triggers AS
-SELECT id AS app_row_id, proc_time FROM cdc_market_app WHERE id IS NOT NULL
+SELECT applicationNo AS market_application_no, status AS cdc_status, proc_time
+FROM cdc_market_app
+WHERE applicationNo IS NOT NULL AND TRIM(applicationNo) <> ''
 UNION ALL
-SELECT m.app_row_id, c.proc_time
-FROM cdc_core_app AS c
-INNER JOIN dim_market_app_by_no FOR SYSTEM_TIME AS OF c.proc_time AS m
-    ON m.applicationNo = c.ext_sn
-WHERE c.ext_sn IS NOT NULL AND TRIM(c.ext_sn) <> ''
+SELECT ext_sn AS market_application_no, CAST(NULL AS INT) AS cdc_status, proc_time
+FROM cdc_core_app
+WHERE ext_sn IS NOT NULL AND TRIM(ext_sn) <> ''
 UNION ALL
-SELECT a.app_row_id, ud.proc_time
+SELECT m.market_application_no, CAST(NULL AS INT) AS cdc_status, ud.proc_time
 FROM cdc_user_data AS ud
-INNER JOIN dim_apps_by_user FOR SYSTEM_TIME AS OF ud.proc_time AS a
-    ON a.user_id = ud.`userId`
+INNER JOIN dim_app_no_by_user FOR SYSTEM_TIME AS OF ud.proc_time AS m
+    ON m.user_id = ud.`userId`
 WHERE ud.`userId` IS NOT NULL;
 
 INSERT INTO sink_application
 SELECT
-    b.application_no,
-    CASE
-        WHEN b.mobile_token IS NOT NULL AND TRIM(b.mobile_token) <> '' THEN b.mobile_token
-        WHEN b.mobile_norm IS NULL OR TRIM(b.mobile_norm) = '' THEN ''
-        ELSE COALESCE(vt_tokenize(TRIM(b.mobile_norm)), '')
-    END AS mobile,
+    x.application_no,
+    COALESCE(x.vt.mobile, '') AS mobile,
     '' AS coupon_code,
-    b.bid,
-    b.app_id,
-    b.app_version,
-    b.user_id,
-    b.user_id AS group_user_id,
-    b.sn,
+    x.bid,
+    x.app_id,
+    x.app_version,
+    x.user_id,
+    x.user_id AS group_user_id,
+    x.sn,
     0 AS is_test,
-    CAST(b.is_first_apply AS INT) AS is_first_apply,
+    CAST(x.is_first_apply AS INT) AS is_first_apply,
     0 AS is_auto_apply,
-    COALESCE(
-        NULLIF(TRIM(b.id_number_token), ''),
-        CASE WHEN b.bvn_raw IS NOT NULL AND TRIM(b.bvn_raw) <> '' THEN COALESCE(vt_tokenize(TRIM(b.bvn_raw)), '') ELSE '' END
-    ) AS id_number,
-    CASE
-        WHEN b.gaid_token IS NOT NULL AND TRIM(b.gaid_token) <> '' THEN b.gaid_token
-        WHEN b.gaid_raw IS NULL OR TRIM(b.gaid_raw) = '' THEN CAST(NULL AS STRING)
-        ELSE vt_tokenize(TRIM(b.gaid_raw))
-    END AS gaid_idfa,
-    b.device_uuid,
+    COALESCE(x.vt.id_number, '') AS id_number,
+    x.vt.gaid_idfa AS gaid_idfa,
+    x.device_uuid,
     CAST(NULL AS STRING) AS session_id,
-    b.bank_code,
+    x.bank_code,
     '' AS bank_account_name,
-    CASE
-        WHEN b.bank_account_token IS NOT NULL AND TRIM(b.bank_account_token) <> '' THEN b.bank_account_token
-        WHEN b.bank_account_raw IS NULL OR TRIM(b.bank_account_raw) = '' THEN ''
-        ELSE vt_tokenize(TRIM(b.bank_account_raw))
-    END AS bank_account_number,
-    b.product_id,
+    COALESCE(x.vt.bank_account, '') AS bank_account_number,
+    x.product_id,
     'PROD-002-D7' AS product_scheme_id,
     48 AS product_calculator_version,
     50 AS repay_calculator_version,
     49 AS rollover_calculator_version,
     '{"product_scheme_id":"PROD-002-D7"}' AS product_scheme_param,
-    CAST(b.term AS INT) AS term,
+    CAST(x.term AS INT) AS term,
     1 AS periods,
     1 AS repayment_method,
     CONCAT(
-        '{"roll_sequence":0,"period":1,"principal":', CAST(GREATEST(COALESCE(b.disburse_amount, 0), 0) AS STRING),
-        ',"disbursed_amount":', CAST(GREATEST(COALESCE(b.disburse_amount, 0), 0) AS STRING),
-        ',"interest":0,"admin_fee":', CAST(GREATEST(COALESCE(b.core_orig_fee, 0), 0) AS STRING),
-        ',"service_fee":0,"tax_fee":0,"reduction_amount":0,"total_amount":', CAST(GREATEST(COALESCE(b.repayment, 0), 0) AS STRING),
-        ',"term":', CAST(COALESCE(b.term, 0) AS STRING),
+        '{"roll_sequence":0,"period":1,"principal":', CAST(GREATEST(COALESCE(x.disburse_amount, 0), 0) AS STRING),
+        ',"disbursed_amount":', CAST(GREATEST(COALESCE(x.disburse_amount, 0), 0) AS STRING),
+        ',"interest":0,"admin_fee":', CAST(GREATEST(COALESCE(x.core_orig_fee, 0), 0) AS STRING),
+        ',"service_fee":0,"tax_fee":0,"reduction_amount":0,"total_amount":', CAST(GREATEST(COALESCE(x.repayment, 0), 0) AS STRING),
+        ',"term":', CAST(COALESCE(x.term, 0) AS STRING),
         ',"roll_allowed":0}'
     ) AS repayment_plan,
     -- 目标库 amount 列为 bigint unsigned；源库 repayment 存在负数，直接写入会 Data truncation 并拖垮整 job
-    GREATEST(COALESCE(b.amount, 0), 0) AS credit_limit,
-    GREATEST(COALESCE(b.amount, 0), 0) AS loan_amount,
-    GREATEST(COALESCE(b.disburse_amount, 0), 0) AS principal,
-    GREATEST(COALESCE(b.repayment, 0), 0) AS total_amount,
-    GREATEST(COALESCE(b.disburse_amount, 0), 0) AS disbursed_amount,
-    COALESCE(b.apply_date, 0) * 1000 AS created_time,
-    COALESCE(b.core_apply_time, 0) * 1000 AS submited_time,
-    COALESCE(b.core_audit_time, 0) * 1000 AS reviewed_time,
-    COALESCE(b.disburse_time, 0) * 1000 AS disbursed_time,
-    COALESCE(b.last_repay_time, 0) * 1000 AS last_paid_time,
-    COALESCE(b.paid_time, 0) * 1000 AS paid_off_time,
-    CASE WHEN COALESCE(b.apply_date, 0) > 0 THEN (b.apply_date + 7 * 86400) * 1000 ELSE 0 END AS lock_expire_time,
-    CASE CAST(b.src_status AS INT)
+    GREATEST(COALESCE(x.amount, 0), 0) AS credit_limit,
+    GREATEST(COALESCE(x.amount, 0), 0) AS loan_amount,
+    GREATEST(COALESCE(x.disburse_amount, 0), 0) AS principal,
+    GREATEST(COALESCE(x.repayment, 0), 0) AS total_amount,
+    GREATEST(COALESCE(x.disburse_amount, 0), 0) AS disbursed_amount,
+    COALESCE(x.apply_date, 0) * 1000 AS created_time,
+    COALESCE(x.core_apply_time, 0) * 1000 AS submited_time,
+    COALESCE(x.core_audit_time, 0) * 1000 AS reviewed_time,
+    COALESCE(x.disburse_time, 0) * 1000 AS disbursed_time,
+    COALESCE(x.last_repay_time, 0) * 1000 AS last_paid_time,
+    COALESCE(x.paid_time, 0) * 1000 AS paid_off_time,
+    CASE WHEN COALESCE(x.apply_date, 0) > 0 THEN (x.apply_date + 7 * 86400) * 1000 ELSE 0 END AS lock_expire_time,
+    -- market CDC 优先用事件自带 status；core/user_data 触发仍回落 Lookup src_status
+    CASE CAST(COALESCE(x.cdc_status, x.src_status) AS INT)
         WHEN 0 THEN 1 WHEN 1 THEN 1 WHEN 2 THEN 1 WHEN 4 THEN 1
         WHEN 5 THEN 3 WHEN 3 THEN 5 WHEN 6 THEN 5 WHEN 8 THEN 7 WHEN 7 THEN 11
         WHEN 9 THEN 13 WHEN 10 THEN 13 WHEN 12 THEN 15
         WHEN 11 THEN 20 WHEN 13 THEN 20 WHEN 14 THEN 20 WHEN 16 THEN 20
         WHEN 15 THEN 23 WHEN 17 THEN 27 WHEN 18 THEN 27 WHEN 19 THEN 27
-        ELSE CAST(b.src_status AS INT)
+        ELSE CAST(COALESCE(x.cdc_status, x.src_status) AS INT)
     END AS status
-FROM v_app_triggers AS t
-INNER JOIN dim_app_bundle FOR SYSTEM_TIME AS OF t.proc_time AS b
-    ON b.app_row_id = t.app_row_id
-WHERE b.core_sn IS NOT NULL AND TRIM(b.core_sn) <> ''
-  AND b.mobile_norm IS NOT NULL AND TRIM(b.mobile_norm) <> '';
+FROM (
+    SELECT
+        b.*,
+        t.cdc_status,
+        vt_tokenize_app(
+            b.mobile_token, b.mobile_norm,
+            b.id_number_token, b.bvn_raw,
+            b.gaid_token, b.gaid_raw,
+            b.bank_account_token, b.bank_account_raw
+        ) AS vt
+    FROM v_app_triggers AS t
+    INNER JOIN dim_app_bundle FOR SYSTEM_TIME AS OF t.proc_time AS b
+        ON b.market_application_no = t.market_application_no
+    WHERE b.core_sn IS NOT NULL AND TRIM(b.core_sn) <> ''
+      AND b.mobile_norm IS NOT NULL AND TRIM(b.mobile_norm) <> ''
+) AS x;
