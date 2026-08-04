@@ -2,8 +2,8 @@
 -- 口径对齐 ng_migration_run._build_id_mapping_rows：
 --   id(锚点)=mobile token；单向展开 type=
 --     mobile / gaid_idfa / device_uuid / bank_account / id_number / id2
--- Lookup 键 BIGINT + 视图裸列（勿 DECIMAL：JDBC Long 无法转 BigDecimal）
--- 前置: ./scripts/deploy-source-ddl.sh（含 id_mapping_incr_bundle_lookup）
+-- Lookup 键：裸 applicationNo（唯一索引），避免 UNSIGNED id BigInteger ClassCast
+-- 前置: ./scripts/deploy-source-ddl.sh（含 id_mapping_incr_bundle_by_no_lookup）
 CREATE TEMPORARY FUNCTION vt_tokenize AS 'com.nigeria.flink.udf.VtTokenizeFunction';
 
 SET 'parallelism.default' = '${FLINK_PARALLELISM}';
@@ -21,6 +21,7 @@ SET 'table.exec.async-lookup.timeout' = '60s';
 
 CREATE TABLE IF NOT EXISTS cdc_market_app (
     id BIGINT,
+    applicationNo STRING,
     proc_time AS PROCTIME(),
     PRIMARY KEY (id) NOT ENFORCED
 ) WITH (
@@ -36,7 +37,8 @@ CREATE TABLE IF NOT EXISTS cdc_market_app (
     'scan.startup.mode' = '${CDC_STARTUP_MODE}',
     'scan.startup.timestamp-millis' = '${CDC_STARTUP_TIMESTAMP_MILLIS}',
     'scan.incremental.snapshot.enabled' = 'true',
-    'debezium.snapshot.mode' = 'schema_only'
+    'debezium.snapshot.mode' = 'schema_only',
+    'debezium.bigint.unsigned.handling.mode' = 'long'
 );
 
 CREATE TABLE IF NOT EXISTS cdc_user_data (
@@ -81,6 +83,7 @@ CREATE TABLE IF NOT EXISTS cdc_user (
 );
 
 CREATE TABLE IF NOT EXISTS dim_idmap_bundle (
+    market_application_no STRING,
     app_row_id BIGINT,
     app_id BIGINT,
     mobile_norm STRING,
@@ -95,25 +98,25 @@ CREATE TABLE IF NOT EXISTS dim_idmap_bundle (
     id2_raw STRING,
     id2_token STRING,
     event_time BIGINT,
-    PRIMARY KEY (app_row_id) NOT ENFORCED
+    PRIMARY KEY (market_application_no) NOT ENFORCED
 ) WITH (
     'connector' = 'jdbc',
     'url' = 'jdbc:mysql://${MARKET_MYSQL_HOST}:${MARKET_MYSQL_PORT}/${MARKET_MYSQL_DATABASE}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Africa/Lagos&tinyInt1isBit=false',
-    'table-name' = 'id_mapping_incr_bundle_lookup',
+    'table-name' = 'id_mapping_incr_bundle_by_no_lookup',
     'username' = '${MARKET_MYSQL_USER}',
     'password' = '${MARKET_MYSQL_PASSWORD}',
     'lookup.cache.max-rows' = '500000',
     'lookup.cache.ttl' = '${LOOKUP_CACHE_TTL}'
 );
 
-CREATE TABLE IF NOT EXISTS dim_apps_by_user (
+CREATE TABLE IF NOT EXISTS dim_app_no_by_user (
     user_id BIGINT,
-    app_row_id BIGINT,
+    market_application_no STRING,
     PRIMARY KEY (user_id) NOT ENFORCED
 ) WITH (
     'connector' = 'jdbc',
     'url' = 'jdbc:mysql://${MARKET_MYSQL_HOST}:${MARKET_MYSQL_PORT}/${MARKET_MYSQL_DATABASE}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Africa/Lagos&tinyInt1isBit=false',
-    'table-name' = 'market_app_ids_by_user_lookup',
+    'table-name' = 'market_app_no_by_user_lookup',
     'username' = '${MARKET_MYSQL_USER}',
     'password' = '${MARKET_MYSQL_PASSWORD}',
     'lookup.cache.max-rows' = '500000',
@@ -139,18 +142,20 @@ CREATE TABLE IF NOT EXISTS sink_id_mapping (
 );
 
 CREATE TEMPORARY VIEW v_idmap_triggers AS
-SELECT id AS app_row_id, proc_time FROM cdc_market_app WHERE id IS NOT NULL
+SELECT applicationNo AS market_application_no, proc_time
+FROM cdc_market_app
+WHERE applicationNo IS NOT NULL AND TRIM(applicationNo) <> ''
 UNION ALL
-SELECT a.app_row_id, ud.proc_time
+SELECT m.market_application_no, ud.proc_time
 FROM cdc_user_data AS ud
-INNER JOIN dim_apps_by_user FOR SYSTEM_TIME AS OF ud.proc_time AS a
-    ON a.user_id = ud.`userId`
+INNER JOIN dim_app_no_by_user FOR SYSTEM_TIME AS OF ud.proc_time AS m
+    ON m.user_id = ud.`userId`
 WHERE ud.`userId` IS NOT NULL
 UNION ALL
-SELECT a.app_row_id, u.proc_time
+SELECT m.market_application_no, u.proc_time
 FROM cdc_user AS u
-INNER JOIN dim_apps_by_user FOR SYSTEM_TIME AS OF u.proc_time AS a
-    ON a.user_id = u.id
+INNER JOIN dim_app_no_by_user FOR SYSTEM_TIME AS OF u.proc_time AS m
+    ON m.user_id = u.id
 WHERE u.id IS NOT NULL;
 
 -- 先解析 token，再 ARRAY/UNNEST 展开（对齐迁移固定 type 顺序）
@@ -209,7 +214,7 @@ FROM (
             END AS id2_tok
         FROM v_idmap_triggers AS t
         INNER JOIN dim_idmap_bundle FOR SYSTEM_TIME AS OF t.proc_time AS b
-            ON b.app_row_id = t.app_row_id
+            ON b.market_application_no = t.market_application_no
         WHERE b.mobile_norm IS NOT NULL AND TRIM(b.mobile_norm) <> ''
     ) AS p
     WHERE p.mobile_tok IS NOT NULL AND TRIM(p.mobile_tok) <> ''

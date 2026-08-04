@@ -1,1 +1,4 @@
 com/nigeria/flink/udf/EmergencyContactsVtHelper$ContactDraft.class
+com/nigeria/flink/udf/VtLocalCache$1.class
+com/nigeria/flink/udf/VtTokenizeAppFieldsFunction.class
+com/nigeria/flink/udf/VtLocalCache.class

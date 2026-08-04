@@ -45,7 +45,11 @@ INSERT INTO sink_user_product
 SELECT
     p.user_id AS group_user_id,
     p.product_id,
-    '[]' AS schemes,
+    CONCAT(
+        '[{"schemeId":"PROD-002-D7","amountRange":[',
+        CAST(COALESCE(p.credit_amount, 0) AS STRING),
+        ']}]'
+    ) AS schemes,
     1 AS is_open,
     COALESCE(p.credit_amount, 0) AS credit_amount,
     0 AS unpaid_amount,

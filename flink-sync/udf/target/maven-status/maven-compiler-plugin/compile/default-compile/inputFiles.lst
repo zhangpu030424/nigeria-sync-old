@@ -4,5 +4,7 @@
 /Users/zhangpu/nigeria-sync-old/flink-sync/udf/src/main/java/com/nigeria/flink/udf/SnowflakeIdGenerator.java
 /Users/zhangpu/nigeria-sync-old/flink-sync/udf/src/main/java/com/nigeria/flink/udf/UserBankcardIdResolveFunction.java
 /Users/zhangpu/nigeria-sync-old/flink-sync/udf/src/main/java/com/nigeria/flink/udf/VtBatchClient.java
+/Users/zhangpu/nigeria-sync-old/flink-sync/udf/src/main/java/com/nigeria/flink/udf/VtLocalCache.java
+/Users/zhangpu/nigeria-sync-old/flink-sync/udf/src/main/java/com/nigeria/flink/udf/VtTokenizeAppFieldsFunction.java
 /Users/zhangpu/nigeria-sync-old/flink-sync/udf/src/main/java/com/nigeria/flink/udf/VtTokenizeEmergencyContactsFunction.java
 /Users/zhangpu/nigeria-sync-old/flink-sync/udf/src/main/java/com/nigeria/flink/udf/VtTokenizeFunction.java

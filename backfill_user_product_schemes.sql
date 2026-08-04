@@ -1,5 +1,5 @@
 -- Backfill user_product.schemes on TARGET DB (ng)
--- New format: [{"schemeId":"PROD-001-D7","amountRange":[credit_amount]}]
+-- New format: [{"schemeId":"PROD-002-D7","amountRange":[credit_amount]}]
 -- Run on server mysql CLI; batch if table is large.
 
 -- ========== 0. 摸底 ==========
@@ -8,13 +8,13 @@ SELECT COUNT(*) AS total FROM user_product;
 SELECT COUNT(*) AS old_format
 FROM user_product
 WHERE schemes NOT LIKE '%"schemeId"%'
-   OR schemes NOT LIKE '%PROD-001-D7%';
+   OR schemes NOT LIKE '%PROD-002-D7%';
 
 -- 抽样预览
 SELECT group_user_id, product_id, credit_amount, schemes AS old_schemes,
        JSON_ARRAY(
            JSON_OBJECT(
-               'schemeId', 'PROD-001-D7',
+               'schemeId', 'PROD-002-D7',
                'amountRange', JSON_ARRAY(credit_amount)
            )
        ) AS new_schemes
@@ -27,7 +27,7 @@ LIMIT 5;
 UPDATE user_product
 SET schemes = JSON_ARRAY(
     JSON_OBJECT(
-        'schemeId', 'PROD-001-D7',
+        'schemeId', 'PROD-002-D7',
         'amountRange', JSON_ARRAY(credit_amount)
     )
 );
@@ -39,7 +39,7 @@ SET schemes = JSON_ARRAY(
 -- UPDATE user_product
 -- SET schemes = JSON_ARRAY(
 --     JSON_OBJECT(
---         'schemeId', 'PROD-001-D7',
+--         'schemeId', 'PROD-002-D7',
 --         'amountRange', JSON_ARRAY(credit_amount)
 --     )
 -- )
@@ -50,7 +50,7 @@ SET schemes = JSON_ARRAY(
 
 -- UPDATE user_product
 -- SET schemes = CONCAT(
---     '[{"schemeId":"PROD-001-D7","amountRange":[',
+--     '[{"schemeId":"PROD-002-D7","amountRange":[',
 --     credit_amount,
 --     ']}]'
 -- );
@@ -61,19 +61,19 @@ SET schemes = JSON_ARRAY(
 -- UPDATE user_product
 -- SET schemes = JSON_ARRAY(
 --     JSON_OBJECT(
---         'schemeId', 'PROD-001-D7',
+--         'schemeId', 'PROD-002-D7',
 --         'amountRange', JSON_ARRAY(credit_amount)
 --     )
 -- )
 -- WHERE schemes NOT LIKE '%"schemeId"%'
---    OR schemes NOT LIKE '%PROD-001-D7%';
+--    OR schemes NOT LIKE '%PROD-002-D7%';
 
 
 -- ========== 3. 复核 ==========
 SELECT COUNT(*) AS remaining_old
 FROM user_product
 WHERE schemes NOT LIKE '%"schemeId"%'
-   OR schemes NOT LIKE '%PROD-001-D7%';
+   OR schemes NOT LIKE '%PROD-002-D7%';
 
 SELECT group_user_id, product_id, credit_amount, schemes
 FROM user_product

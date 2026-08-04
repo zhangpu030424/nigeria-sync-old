@@ -60,7 +60,7 @@ ENV_FILE = HERE / "ng_migration.env"
 def _user_product_schemes_json(credit_amount: int) -> str:
     return _json_dumps([
         {
-            "schemeId": "PROD-001-D7",
+            "schemeId": "PROD-002-D7",
             "amountRange": [int(credit_amount)],
         },
     ])

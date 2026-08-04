@@ -154,10 +154,97 @@ WHERE a.`productId` IS NOT NULL AND a.`productId` <> 0
       WHERE a2.`userId` = a.`userId` AND a2.`productId` = a.`productId`
   );
 
--- ---------- application 增量 bundle Lookup（Flink: WHERE app_row_id = ?）----------
+-- ---------- application 增量 bundle Lookup（Flink: WHERE market_application_no = ?）----------
+-- 关键：必须 ALGORITHM=MERGE + 以 a 为驱动，否则 MySQL 会全扫 core.application（800万+）
+-- 关键：Lookup 键用裸 applicationNo（唯一索引），勿用 UNSIGNED id（BigInteger ClassCast）
+-- VT：JOIN vt_token_cache 须能走 uk_type_raw（勿对 raw_value 两侧 COLLATE，否则会改走 idx_status 扫百万行）
+--      miss 时 token 为 NULL，由 Flink vt_tokenize 兜底
+CREATE OR REPLACE ALGORITHM=MERGE VIEW application_incr_bundle_by_no_lookup AS
+SELECT a.applicationNo                                               AS market_application_no,
+       CAST(a.id AS SIGNED)                                          AS app_row_id,
+       CAST(a.applicationNo AS CHAR)                                 AS market_no,
+       CONCAT('ng', LPAD(CAST(a.`appId` AS CHAR), 4, '0'), '-', a.applicationNo) AS application_no,
+       CASE
+           WHEN a.mobile LIKE '+234%' THEN a.mobile
+           WHEN a.mobile LIKE '234%' THEN CONCAT('+', a.mobile)
+           WHEN a.mobile LIKE '0%' THEN CONCAT('+234', SUBSTRING(a.mobile, 2))
+           ELSE CONCAT('+234', a.mobile)
+           END                                                       AS mobile_norm,
+       CAST(vt_m.token AS CHAR)                                      AS mobile_token,
+       'ng01'                                                        AS bid,
+       CAST(a.`appId` AS SIGNED)                                     AS app_id,
+       '1.0.0'                                                       AS app_version,
+       CAST(a.`userId` AS SIGNED)                                    AS user_id,
+       CAST(a.applicationNo AS CHAR)                                 AS sn,
+       CAST(CASE WHEN a.`repeatLoan` = 0 THEN 1 ELSE 0 END AS SIGNED) AS is_first_apply,
+       CAST(IFNULL(NULLIF(a.gaid, ''), NULL) AS CHAR)                AS gaid_raw,
+       CAST(vt_g.token AS CHAR)                                      AS gaid_token,
+       CAST(IFNULL(CAST(a.`deviceDataId` AS CHAR), '') AS CHAR)      AS device_uuid,
+       CAST(IFNULL(a.bankCode, '') AS CHAR)                          AS bank_code,
+       CAST(IFNULL(a.bankAccount, '') AS CHAR)                       AS bank_account_raw,
+       CAST(vt_ba.token AS CHAR)                                     AS bank_account_token,
+       CAST(a.`productId` AS CHAR)                                   AS product_id,
+       CAST(a.term AS SIGNED)                                        AS term,
+       CAST(IFNULL(a.shouldLoanAmount, 0) AS SIGNED)                 AS should_loan_amount,
+       CAST(IFNULL(a.amount, 0) AS SIGNED)                           AS amount,
+       CAST(IFNULL(a.repayment, 0) AS SIGNED)                        AS repayment,
+       CAST(IFNULL(a.disburseAmount, 0) AS SIGNED)                   AS disburse_amount,
+       CAST(IFNULL(a.applyDate, 0) AS SIGNED)                        AS apply_date,
+       CAST(IFNULL(a.dueDate, 0) AS SIGNED)                          AS due_date,
+       CAST(ca.sn AS CHAR)                                           AS core_sn,
+       CAST(IFNULL(ca.apply_time, 0) AS SIGNED)                      AS core_apply_time,
+       CAST(IFNULL(ca.audit_time, 0) AS SIGNED)                      AS core_audit_time,
+       CAST(IFNULL(ca.orig_fee, 0) AS SIGNED)                        AS core_orig_fee,
+       CAST(IFNULL(a.disburseTime, 0) AS SIGNED)                     AS disburse_time,
+       CAST(IFNULL(a.paidTime, 0) AS SIGNED)                         AS paid_time,
+       CAST(IFNULL(a.`status`, 0) AS SIGNED)                         AS src_status,
+       CAST(vt_id.token AS CHAR)                                     AS id_number_token,
+       CAST(ud.bvn AS CHAR)                                          AS bvn_raw,
+       CAST(0 AS SIGNED)                                             AS last_repay_time
+FROM application a
+         STRAIGHT_JOIN ng_loan_core.application ca ON ca.ext_sn = a.applicationNo
+         LEFT JOIN user_data ud
+                   ON ud.id = (
+                       SELECT ud2.id FROM user_data ud2
+                       WHERE ud2.`userId` = a.`userId`
+                       ORDER BY ud2.id DESC LIMIT 1
+                   )
+         LEFT JOIN vt_token_cache vt_m
+                   ON vt_m.vt_type = 1 AND vt_m.status = 1
+                       AND vt_m.raw_value = (CASE
+                           WHEN a.mobile LIKE '+234%' THEN a.mobile
+                           WHEN a.mobile LIKE '234%' THEN CONCAT('+', a.mobile)
+                           WHEN a.mobile LIKE '0%' THEN CONCAT('+234', SUBSTRING(a.mobile, 2))
+                           ELSE CONCAT('+234', a.mobile)
+                       END)
+         LEFT JOIN vt_token_cache vt_g
+                   ON vt_g.vt_type = 2 AND vt_g.status = 1
+                       AND vt_g.raw_value = NULLIF(TRIM(a.gaid), '')
+         LEFT JOIN vt_token_cache vt_ba
+                   ON vt_ba.vt_type = 3 AND vt_ba.status = 1
+                       AND vt_ba.raw_value = NULLIF(TRIM(a.bankAccount), '')
+         LEFT JOIN vt_token_cache vt_id
+                   ON vt_id.vt_type = 4 AND vt_id.status = 1
+                       AND vt_id.raw_value = NULLIF(TRIM(ud.bvn), '')
+WHERE a.applicationNo IS NOT NULL AND TRIM(a.applicationNo) <> '';
+
+-- ---------- application 增量：userId → 最新 applicationNo（勿返回 UNSIGNED id）----------
+CREATE OR REPLACE ALGORITHM=MERGE VIEW market_app_no_by_user_lookup AS
+SELECT a.`userId` AS user_id,
+       a.applicationNo AS market_application_no
+FROM application a
+WHERE a.`userId` IS NOT NULL
+  AND a.applicationNo IS NOT NULL AND TRIM(a.applicationNo) <> ''
+  AND a.id = (
+      SELECT MAX(a2.id)
+      FROM application a2
+      WHERE a2.`userId` = a.`userId`
+  );
+
+-- ---------- application 增量 bundle Lookup（旧：按 app_row_id；保留给兼容，新 job 改用 by_no）----------
 -- 关键：必须 ALGORITHM=MERGE + 以 a 为驱动，否则 MySQL 会全扫 core.application（800万+）
 -- 关键：app_row_id 必须是裸 a.id（勿 CAST）；CAST 后 WHERE app_row_id=? 无法走主键 → 全表扫 1400万+ / 数秒每次
--- Flink 侧用 DECIMAL(20,0) 承接 unsigned，避免 ClassCast
+-- 注意：裸 UNSIGNED id 在 Connector/J 下 getObject=BigInteger，Flink BIGINT 会 ClassCast；新链路请用 application_incr_bundle_by_no_lookup
 -- 勿 JOIN vt_token_cache；token 由 Flink vt_tokenize 兜底
 CREATE OR REPLACE ALGORITHM=MERGE VIEW application_incr_bundle_lookup AS
 SELECT a.id                                                          AS app_row_id,
@@ -210,10 +297,65 @@ FROM application a
                    )
 WHERE a.applicationNo IS NOT NULL AND TRIM(a.applicationNo) <> '';
 
--- ---------- id_mapping 增量 bundle Lookup（Flink: WHERE app_row_id = ?）----------
+-- ---------- id_mapping 增量 bundle Lookup（新：WHERE market_application_no = ?）----------
+-- Lookup 键用裸 applicationNo；VT JOIN 走 uk_type_raw（勿 COLLATE），miss 由 Flink vt_tokenize 兜底
+CREATE OR REPLACE ALGORITHM=MERGE VIEW id_mapping_incr_bundle_by_no_lookup AS
+SELECT a.applicationNo                                               AS market_application_no,
+       CAST(a.id AS SIGNED)                                          AS app_row_id,
+       CAST(a.`appId` AS SIGNED)                                     AS app_id,
+       CASE
+           WHEN a.mobile LIKE '+234%' THEN a.mobile
+           WHEN a.mobile LIKE '234%' THEN CONCAT('+', a.mobile)
+           WHEN a.mobile LIKE '0%' THEN CONCAT('+234', SUBSTRING(a.mobile, 2))
+           ELSE CONCAT('+234', a.mobile)
+           END                                                       AS mobile_norm,
+       CAST(vt_m.token AS CHAR)                                      AS mobile_token,
+       CAST(IFNULL(NULLIF(a.gaid, ''), NULL) AS CHAR)                AS gaid_raw,
+       CAST(vt_g.token AS CHAR)                                      AS gaid_token,
+       CAST(IFNULL(CAST(a.`deviceDataId` AS CHAR), '') AS CHAR)      AS device_uuid,
+       CAST(IFNULL(a.bankAccount, '') AS CHAR)                       AS bank_account_raw,
+       CAST(vt_ba.token AS CHAR)                                     AS bank_account_token,
+       CAST(ud.bvn AS CHAR)                                          AS bvn_raw,
+       CAST(vt_id.token AS CHAR)                                     AS id_number_token,
+       CAST(IFNULL(u.credentialNo, '') AS CHAR)                      AS id2_raw,
+       CAST(vt_id2.token AS CHAR)                                    AS id2_token,
+       CAST(UNIX_TIMESTAMP(a.created) AS SIGNED) * 1000              AS event_time
+FROM application a
+         STRAIGHT_JOIN ng_loan_core.application ca ON ca.ext_sn = a.applicationNo
+         LEFT JOIN `user` u ON u.id = a.`userId`
+         LEFT JOIN user_data ud
+                   ON ud.id = (
+                       SELECT ud2.id FROM user_data ud2
+                       WHERE ud2.`userId` = a.`userId`
+                       ORDER BY ud2.id DESC LIMIT 1
+                   )
+         LEFT JOIN vt_token_cache vt_m
+                   ON vt_m.vt_type = 1 AND vt_m.status = 1
+                       AND vt_m.raw_value = (CASE
+                           WHEN a.mobile LIKE '+234%' THEN a.mobile
+                           WHEN a.mobile LIKE '234%' THEN CONCAT('+', a.mobile)
+                           WHEN a.mobile LIKE '0%' THEN CONCAT('+234', SUBSTRING(a.mobile, 2))
+                           ELSE CONCAT('+234', a.mobile)
+                       END)
+         LEFT JOIN vt_token_cache vt_g
+                   ON vt_g.vt_type = 2 AND vt_g.status = 1
+                       AND vt_g.raw_value = NULLIF(TRIM(a.gaid), '')
+         LEFT JOIN vt_token_cache vt_ba
+                   ON vt_ba.vt_type = 3 AND vt_ba.status = 1
+                       AND vt_ba.raw_value = NULLIF(TRIM(a.bankAccount), '')
+         LEFT JOIN vt_token_cache vt_id
+                   ON vt_id.vt_type = 4 AND vt_id.status = 1
+                       AND vt_id.raw_value = NULLIF(TRIM(ud.bvn), '')
+         LEFT JOIN vt_token_cache vt_id2
+                   ON vt_id2.vt_type = 4 AND vt_id2.status = 1
+                       AND vt_id2.raw_value = NULLIF(TRIM(u.credentialNo), '')
+WHERE a.applicationNo IS NOT NULL AND TRIM(a.applicationNo) <> ''
+  AND a.mobile IS NOT NULL AND TRIM(a.mobile) <> '';
+
+-- ---------- id_mapping 增量 bundle Lookup（旧：WHERE app_row_id = ?；保留兼容）----------
 -- 口径对齐 ng_migration_run._build_id_mapping_rows：
 --   anchor=id 为 mobile token；按 type 展开 mobile/gaid_idfa/device_uuid/bank_account/id_number/id2
--- 优化：app_row_id 裸 a.id（勿 CAST）；Flink 侧 BIGINT（JDBC 返回 Long）
+-- 注意：CAST(id AS SIGNED) 作 WHERE 键会全表扫；裸 UNSIGNED id 会 BigInteger ClassCast；新链路用 by_no
 -- VT：优先 vt_token_cache；miss 由 Flink vt_tokenize 兜底
 -- 需有 core 建档（与 application 写入条件一致）
 CREATE OR REPLACE ALGORITHM=MERGE VIEW id_mapping_incr_bundle_lookup AS
@@ -269,7 +411,7 @@ WHERE a.applicationNo IS NOT NULL AND TRIM(a.applicationNo) <> ''
   AND a.mobile IS NOT NULL AND TRIM(a.mobile) <> '';
 
 -- ---------- 辅助：applicationNo → app_row_id ----------
--- 裸 id；Flink 侧 DECIMAL(20,0)；application / id_mapping 共用
+-- 裸 id；Flink 侧 STRING；application / id_mapping 共用
 CREATE OR REPLACE ALGORITHM=MERGE VIEW market_app_id_by_no_lookup AS
 SELECT applicationNo,
        id AS app_row_id
@@ -279,7 +421,7 @@ WHERE applicationNo IS NOT NULL AND TRIM(applicationNo) <> '';
 -- ---------- 辅助：userId → 最新 app_row_id（user_data 变更触发）----------
 -- 只取该用户最新一笔，避免一用户上千笔 application 扇出打爆 LookupJoin
 -- 裸 userId/id：CAST 会导致 WHERE user_id=? 无法用 userId 索引 → 扫全表索引
--- Flink 侧 DECIMAL(20,0)
+-- Flink：user_id=BIGINT，app_row_id=STRING
 CREATE OR REPLACE ALGORITHM=MERGE VIEW market_app_ids_by_user_lookup AS
 SELECT a.`userId` AS user_id,
        a.id AS app_row_id
