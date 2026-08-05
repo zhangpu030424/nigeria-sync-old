@@ -2510,10 +2510,10 @@ def _map_loan_status(rp_status: Any, repaid_amt: Any) -> Any:
 def _build_loan_row(rp: dict, application_no: str) -> dict:
     st = int(rp.get("status") or 0)
     repaid = int(rp.get("repaid_amt") or 0)
-    repay_last = int(rp.get("repay_last_time") or 0)
     settle_time = int(rp.get("settle_time") or 0)
     paid_amount = repaid if st in (2, 4) else 0
-    paid_time_ms = _to_epoch_ms(repay_last) if repay_last > 0 else 0
+    # 与 Flink loan_incr_bundle_lookup 一致：ng_loan_market.application.paidTime * 100
+    paid_time = int(rp.get("market_paid_time") or 0)
     period = 1
     roll_sequence = 0
     loan_sn = loan_sn_from_repay_plan(rp)
@@ -2534,7 +2534,7 @@ def _build_loan_row(rp: dict, application_no: str) -> dict:
         "reduction_amount": 0,
         "total_amount": int(rp.get("amt") or 0),
         "paid_amount": paid_amount,
-        "paid_time": paid_time_ms if paid_time_ms > 0 else None,
+        "paid_time": paid_time if paid_time > 0 else None,
         "paid_off_date": _unix_to_date_str(settle_time) if settle_time > 0 else None,
         "created_time": _to_epoch_ms(rp.get("created_at")),
         "status": _map_loan_status(st, repaid),
@@ -2546,7 +2546,7 @@ def _fetch_loan_rows_from_source(
 ) -> List[dict]:
     if not sn_to_app_no:
         return []
-    c = "ng_loan_core"
+    c, m = "ng_loan_core", "ng_loan_market"
     uniq = list(sn_to_app_no.keys())
     out: List[dict] = []
     for i in range(0, len(uniq), 2000):
@@ -2555,7 +2555,8 @@ def _fetch_loan_rows_from_source(
         sql = f"""
             SELECT rp.sn, rp.plan_sn, rp.start_date, rp.due_date, rp.prin_amt, rp.interest,
                    rp.orig_fee, rp.penalty, rp.amt, rp.`status`, rp.repaid_amt,
-                   rp.repay_last_time, rp.settle_time, rp.created_at
+                   rp.repay_last_time, rp.settle_time, rp.created_at,
+                   CAST(IFNULL(ma.paidTime, 0) AS SIGNED) * 100 AS market_paid_time
             FROM {c}.repay_plan rp
             INNER JOIN (
                 SELECT sn, MAX(plan_sn) AS max_plan_sn
@@ -2563,6 +2564,8 @@ def _fetch_loan_rows_from_source(
                 WHERE sn IN ({ph})
                 GROUP BY sn
             ) pick ON rp.sn = pick.sn AND rp.plan_sn = pick.max_plan_sn
+            INNER JOIN {c}.application ca ON ca.sn = rp.sn
+            INNER JOIN {m}.application ma ON ma.applicationNo = ca.ext_sn
         """
         with src.cursor() as cur:
             cur.execute(sql, part)

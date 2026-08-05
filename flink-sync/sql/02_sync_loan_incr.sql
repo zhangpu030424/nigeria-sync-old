@@ -57,6 +57,8 @@ CREATE TABLE IF NOT EXISTS cdc_repay_record (
 CREATE TABLE IF NOT EXISTS cdc_market_app_disburse (
     id DECIMAL(20, 0),
     `disburseTime` BIGINT,
+    -- paidTime 变更也要触发 loan 重算（paid_time = paidTime * 100）
+    `paidTime` BIGINT,
     proc_time AS PROCTIME(),
     PRIMARY KEY (id) NOT ENFORCED
 ) WITH (
@@ -92,6 +94,7 @@ CREATE TABLE IF NOT EXISTS dim_loan_bundle (
     repaid_amt BIGINT,
     repay_last_time BIGINT,
     settle_time BIGINT,
+    market_paid_time BIGINT,
     created_at TIMESTAMP(3),
     PRIMARY KEY (sn) NOT ENFORCED
 ) WITH (
@@ -184,7 +187,8 @@ SELECT
     0 AS reduction_amount,
     GREATEST(COALESCE(l.amt, 0), 0) AS total_amount,
     CASE WHEN l.rp_status IN (2, 4) THEN GREATEST(COALESCE(l.repaid_amt, 0), 0) ELSE 0 END AS paid_amount,
-    CASE WHEN COALESCE(l.repay_last_time, 0) > 0 THEN l.repay_last_time * 1000 ELSE CAST(NULL AS BIGINT) END AS paid_time,
+    -- market.application.paidTime * 100（见 loan_incr_bundle_lookup.market_paid_time）
+    CASE WHEN COALESCE(l.market_paid_time, 0) > 0 THEN l.market_paid_time ELSE CAST(NULL AS BIGINT) END AS paid_time,
     CASE WHEN COALESCE(l.settle_time, 0) > 0
         THEN DATE_FORMAT(FROM_UNIXTIME(CASE WHEN l.settle_time > 10000000000 THEN l.settle_time / 1000 ELSE l.settle_time END), 'yyyy-MM-dd')
         ELSE CAST(NULL AS STRING) END AS paid_off_date,

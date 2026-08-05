@@ -462,6 +462,8 @@ SELECT rp.sn                                                                    
        CAST(IFNULL(rp.repaid_amt, 0) AS SIGNED)                                    AS repaid_amt,
        CAST(IFNULL(rp.repay_last_time, 0) AS SIGNED)                               AS repay_last_time,
        CAST(IFNULL(rp.settle_time, 0) AS SIGNED)                                   AS settle_time,
+       -- market.application.paidTime 在源库为非毫秒口径（历史脏数据推断），按目标字段注释“毫秒”统一乘以 100
+       CAST(IFNULL(ma.paidTime, 0) AS SIGNED) * 100                                AS market_paid_time,
        rp.created_at
 FROM ng_loan_core.repay_plan rp
          STRAIGHT_JOIN ng_loan_core.application ca ON ca.sn = rp.sn
